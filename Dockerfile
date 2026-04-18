@@ -1,4 +1,4 @@
-#docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t bnhf/ah4c:latest -t bnhf/ah4c:2025.08.31 . --push --no-cache
+#docker buildx build --platform linux/amd64 -f Dockerfile -t ghcr.io/mackid1993/ah4c:latest . --push --no-cache
 
 # First Stage: Build ws-scrcpy and ah4c
 FROM golang:bookworm AS builder
@@ -17,8 +17,8 @@ WORKDIR /ws-scrcpy/dist
 RUN npm install
 
 # Build ah4c application
-WORKDIR /go/src/github.com/sullrich
-RUN git clone https://github.com/sullrich/ah4c . \
+WORKDIR /go/src/github.com/mackid1993
+RUN git clone -b main https://github.com/mackid1993/ah4c . \
     && sed -i '/r\.GET("\/env",/,/^[[:space:]]})$/d;/r\.GET("\/config",/,/^[[:space:]]})$/d;/r\.POST("\/configsave",/,/^[[:space:]]})$/d' main.go \
     && go build -o /opt/ah4c
 
