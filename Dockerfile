@@ -22,7 +22,7 @@ RUN npm install
 # Build ah4c application
 WORKDIR /go/src/github.com/mackid1993
 RUN git clone -b main https://github.com/mackid1993/ah4c . \
-    && sed -i '/r\.GET("\/env",/,/^[[:space:]]})$/d;/r\.GET("\/config",/,/^[[:space:]]})$/d;/r\.POST("\/configsave",/,/^[[:space:]]})$/d' main.go \
+    && sed -i '/^[[:space:]]"html\/template"$/d;/r\.GET("\/env",/,/^[[:space:]]})$/d;/r\.GET("\/config",/,/^[[:space:]]})$/d;/r\.POST("\/configsave",/,/^[[:space:]]})$/d' main.go \
     && go build -o /opt/ah4c
 
 # Second Stage: Create the Runtime Environment
