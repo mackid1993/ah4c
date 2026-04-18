@@ -19,6 +19,7 @@ RUN npm install
 # Build ah4c application
 WORKDIR /go/src/github.com/sullrich
 RUN git clone https://github.com/sullrich/ah4c . \
+    && sed -i '/r\.GET("\/env",/,/^[[:space:]]})$/d;/r\.GET("\/config",/,/^[[:space:]]})$/d;/r\.POST("\/configsave",/,/^[[:space:]]})$/d' main.go \
     && go build -o /opt/ah4c
 
 # Second Stage: Create the Runtime Environment
