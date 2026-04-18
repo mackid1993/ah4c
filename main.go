@@ -15,6 +15,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"html/template"
 	"io"
@@ -384,25 +385,65 @@ func tune(idx, channel string) (io.ReadCloser, error) {
 			}
 			// Network encoder
 			logger("Attempting network tune for device %s %s %v %v", t.url, t.tunerip, channel, idx)
-			resp, err := http.Get(t.url)
-			if err != nil {
-				logger("[ERR] Failed to fetch source: %v", err)
-				t.active = false
-				continue
-			} else if resp.StatusCode != 200 {
-				logger("[ERR] Failed to fetch source: %v", resp.Status)
+
+			// Encoder readiness probe: retry until the source serves HTTP 200
+			// AND begins producing bytes within the probe window. Handles the
+			// cold-start case where an encoder's HTTP endpoint is up before its
+			// encoding pipeline is actually producing TS data.
+			const (
+				probeAttempts = 6               // ~30s total grace
+				probeTimeout  = 5 * time.Second // per-attempt read window
+				minProbeBytes = 64 * 1024       // 64KB = pipeline actually producing
+			)
+
+			var resp *http.Response
+			var buffered []byte
+			var err error
+			for attempt := 1; attempt <= probeAttempts; attempt++ {
+				resp, err = http.Get(t.url)
+				if err != nil {
+					logger("[WARN] Fetch attempt %d/%d failed: %v", attempt, probeAttempts, err)
+					time.Sleep(1 * time.Second)
+					continue
+				}
+				if resp.StatusCode != 200 {
+					logger("[WARN] Fetch attempt %d/%d got status %v", attempt, probeAttempts, resp.Status)
+					resp.Body.Close()
+					resp = nil
+					time.Sleep(1 * time.Second)
+					continue
+				}
+				// HTTP 200 received; now confirm bytes are actually flowing.
+				buf := make([]byte, minProbeBytes)
+				readCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+				n, readErr := readFull(readCtx, resp.Body, buf)
+				cancel()
+				if n >= minProbeBytes {
+					logger("[INFO] Encoder producing bytes on attempt %d/%d (%d bytes in probe)", attempt, probeAttempts, n)
+					buffered = buf[:n]
+					break
+				}
+				logger("[WARN] Attempt %d/%d: only %d bytes in %v (err=%v); retrying", attempt, probeAttempts, n, probeTimeout, readErr)
+				resp.Body.Close()
+				resp = nil
+				time.Sleep(1 * time.Second)
+			}
+			if resp == nil {
+				logger("[ERR] Encoder never produced bytes after %d attempts", probeAttempts)
 				t.active = false
 				continue
 			}
+
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
+				resp.Body.Close()
 				continue
 			}
 			t.active = true
 			t.index = i
 			return &reader{
-				ReadCloser: resp.Body,
+				ReadCloser: prependReader(buffered, resp.Body),
 				channel:    channel,
 				t:          t,
 			}, nil
@@ -1312,4 +1353,52 @@ func saveConfigToFile(filePath string, configData ConfigData) {
 		log.Printf("Failed to write to file: %s", err)
 		os.Exit(1)
 	}
+}
+
+// readFull reads up to len(buf) bytes with a context deadline.
+// Returns bytes actually read even on timeout.
+func readFull(ctx context.Context, r io.Reader, buf []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := io.ReadFull(r, buf)
+		ch <- result{n, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// prependReader returns an io.ReadCloser that first emits `prefix` bytes,
+// then reads from `rest`. Used to replay probe bytes to the downstream client.
+func prependReader(prefix []byte, rest io.ReadCloser) io.ReadCloser {
+	return &prefixedReadCloser{
+		prefix: prefix,
+		rest:   rest,
+	}
+}
+
+type prefixedReadCloser struct {
+	prefix []byte
+	pos    int
+	rest   io.ReadCloser
+}
+
+func (p *prefixedReadCloser) Read(buf []byte) (int, error) {
+	if p.pos < len(p.prefix) {
+		n := copy(buf, p.prefix[p.pos:])
+		p.pos += n
+		return n, nil
+	}
+	return p.rest.Read(buf)
+}
+
+func (p *prefixedReadCloser) Close() error {
+	return p.rest.Close()
 }
