@@ -592,8 +592,28 @@ func run() error {
 		}()
 		starttime := time.Now()
 		var bytesCopied int64
-		if bytesCopied, err = io.Copy(c.Writer, reader); err != nil {
-			logger("[IO] io.Copy: %v", err)
+		// Flush after every successful write so bytes don't pool in the server-side
+		// buffer. Some client stacks (NVIDIA Shield TV, notably) are timing-sensitive
+		// to bursty writes and will reset or stall the connection if data arrives in
+		// large irregular chunks.
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := reader.Read(buf)
+			if n > 0 {
+				written, werr := c.Writer.Write(buf[:n])
+				bytesCopied += int64(written)
+				if werr != nil {
+					logger("[IO] write: %v", werr)
+					break
+				}
+				c.Writer.Flush()
+			}
+			if rerr != nil {
+				if rerr != io.EOF {
+					logger("[IO] read: %v", rerr)
+				}
+				break
+			}
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
 		elapsedtime := time.Since(starttime)
