@@ -19,10 +19,11 @@ RUN git clone https://github.com/NetrisTV/ws-scrcpy.git . \
 WORKDIR /ws-scrcpy/dist
 RUN npm install
 
-# Build ah4c application
-WORKDIR /go/src/github.com/mackid1993
-RUN git clone -b main https://github.com/mackid1993/ah4c . \
-    && sed -i '/^[[:space:]]"html\/template"$/d;/r\.GET("\/env",/,/^[[:space:]]})$/d;/r\.GET("\/config",/,/^[[:space:]]})$/d;/r\.POST("\/configsave",/,/^[[:space:]]})$/d' main.go \
+# Build ah4c application from the workflow's checkout (so the branch/ref
+# dispatched to the workflow is what ships in the image).
+WORKDIR /go/src/github.com/mackid1993/ah4c
+COPY go.mod go.sum main.go ./
+RUN sed -i '/^[[:space:]]"html\/template"$/d;/r\.GET("\/env",/,/^[[:space:]]})$/d;/r\.GET("\/config",/,/^[[:space:]]})$/d;/r\.POST("\/configsave",/,/^[[:space:]]})$/d' main.go \
     && go build -o /opt/ah4c
 
 # Second Stage: Create the Runtime Environment
