@@ -15,6 +15,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"html/template"
 	"io"
@@ -212,12 +213,6 @@ func (r *reader) Read(p []byte) (int, error) {
 	if !r.started {
 		r.started = true
 		addReader(r)
-		go func() {
-			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
-				logger("[ERR] Failed to run start script: %v", err)
-				return
-			}
-		}()
 	}
 	// Determine the index of the tuner
 	tunerIndex := -1
@@ -353,13 +348,17 @@ func tune(idx, channel string) (io.ReadCloser, error) {
 			// Handle application encoder
 			if t.cmd != "" {
 				logger("Attempting application tune for device %s %v", t.cmd, idx)
+				if err := execute(t.pre, t.tunerip, channel); err != nil {
+					logger("[ERR] Failed to run pre script: %v", err)
+					t.active = false
+					continue
+				}
 				cmdAndArgs := parseCommand(t.cmd)
 				cmd := exec.Command(cmdAndArgs[0], cmdAndArgs[1:]...)
 				pipeReader, pipeWriter := io.Pipe()
 				cmd.Stdout = pipeWriter
 				cmd.Stderr = os.Stderr
-				err := cmd.Start()
-				if err != nil {
+				if err := cmd.Start(); err != nil {
 					logger("[ERR] Failed to run command %s", err)
 					t.active = false
 					continue
@@ -368,44 +367,179 @@ func tune(idx, channel string) (io.ReadCloser, error) {
 					cmd.Wait()
 					pipeWriter.Close()
 				}()
-				if err := execute(t.pre, t.tunerip, channel); err != nil {
-					logger("[ERR] Failed to run pre script: %v", err)
+				if err := execute(t.start, channel, t.tunerip); err != nil {
+					logger("[ERR] Failed to run start script: %v", err)
+					cmd.Process.Kill()
+					pipeWriter.Close()
 					t.active = false
 					continue
 				}
 				t.active = true
 				t.index = i
-				return &reader{
+				r := &reader{
 					ReadCloser: pipeReader,
 					channel:    channel,
 					t:          t,
 					cmd:        cmd,
-				}, nil
+					started:    true,
+				}
+				addReader(r)
+				return r, nil
 			}
 			// Network encoder
 			logger("Attempting network tune for device %s %s %v %v", t.url, t.tunerip, channel, idx)
-			resp, err := http.Get(t.url)
-			if err != nil {
-				logger("[ERR] Failed to fetch source: %v", err)
-				t.active = false
-				continue
-			} else if resp.StatusCode != 200 {
-				logger("[ERR] Failed to fetch source: %v", resp.Status)
-				t.active = false
-				continue
-			}
+
+			// Run prebmitune synchronously (unchanged)
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
 				continue
 			}
+
+			// Initial probe: confirm encoder is producing bytes
+			const (
+				initialProbeBytes   = 64 * 1024
+				initialProbeTimeout = 5 * time.Second
+				monitorBufferCap    = 2 * 1024 * 1024 // 2MB rolling buffer during channel change
+				monitorStallTimeout = 3 * time.Second // if no data for 3s, channel change broke the stream
+				retryAttempts       = 6               // cold/recovered-channel retry budget
+				retryProbeBytes     = 64 * 1024
+				retryProbeTimeout   = 5 * time.Second
+			)
+
+			probeAndRead := func(url string, minBytes int, timeout time.Duration) (*http.Response, []byte, error) {
+				resp, err := http.Get(url)
+				if err != nil {
+					return nil, nil, err
+				}
+				if resp.StatusCode != 200 {
+					resp.Body.Close()
+					return nil, nil, fmt.Errorf("status %s", resp.Status)
+				}
+				buf := make([]byte, minBytes)
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				n, _ := readFull(ctx, resp.Body, buf)
+				cancel()
+				if n < minBytes {
+					resp.Body.Close()
+					return nil, nil, fmt.Errorf("only %d/%d bytes in %v", n, minBytes, timeout)
+				}
+				return resp, buf[:n], nil
+			}
+
+			resp, initialBuf, err := probeAndRead(t.url, initialProbeBytes, initialProbeTimeout)
+			if err != nil {
+				logger("[ERR] Initial encoder probe failed: %v", err)
+				t.active = false
+				continue
+			}
+
+			// Fire bmitune.sh in a goroutine — same as the legacy behavior, but we're going to
+			// monitor the probe connection for a stall instead of blindly handing off.
+			bmituneDone := make(chan struct{})
+			go func() {
+				if err := execute(t.start, channel, t.tunerip); err != nil {
+					logger("[ERR] Failed to run start script: %v", err)
+				}
+				close(bmituneDone)
+			}()
+
+			// Drain the probe connection into a rolling buffer while bmitune runs and for
+			// a short period after it completes. If the stream stalls during this window,
+			// we know the channel change broke the encoder output and we need to reconnect.
+			monitorBuf := make([]byte, 0, monitorBufferCap)
+			monitorBuf = append(monitorBuf, initialBuf...)
+
+			monitorDone := make(chan error, 1)
+			go func() {
+				chunk := make([]byte, 32*1024)
+				lastData := time.Now()
+				bmituneCompleted := false
+				graceDeadline := time.Time{}
+				for {
+					if !bmituneCompleted {
+						select {
+						case <-bmituneDone:
+							bmituneCompleted = true
+							graceDeadline = time.Now().Add(1 * time.Second)
+						default:
+						}
+					}
+					if bmituneCompleted && time.Now().After(graceDeadline) {
+						monitorDone <- nil
+						return
+					}
+					readCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+					n, readErr := readFull(readCtx, resp.Body, chunk)
+					cancel()
+					if n > 0 {
+						lastData = time.Now()
+						if len(monitorBuf)+n <= cap(monitorBuf) {
+							monitorBuf = append(monitorBuf, chunk[:n]...)
+						}
+					}
+					if time.Since(lastData) > monitorStallTimeout {
+						monitorDone <- fmt.Errorf("stream stalled %v after last data", monitorStallTimeout)
+						return
+					}
+					if readErr != nil && n == 0 {
+						continue
+					}
+				}
+			}()
+
+			monitorErr := <-monitorDone
+
+			if monitorErr == nil {
+				logger("[INFO] Stream stable through bmitune; fast path handoff (%d bytes buffered)", len(monitorBuf))
+				t.active = true
+				t.index = i
+				r := &reader{
+					ReadCloser: prependReader(monitorBuf, resp.Body),
+					channel:    channel,
+					t:          t,
+					started:    true,
+				}
+				addReader(r)
+				return r, nil
+			}
+
+			// Slow path: stream stalled. Close and reconnect to pick up the new channel.
+			logger("[WARN] Stream stalled during channel change (%v); reconnecting", monitorErr)
+			resp.Body.Close()
+
+			// Wait for bmitune to finish if it hasn't already, so the channel change is complete.
+			<-bmituneDone
+
+			var retryResp *http.Response
+			var retryBuf []byte
+			for attempt := 1; attempt <= retryAttempts; attempt++ {
+				retryResp, retryBuf, err = probeAndRead(t.url, retryProbeBytes, retryProbeTimeout)
+				if err == nil {
+					logger("[INFO] Encoder recovered on retry attempt %d/%d", attempt, retryAttempts)
+					break
+				}
+				logger("[WARN] Retry attempt %d/%d: %v", attempt, retryAttempts, err)
+				time.Sleep(1 * time.Second)
+				retryResp = nil
+			}
+
+			if retryResp == nil {
+				logger("[ERR] Encoder never recovered after %d retry attempts", retryAttempts)
+				t.active = false
+				continue
+			}
+
 			t.active = true
 			t.index = i
-			return &reader{
-				ReadCloser: resp.Body,
+			r := &reader{
+				ReadCloser: prependReader(retryBuf, retryResp.Body),
 				channel:    channel,
 				t:          t,
-			}, nil
+				started:    true,
+			}
+			addReader(r)
+			return r, nil
 		}
 	}
 	return nil, fmt.Errorf("device(s) not available")
@@ -1320,4 +1454,52 @@ func saveConfigToFile(filePath string, configData ConfigData) {
 		log.Printf("Failed to write to file: %s", err)
 		return
 	}
+}
+
+// readFull reads up to len(buf) bytes with a context deadline.
+// Returns bytes actually read even on timeout.
+func readFull(ctx context.Context, r io.Reader, buf []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := io.ReadFull(r, buf)
+		ch <- result{n, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// prependReader returns an io.ReadCloser that first emits `prefix` bytes,
+// then reads from `rest`. Used to replay probe bytes to the downstream client.
+func prependReader(prefix []byte, rest io.ReadCloser) io.ReadCloser {
+	return &prefixedReadCloser{
+		prefix: prefix,
+		rest:   rest,
+	}
+}
+
+type prefixedReadCloser struct {
+	prefix []byte
+	pos    int
+	rest   io.ReadCloser
+}
+
+func (p *prefixedReadCloser) Read(buf []byte) (int, error) {
+	if p.pos < len(p.prefix) {
+		n := copy(buf, p.prefix[p.pos:])
+		p.pos += n
+		return n, nil
+	}
+	return p.rest.Read(buf)
+}
+
+func (p *prefixedReadCloser) Close() error {
+	return p.rest.Close()
 }
