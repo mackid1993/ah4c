@@ -583,7 +583,6 @@ func run() error {
 			c.Data(500, "text/html; charset=utf-8", []byte(errorMessage))
 			return
 		}
-		c.Header("Transfer-Encoding", "identity")
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
@@ -592,8 +591,28 @@ func run() error {
 		}()
 		starttime := time.Now()
 		var bytesCopied int64
-		if bytesCopied, err = io.Copy(c.Writer, reader); err != nil {
-			logger("[IO] io.Copy: %v", err)
+		// Flush after every successful write so bytes don't pool in the server-side
+		// buffer. Some client stacks (NVIDIA Shield TV over Wi-Fi, notably) are
+		// timing-sensitive to bursty writes and will reset the connection if data
+		// arrives in large irregular chunks.
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := reader.Read(buf)
+			if n > 0 {
+				written, werr := c.Writer.Write(buf[:n])
+				bytesCopied += int64(written)
+				if werr != nil {
+					logger("[IO] write: %v", werr)
+					break
+				}
+				c.Writer.Flush()
+			}
+			if rerr != nil {
+				if rerr != io.EOF {
+					logger("[IO] read: %v", rerr)
+				}
+				break
+			}
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
 		elapsedtime := time.Since(starttime)
@@ -948,7 +967,26 @@ func run() error {
 		}()
 	}
 	logger("[START] ah4c is ready")
-	return r.Run(":7654")
+	return runServer(":7654", r)
+}
+
+// runServer listens on addr using a tuned TCP listener. Short TCP keep-alives
+// let us detect half-closed connections (e.g. Wi-Fi drops to a Shield) faster
+// so they're cleaned up before the kernel's default ~2 hour idle keep-alive.
+func runServer(addr string, handler http.Handler) error {
+	lc := net.ListenConfig{
+		KeepAlive: 30 * time.Second,
+	}
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Handler: handler,
+		// Deliberately no ReadTimeout/WriteTimeout — streams are long-lived.
+		IdleTimeout: 120 * time.Second,
+	}
+	return srv.Serve(ln)
 }
 
 // Helper function to extract attribute from a line
