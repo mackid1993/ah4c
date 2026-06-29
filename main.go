@@ -75,6 +75,7 @@ type tuner struct {
 	filePath string
 	index    int
 	teecmd   string
+	lastChan string
 }
 
 // All readers
@@ -214,12 +215,19 @@ func (r *reader) Read(p []byte) (int, error) {
 	if !r.started {
 		r.started = true
 		addReader(r)
-		go func() {
-			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
-				logger("[ERR] Failed to run start script: %v", err)
-				return
-			}
-		}()
+		// Opt-in: when Channels reopens the SAME channel on this tuner the box is already
+		// tuned, so re-firing the deeplink only forces a destructive re-prepare -- skip it.
+		if os.Getenv("SKIP_SAME_CHANNEL_RETUNE") == "TRUE" && r.t.lastChan == r.channel {
+			logger("[%s] already on %s; skipping redundant re-tune", r.t.tunerip, r.channel)
+		} else {
+			r.t.lastChan = r.channel
+			go func() {
+				if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+					logger("[ERR] Failed to run start script: %v", err)
+					return
+				}
+			}()
+		}
 	}
 	// Determine the index of the tuner
 	tunerIndex := -1
