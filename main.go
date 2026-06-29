@@ -215,11 +215,11 @@ func (r *reader) Read(p []byte) (int, error) {
 	if !r.started {
 		r.started = true
 		addReader(r)
-		// Opt-in: when Channels reopens the SAME channel on this tuner the box is already
-		// tuned, so re-firing the deeplink only forces a destructive re-prepare -- skip it.
-		if os.Getenv("SKIP_SAME_CHANNEL_RETUNE") == "TRUE" && r.t.lastChan == r.channel {
-			logger("[%s] already on %s; skipping redundant re-tune", r.t.tunerip, r.channel)
-		} else {
+		// Opt-in: skip the deeplink re-fire when Channels reopens the SAME channel on this
+		// tuner -- the box is already tuned, so re-firing only forces a destructive re-prepare.
+		skip := os.Getenv("SKIP_SAME_CHANNEL_RETUNE") == "TRUE" && r.t.lastChan == r.channel
+		logger("[retune] %s channel=%q last=%q skip=%v", r.t.tunerip, r.channel, r.t.lastChan, skip)
+		if !skip {
 			r.t.lastChan = r.channel
 			go func() {
 				if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
@@ -987,6 +987,7 @@ func loadenv() {
 	logger("[ENV] ALERT_WEBHOOK_URL          %s", os.Getenv("ALERT_WEBHOOK_URL"))
 	logger("[ENV] ALLOW_DEBUG_VIDEO_PREVIEW  %s", os.Getenv("ALLOW_DEBUG_VIDEO_PREVIEW"))
 	logger("[ENV] NULL_FRAME_INSERTION       %s", os.Getenv("NULL_FRAME_INSERTION"))
+	logger("[ENV] SKIP_SAME_CHANNEL_RETUNE   %s", os.Getenv("SKIP_SAME_CHANNEL_RETUNE"))
 	// Retrieve the number of tuners from the environment variable "NUMBER_TUNERS".
 	// This value represents the number of distinct tuners that the program will manage.
 	numTunersStr := os.Getenv("NUMBER_TUNERS")
