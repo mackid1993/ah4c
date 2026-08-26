@@ -438,40 +438,48 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
 			var gate *gateReader
-			resp, err := http.Get(t.url)
-			if err != nil {
-				logger("[ERR] Failed to fetch source: %v", err)
-				t.active = false
-				continue
-			} else if resp.StatusCode != 200 {
-				logger("[ERR] Failed to fetch source: %v", resp.Status)
-				resp.Body.Close()
-				t.active = false
-				continue
+			if holdDelay > 0 {
+				// A tune held by the delay does not open the encoder yet: the
+				// wait is the pre-roll or NULL packets, and the encoder is
+				// opened when the delay is up, so the program starts at the
+				// top of its own session rather than joined in progress.
+				body = maybeWrapCaptions(newLateEncoder(t.url, label, early.from(tuneStart), early.player()), i, fmt.Sprintf("tuner%d", i))
+			} else {
+				resp, err := http.Get(t.url)
+				if err != nil {
+					logger("[ERR] Failed to fetch source: %v", err)
+					t.active = false
+					continue
+				} else if resp.StatusCode != 200 {
+					logger("[ERR] Failed to fetch source: %v", resp.Status)
+					resp.Body.Close()
+					t.active = false
+					continue
+				}
+				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
+				body = resp.Body
+				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
+					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
+						r, e := http.Get(t.url)
+						if e != nil {
+							return nil, e
+						}
+						if r.StatusCode != 200 {
+							r.Body.Close()
+							return nil, fmt.Errorf("status %s", r.Status)
+						}
+						return r.Body, nil
+					}, label)
+				}
+				// The gate holds the stream back until the hold says so:
+				// playback detection with a pre-roll to show while it waits.
+				hold := newTuneHold(tuneStart, ready, label, early.player())
+				if hold != nil {
+					gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
+					body = gate
+				}
+				body = hold.wrap(maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i)))
 			}
-			// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
-			body = resp.Body
-			if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
-				body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
-					r, e := http.Get(t.url)
-					if e != nil {
-						return nil, e
-					}
-					if r.StatusCode != 200 {
-						r.Body.Close()
-						return nil, fmt.Errorf("status %s", r.Status)
-					}
-					return r.Body, nil
-				}, label)
-			}
-			// The gate holds the stream back until the hold says so:
-			// playback detection with a pre-roll to show while it waits.
-			hold := newTuneHold(tuneStart, ready, label, early.player())
-			if hold != nil {
-				gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
-				body = gate
-			}
-			body = hold.wrap(maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i)))
 			t.active = true
 			t.index = i
 			r := &reader{
@@ -673,6 +681,20 @@ func run() error {
 		defer reader.Close()
 		starttime := time.Now()
 		var bytesCopied int64
+		// The first stretch of a hold goes out as 1xx, which puts nothing in
+		// the body; the body carries whatever is left, however long that is.
+		h, taken := holdOnHints(c.Writer, reader, tuner, channel)
+		switch {
+		case h != nil:
+			defer h.Close()
+			if bytesCopied, err = h.stream(reader); err != nil {
+				logger("[IO] stream: %v", err)
+			}
+			return
+		case taken:
+			logger("[HOLD] tuner=%s channel=%s the DVR left during the hold", tuner, channel)
+			return
+		}
 		c.Header("Transfer-Encoding", "identity")
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
@@ -1268,7 +1290,7 @@ func loadenv() {
 func main() {
 	logger("[START] ah4c %s is starting", buildVersion())
 	loadenv()
-	prerollStartup()
+	tuneHoldStartup()
 	loadCaptionConfig()
 	warnIfNotPersistent()
 	restoreGPURuntime()

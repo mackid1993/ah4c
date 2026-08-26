@@ -516,6 +516,15 @@ type earlyTune struct {
 	preroll *prerollPlayer
 }
 
+// from is when the delay is counted from. The DVR's request, so the viewer
+// waits PLAYBACK_DELAY and not that plus however long the scripts took.
+func (e *earlyTune) from(fallback time.Time) time.Time {
+	if e == nil {
+		return fallback
+	}
+	return e.t0
+}
+
 // player is the pre-roll already playing, or nil.
 func (e *earlyTune) player() *prerollPlayer {
 	if e == nil {
@@ -531,7 +540,7 @@ func tuneEarly(idx, channel string) (io.ReadCloser, error) {
 
 // tuneEarlyWith is tuneEarly over any tune function.
 func tuneEarlyWith(idx, channel string, tuneFn func(string, string, *earlyTune) (io.ReadCloser, error)) (io.ReadCloser, error) {
-	if prerollTS == "" {
+	if prerollTS == "" && holdDelay == 0 {
 		return tuneFn(idx, channel, nil)
 	}
 	t0 := time.Now()
@@ -542,7 +551,11 @@ func tuneEarlyWith(idx, channel string, tuneFn func(string, string, *earlyTune) 
 		r, err := tuneFn(idx, channel, &earlyTune{t0: t0, preroll: e.preroll})
 		e.result <- tuneResult{r, err}
 	}()
-	logger("[PREROLL] %s answered at once with the pre-roll", label)
+	if e.preroll != nil {
+		logger("[PREROLL] %s answered at once with the pre-roll", label)
+	} else {
+		logger("[HOLD] %s holding this tune for %s", label, holdWords(holdDelay))
+	}
 	return e, nil
 }
 
