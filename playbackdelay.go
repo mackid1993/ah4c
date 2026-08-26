@@ -23,14 +23,15 @@ import (
 var holdDelay time.Duration
 
 // holdMost is as long as a tune is held, whatever PLAYBACK_DELAY asks for.
-// Forty-five seconds is the longest confirmed against a real DVR: half again
-// the thirty seconds a DVR allows a tune, which is the whole point of holding
-// one, and a length that has been tuned over and over rather than argued for.
-// Longer holds do keep the DVR fed — the filler goes on indefinitely — but
-// have not been confirmed to leave the viewer at the live edge, and a hold
-// that records behind the live edge is worse than no hold at all. Raise this
-// when there is a tune to point at, not before.
-const holdMost = 45 * time.Second
+// Forty-five seconds was the longest confirmed to leave the viewer at the
+// live edge, and the reason looks to be the DVR's clock rather than the
+// hold: the DVR pins the first timestamp it sees to the moment the response
+// headers arrived, and NULL packets carry no time, so a hold reads as that
+// far behind until a timestamp jump makes the DVR re-pin to now. This build
+// makes that jump at the hand-off (refreshAfter) instead of twenty seconds
+// after it, and lifts the ceiling to find out whether that is the whole
+// story. Ten minutes is a guard against a typo, not a measured limit.
+const holdMost = 10 * time.Minute
 
 const (
 	// The wait's byte diet: volume through the DVR's detection window, then
@@ -127,11 +128,26 @@ func tuneHoldStartup() {
 		} else {
 			holdDelay = d
 			if holdDelay > holdMost {
-				logger("[HOLD] PLAYBACK_DELAY %s is longer than %s, which is as long as a hold has been confirmed to keep a tune at the live edge; holding for %s",
+				logger("[HOLD] PLAYBACK_DELAY %s is longer than %s, which is as long as this build will hold a tune; holding for %s",
 					holdWords(holdDelay), holdWords(holdMost), holdWords(holdMost))
 				holdDelay = holdMost
 			}
 		}
+	}
+	refreshAfter = refreshDefault
+	if s := os.Getenv("PLAYBACK_REFRESH"); strings.TrimSpace(s) != "" {
+		d, err := parseHoldDuration(s)
+		switch {
+		case err != nil:
+			logger("[HOLD] PLAYBACK_REFRESH %q %v; reopening the encoder %s after the program starts", s, err, holdWords(refreshDefault))
+		case d == 0:
+			logger("[HOLD] PLAYBACK_REFRESH is 0; reopening the encoder %s after the program starts, since that is what pulls the viewer to the live edge", holdWords(refreshDefault))
+		default:
+			refreshAfter = d
+		}
+	}
+	if holdDelay > 0 {
+		logger("[HOLD] the encoder is reopened %s after the program starts", holdWords(refreshAfter))
 	}
 	prerollStartup()
 	detect := strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE")
@@ -323,7 +339,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	}
 	// http.Get, not a client with a Timeout: that field covers reading the
 	// body, so it breaks the stream by force at a moment nothing chose and
-	// leaves nothing able to decline. The break is wanted — see refreshAt —
+	// leaves nothing able to decline. The break is wanted — see refreshAfter —
 	// but it is made deliberately below, and made so it can fail safely.
 	resp, err := http.Get(l.url)
 	if err == nil && resp.StatusCode != 200 {
@@ -618,12 +634,18 @@ func (l *lateEncoder) stallTolerant(body io.ReadCloser) io.ReadCloser {
 	}, l.label)
 }
 
-// refreshAt is how long after the programme starts the encoder connection is
+// refreshAfter is how long after the program starts the encoder connection is
 // reopened once. The break discards whatever the DVR has stored ahead of the
 // show and starts again at the encoder's live output, which is what pulls the
 // viewer back to the live edge; without it the viewer stays wherever the
-// hand-off left them.
-const refreshAt = 20 * time.Second
+// hand-off left them. It was twenty seconds because a client timeout happened
+// to fire there, not because twenty was chosen; the viewer is mislabeled as
+// behind for exactly this long, so it is now as short as leaves the DVR time
+// to detect the program before the clock jumps. PLAYBACK_REFRESH overrides it
+// so the number can be tried without a rebuild.
+const refreshDefault = 5 * time.Second
+
+var refreshAfter = refreshDefault
 
 // refreshing reopens the encoder once, shortly after the programme starts, and
 // only if the encoder will have it. The new connection is opened before the old
@@ -631,7 +653,7 @@ const refreshAt = 20 * time.Second
 // while a tuner owns the stream — costs nothing at all: the refresh is declined,
 // said so once, and never tried again for this tune.
 func (l *lateEncoder) refreshing(body io.ReadCloser) io.ReadCloser {
-	return &refreshSource{ReadCloser: body, at: time.Now().Add(refreshAt), label: l.label, open: func() (io.ReadCloser, error) {
+	return &refreshSource{ReadCloser: body, at: time.Now().Add(refreshAfter), label: l.label, open: func() (io.ReadCloser, error) {
 		r, e := http.Get(l.url)
 		if e != nil {
 			return nil, e
