@@ -477,6 +477,20 @@ func (h *holdReader) Close() error {
 	return h.src.Close()
 }
 
+// holdFiller times the program tables into a stretch of filler, so the DVR
+// always has a service to point at however long the wait runs.
+type holdFiller struct{ last time.Time }
+
+// due reports whether the tables should go out now, and records that they did.
+// now is a parameter so the cadence can be checked without waiting on a clock.
+func (f *holdFiller) due(now time.Time, room int) bool {
+	if room < len(holdTables) || (!f.last.IsZero() && now.Sub(f.last) < holdTablesGap) {
+		return false
+	}
+	f.last = now
+	return true
+}
+
 // nullPackets fills p with whole NULL packets, so filler always lands on a
 // packet boundary.
 func nullPackets(p []byte) int {
@@ -575,6 +589,7 @@ type earlyReader struct {
 	open    bool
 	failed  error
 	nulls   int64
+	filler  holdFiller
 	mu      sync.Mutex
 	closed  bool
 }
@@ -616,8 +631,16 @@ func (e *earlyReader) Read(p []byte) (int, error) {
 }
 
 // serveNulls sends NULL packets, which carry no time.
+// serveNulls sends NULL packets on the same diet the hold that follows uses.
+// It used to send a whole 32 KB buffer every half second — sixty-four
+// kilobytes a second, against the four hundred bytes a second the hold spends
+// — so the seconds the scripts take cost the DVR more than the entire wait
+// after them, and all of it is buffer it holds ahead of the show.
 func (e *earlyReader) serveNulls(p []byte) int {
 	n := nullPackets(p)
+	if e.filler.due(time.Now(), len(p)) {
+		n = copy(p, holdTables)
+	}
 	e.nulls += int64(n)
 	return n
 }
@@ -691,3 +714,98 @@ func (e *earlyReader) Close() error {
 	}()
 	return nil
 }
+
+// --- A program to hold on to ---
+// NULL packets carry no picture, no sound and no clock, which is exactly what
+// a hold needs — but they also carry no program. A DVR handed nothing but PID
+// 0x1FFF has bytes arriving and no service to point at, and after a while it
+// concludes there is nothing there and tunes again. That is what bounds how
+// long a hold can run.
+//
+// So the hold also sends a PAT and a PMT naming a service, and never sends one
+// packet on the PIDs they name. There is no PCR and no elementary stream, so
+// there is still nothing that can be put on a timeline; there is simply a
+// program for the DVR to hold on to while it waits.
+
+const (
+	// holdProgram, holdPMTPID and the elementary PIDs are the service the hold
+	// declares. They are deliberately not the ones an encoder tends to use, so
+	// the encoder's own tables read as a different service at the hand-off
+	// rather than as a repeat of these.
+	holdProgram   = 0x0FF1
+	holdPMTPID    = 0x0FF0
+	holdVideoPID  = 0x0FF2
+	holdAudioPID  = 0x0FF3
+	holdTablesGap = 500 * time.Millisecond
+)
+
+// holdTables is the PAT and PMT the hold repeats: two packets, built once.
+var holdTables = func() []byte {
+	pat := section(0x00, holdProgram, []byte{
+		byte(holdProgram >> 8), byte(holdProgram & 0xFF),
+		0xE0 | byte(holdPMTPID>>8), byte(holdPMTPID & 0xFF),
+	})
+	pmt := section(0x02, holdProgram, append([]byte{
+		0xE0 | byte(holdVideoPID>>8), byte(holdVideoPID & 0xFF), // PCR PID, never sent
+		0xF0, 0x00, // no program info
+	},
+		0x1B, 0xE0|byte(holdVideoPID>>8), byte(holdVideoPID&0xFF), 0xF0, 0x00, // H.264
+		0x0F, 0xE0|byte(holdAudioPID>>8), byte(holdAudioPID&0xFF), 0xF0, 0x00, // AAC
+	))
+	return append(packetize(0x0000, pat), packetize(holdPMTPID, pmt)...)
+}()
+
+// section builds a PSI section: header, body, CRC.
+func section(tableID byte, id int, body []byte) []byte {
+	// 0xC3 is reserved bits set, version_number 1, current_next_indicator 1.
+	// Version 1 rather than 0 on purpose: an encoder's own tables are version
+	// 0, and a demuxer may skip a section whose version it has already read.
+	// If the hold declared version 0 too, the encoder's real tables would look
+	// like a repeat of the hold's at the hand-off and could be ignored, and
+	// the DVR would go on waiting for PIDs that only ever existed here.
+	s := []byte{tableID, 0, 0, byte(id >> 8), byte(id), 0xC3, 0x00, 0x00}
+	s = append(s, body...)
+	s = append(s, 0, 0, 0, 0) // room for the CRC
+	length := len(s) - 3
+	s[1] = 0xB0 | byte(length>>8)
+	s[2] = byte(length)
+	c := uint32(0xFFFFFFFF)
+	for _, b := range s[:len(s)-4] {
+		c = c<<8 ^ psiCRC[byte(c>>24)^b]
+	}
+	n := len(s)
+	s[n-4], s[n-3], s[n-2], s[n-1] = byte(c>>24), byte(c>>16), byte(c>>8), byte(c)
+	return s
+}
+
+// packetize wraps a section in one 188-byte packet, padded to the end.
+func packetize(pid int, sec []byte) []byte {
+	p := make([]byte, tsPacketSize)
+	p[0] = 0x47
+	p[1] = 0x40 | byte(pid>>8) // payload_unit_start
+	p[2] = byte(pid)
+	p[3] = 0x10 // payload only, continuity counter 0
+	p[4] = 0x00 // pointer_field
+	copy(p[5:], sec)
+	for i := 5 + len(sec); i < tsPacketSize; i++ {
+		p[i] = 0xFF
+	}
+	return p
+}
+
+// psiCRC is CRC-32/MPEG-2, which is what a PSI section carries.
+var psiCRC = func() [256]uint32 {
+	var t [256]uint32
+	for i := range t {
+		c := uint32(i) << 24
+		for k := 0; k < 8; k++ {
+			if c&0x80000000 != 0 {
+				c = c<<1 ^ 0x04C11DB7
+			} else {
+				c <<= 1
+			}
+		}
+		t[i] = c
+	}
+	return t
+}()

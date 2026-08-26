@@ -182,6 +182,7 @@ type lateEncoder struct {
 	until   time.Time
 	preroll *prerollPlayer
 	pend    []byte
+	filler  holdFiller
 	// tuner and name are what captions are wrapped with, applied to the
 	// encoder's own stream rather than to the hold in front of it.
 	tuner int
@@ -282,6 +283,14 @@ func (l *lateEncoder) serveNulls(p []byte, d time.Duration) (int, error) {
 		p = p[:burst]
 	}
 	n := nullPackets(p)
+	// Every so often, a program for the DVR to point at instead. NULL packets
+	// carry no service, and a DVR handed nothing but stuffing eventually
+	// decides there is nothing there and tunes again — which is what bounds
+	// how long a hold can run. These name PIDs nothing is ever sent on and
+	// carry no PCR, so there is still nothing that can land on a timeline.
+	if l.filler.due(time.Now(), len(p)) {
+		n = copy(p, holdTables)
+	}
 	l.mu.Lock()
 	l.nulls += int64(n)
 	closed := l.closed
