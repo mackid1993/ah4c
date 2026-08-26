@@ -7,10 +7,14 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/jpeg"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,6 +37,21 @@ var holdDelay time.Duration
 // a forty-five second one. Ten minutes is a guard against a typo, not a
 // measured limit.
 const holdMost = 10 * time.Minute
+
+// holdNullMost is as long as NULL packets can fill a hold and leave the
+// viewer at the live edge. Measured: every hold up to forty-five seconds
+// lands there; sixty and ninety come in behind the guide and stay there,
+// whenever the encoder is reopened, while the bytes leaving the DVR are live
+// to within 0.1s. What differs is only how long the player sits with nothing
+// it can decode before the program arrives, and past this it does not come
+// back from that. Frames with time in them do not have the problem — the
+// pre-roll holds as long as it likes — so a longer hold with no pre-roll
+// mounted fills the wait with black frames ah4c makes itself, and pays the
+// pre-roll's price: the wait lands in the recording, as black.
+const holdNullMost = 45 * time.Second
+
+// holdBlack is set when the wait is filled with generated black frames.
+var holdBlack bool
 
 const (
 	// The wait's byte diet: volume through the DVR's detection window, then
@@ -136,11 +155,21 @@ func tuneHoldStartup() {
 		}
 	}
 	prerollStartup()
+	holdBlack = false
+	if holdDelay > holdNullMost && prerollTS == "" {
+		if src, err := blackStill(); err != nil {
+			logger("[HOLD] could not make a black frame for the wait (%v); NULL packets will fill it, and a hold this long has not stayed at the live edge on them", err)
+		} else if preparePreroll(src); prerollTS != "" {
+			holdBlack = true
+		}
+	}
 	detect := strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE")
 	if holdDelay > 0 && detect {
 		logger("[HOLD] PLAYBACK_DELAY is set, so PLAYBACK_DETECTION does not run: the delay decides when the program starts")
 	}
 	switch {
+	case holdBlack:
+		logger("[HOLD] hold %v; longer than %s of NULL packets leaves a viewer at the live edge, so the wait is black frames instead, and lands in the recording as black. Mount a pre-roll to show something else", holdDelay, holdWords(holdNullMost))
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
@@ -170,6 +199,23 @@ func holdWords(d time.Duration) string {
 	default:
 		return unit(sec, "second")
 	}
+}
+
+// blackStill writes a black 1080p JPEG for preparePreroll to make a clip of,
+// the same way a still image dropped in the pre-roll directory is handled.
+func blackStill() (string, error) {
+	img := image.NewRGBA(image.Rect(0, 0, 1920, 1080))
+	draw.Draw(img, img.Bounds(), image.Black, image.Point{}, draw.Src)
+	out := filepath.Join(filepath.Dir(prerollCache), "hold-black.jpg")
+	w, err := os.Create(out)
+	if err != nil {
+		return "", err
+	}
+	defer w.Close()
+	if err := jpeg.Encode(w, img, &jpeg.Options{Quality: 90}); err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 // holdUnit reads spelled-out units: "1 hour", "90 seconds", "2 mins".
