@@ -25,7 +25,7 @@
 20. Closed captions - live CPU speech-to-text written into the stream as CEA-608, the way an HDHomeRun carries them, with no re-encode and nothing added to the image
 21. Autocrop for Xfinity channels with black borders on all 4 sides, driven live through a LinkPi Encoder's web API
 22. Custom startup script - run your own script alongside ah4c at container start via USER_SCRIPT
-23. Tune hold - PLAYBACK_DELAY holds every tune from the request while a slow app reaches its video, feeding the DVR nothing it can put on a timeline, so a tune longer than the DVR's 30 seconds still records
+23. Tune hold - PLAYBACK_DELAY holds every tune from the request while a slow app reaches its video, feeding the DVR nothing it can put on a timeline, so a tune longer than the DVR's 30 seconds still records. Up to 45 seconds, which is as long as a hold has been confirmed to leave the viewer at the live edge
 24. Pre-roll - bind-mount a video or still image of your choice and it is shown instead of NULL packets while a tune is held or an encoder stalls
 
 ah4c WebUI:
@@ -337,9 +337,10 @@ since then the mount is of the file itself. The splice is cleanest when the pre-
 file cannot be prepared the log says why under `[PREROLL]` and the tune falls back to NULL
 packets, so a pre-roll can never cost a recording.
 
-The wait is always as long as `PLAYBACK_DELAY` says, never as long as the pre-roll happens
-to be. A clip shorter than the hold repeats until the hold is over — a still image simply
-stays up — and a clip longer than the hold is cut off when the hold ends.
+The wait is always as long as the hold, never as long as the pre-roll happens to be. A
+clip shorter than the hold repeats until the hold is over — a still image simply stays up
+— and a clip longer than the hold is cut off when the hold ends. The hold is
+`PLAYBACK_DELAY`, or forty-five seconds if that asks for more.
 
 Each hold is logged under `[HOLD]`: when it began, what it is showing, and when the encoder
 took over along with how much filler was sent.
