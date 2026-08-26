@@ -352,9 +352,20 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// Wrapping the hold hands the caption engine the pre-roll to work on and
 	// lets it rewrite the pre-roll's own video packets on the way past.
 	// Playback detection wraps it this way round, and its hand-off is clean.
-	body := markDiscontinuity(maybeWrapCaptions(
+	body := maybeWrapCaptions(
 		newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil),
-		l.tuner, l.name))
+		l.tuner, l.name)
+	// A NULL hold carries no PCR, so the jump to the program's clock is a real
+	// discontinuity the player must be told about or it reads it as corruption.
+	// A clock hold carried the encoder's PCR in real time all the way here, so
+	// the program continues that clock — there is no discontinuity, and marking
+	// one tells the player its clock jumped and makes it re-anchor, throwing
+	// away the very continuity the clock was there to give it.
+	if l.clock == nil || !l.clock.ready.Load() {
+		body = markDiscontinuity(body)
+	} else {
+		logger("[HOLD] %s hand-off continues the wait's clock; no discontinuity marked", l.label)
+	}
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
