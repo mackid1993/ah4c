@@ -25,8 +25,10 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,34 +52,52 @@ type holdClock struct {
 	lastPSI time.Time
 }
 
-// startHoldClock probes url on a goroutine and readies the clock if it can.
-func startHoldClock(url, label string) *holdClock {
+// startHoldClock probes url on a goroutine, retrying until the encoder's
+// program can be read or the wait is nearly over. The encoder is not always
+// streaming a clean transport stream the instant the scripts finish — the app
+// is still switching screens and the HDMI input renegotiating — so one probe
+// at the top of the wait catches nothing. It is retried until the picture
+// settles, which the lag captures showed happens some seconds in.
+func startHoldClock(url, label string, until time.Time) *holdClock {
 	c := &holdClock{}
+	stop := until.Add(-10 * time.Second) // leave time to serve after a late probe
 	go func() {
-		if err := c.probe(url); err != nil {
-			c.dead.Store(true)
-			logger("[HOLD] %s could not read the encoder's program for the wait (%v); the wait carries NULL packets", label, err)
-			return
+		var diag string
+		for attempt := 1; time.Now().Before(stop); attempt++ {
+			d, ok := c.probe(url)
+			if ok {
+				c.ready.Store(true)
+				logger("[HOLD] %s running the encoder's program through the wait (PCR on PID 0x%X), so the player keeps its clock", label, c.pcrPID)
+				return
+			}
+			diag = d
+			time.Sleep(3 * time.Second)
 		}
-		c.ready.Store(true)
-		logger("[HOLD] %s running the encoder's program through the wait (PCR on PID 0x%X), so the player keeps its clock", label, c.pcrPID)
+		c.dead.Store(true)
+		logger("[HOLD] %s could not read the encoder's program for the wait (%s); the wait carries NULL packets", label, diag)
 	}()
 	return c
 }
 
-// probe reads the encoder briefly for its PAT, PMT and current PCR.
-func (c *holdClock) probe(url string) error {
-	resp, err := http.Get(url)
+// probe reads the encoder briefly for its PAT, PMT and current PCR. It returns
+// a description of what it saw and whether it found all three. The client has
+// a timeout because this is a bounded probe, not the stream itself.
+func (c *holdClock) probe(url string) (string, bool) {
+	client := &http.Client{Timeout: 6 * time.Second}
+	resp, err := client.Get(url)
 	if err != nil {
-		return err
+		return "encoder would not open: " + err.Error(), false
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "encoder returned " + resp.Status, false
+	}
 	buf := make([]byte, 0, 512*1024)
 	tmp := make([]byte, 64*1024)
-	deadline := time.Now().Add(6 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	seen := map[int]int{}
 	var pat, pmt []byte
-	var pmtPID = -1
-	var pcrPID = -1
+	pmtPID, pcrPID := -1, -1
 	var base uint64
 	var haveBase bool
 	for time.Now().Before(deadline) {
@@ -85,7 +105,6 @@ func (c *holdClock) probe(url string) error {
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 		}
-		// Re-scan from a sync-aligned start each pass; the buffer is small.
 		start := tsAlign(buf)
 		for i := start; i+tsPacketSize <= len(buf); i += tsPacketSize {
 			pkt := buf[i : i+tsPacketSize]
@@ -93,16 +112,19 @@ func (c *holdClock) probe(url string) error {
 				break
 			}
 			pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
+			seen[pid]++
 			switch {
 			case pid == 0 && pat == nil:
 				if p := psiPayload(pkt); p != nil {
-					pat = append([]byte(nil), pkt...)
-					pmtPID = patFirstPMT(p)
+					if mp := patFirstPMT(p); mp >= 0 {
+						pat, pmtPID = append([]byte(nil), pkt...), mp
+					}
 				}
 			case pmtPID >= 0 && pid == pmtPID && pmt == nil:
 				if p := psiPayload(pkt); p != nil {
-					pmt = append([]byte(nil), pkt...)
-					pcrPID = pmtPCRPID(p)
+					if cp := pmtPCRPID(p); cp >= 0 {
+						pmt, pcrPID = append([]byte(nil), pkt...), cp
+					}
 				}
 			}
 			if pcrPID >= 0 && pid == pcrPID && !haveBase {
@@ -114,23 +136,32 @@ func (c *holdClock) probe(url string) error {
 		if pat != nil && pmt != nil && haveBase {
 			c.pat, c.pmt, c.pcrPID = pat, pmt, pcrPID
 			c.base, c.anchor = base, time.Now()
-			return nil
+			return "", true
 		}
-		if rerr != nil {
-			break
-		}
-		if len(buf) > 4<<20 {
+		if rerr != nil || len(buf) > 4<<20 {
 			break
 		}
 	}
-	return errNoProgram
+	return fmt.Sprintf("read %s, pids %v; pat=%v pmt(pid %d)=%v pcr(pid %d)=%v",
+		byteCount(int64(len(buf))), topPIDs(seen), pat != nil, pmtPID, pmt != nil, pcrPID, haveBase), false
 }
 
-var errNoProgram = &holdErr{"no PAT/PMT/PCR seen"}
-
-type holdErr struct{ s string }
-
-func (e *holdErr) Error() string { return e.s }
+// topPIDs lists the busiest PIDs seen, for a probe that could not parse.
+func topPIDs(seen map[int]int) []string {
+	type kv struct {
+		pid, n int
+	}
+	var s []kv
+	for p, n := range seen {
+		s = append(s, kv{p, n})
+	}
+	sort.Slice(s, func(i, j int) bool { return s[i].n > s[j].n })
+	var out []string
+	for i := 0; i < len(s) && i < 5; i++ {
+		out = append(out, fmt.Sprintf("0x%X:%d", s[i].pid, s[i].n))
+	}
+	return out
+}
 
 // pcrNow extrapolates the encoder's PCR (27 MHz) at the current wall time.
 func (c *holdClock) pcrNow() uint64 {

@@ -234,7 +234,7 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 	// clock; a short one is already at the live edge on NULL packets, and a
 	// pre-roll fills the wait itself.
 	if l.preroll == nil && holdDelay > holdClockMinDelay {
-		l.clock = startHoldClock(url, label)
+		l.clock = startHoldClock(url, label, l.until)
 	}
 	return l
 }
