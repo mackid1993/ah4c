@@ -98,14 +98,14 @@ func (c *holdClock) probe(url string) (string, bool) {
 	seen := map[int]int{}
 	var pat, pmt []byte
 	pmtPID, pcrPID := -1, -1
-	var base uint64
-	var haveBase bool
 	for time.Now().Before(deadline) {
 		n, rerr := resp.Body.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 		}
 		start := tsAlign(buf)
+		var latest uint64
+		var haveLatest bool
 		for i := start; i+tsPacketSize <= len(buf); i += tsPacketSize {
 			pkt := buf[i : i+tsPacketSize]
 			if pkt[0] != 0x47 {
@@ -127,15 +127,19 @@ func (c *holdClock) probe(url string) (string, bool) {
 					}
 				}
 			}
-			if pcrPID >= 0 && pid == pcrPID && !haveBase {
+			// Track the newest PCR in the buffer, not the first: the probe
+			// spends some reads finding the tables, and the first PCR it saw is
+			// that many seconds stale by the time it locks on. Anchoring to the
+			// latest one starts the clock at the encoder's live edge.
+			if pcrPID >= 0 && pid == pcrPID {
 				if b, ok := packetPCR(pkt); ok {
-					base, haveBase = b, true
+					latest, haveLatest = b, true
 				}
 			}
 		}
-		if pat != nil && pmt != nil && haveBase {
+		if pat != nil && pmt != nil && haveLatest {
 			c.pat, c.pmt, c.pcrPID = pat, pmt, pcrPID
-			c.base, c.anchor = base, time.Now()
+			c.base, c.anchor = latest, time.Now()
 			return "", true
 		}
 		if rerr != nil || len(buf) > 4<<20 {
