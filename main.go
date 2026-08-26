@@ -1245,7 +1245,6 @@ func loadenv() {
 	logger("[ENV] NULL_FRAME_INSERTION       %s", os.Getenv("NULL_FRAME_INSERTION"))
 	logger("[ENV] PLAYBACK_DETECTION         %s", os.Getenv("PLAYBACK_DETECTION"))
 	logger("[ENV] PLAYBACK_DELAY             %s", os.Getenv("PLAYBACK_DELAY"))
-	logger("[ENV] PLAYBACK_REFRESH           %s", os.Getenv("PLAYBACK_REFRESH"))
 	logger("[ENV] PLAYBACK_STATIC_TIMEOUT    %s", os.Getenv("PLAYBACK_STATIC_TIMEOUT"))
 	// Retrieve the number of tuners from the environment variable "NUMBER_TUNERS".
 	// This value represents the number of distinct tuners that the program will manage.
