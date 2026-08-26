@@ -339,7 +339,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// lets it rewrite the pre-roll's own video packets on the way past.
 	// Playback detection wraps it this way round, and its hand-off is clean.
 	body := markDiscontinuity(maybeWrapCaptions(
-		newGateReader(maybeWrapNullFrameInsertion(resp.Body, l.url, l.label), armed, true, time.Now(), nil),
+		newGateReader(l.stallTolerant(resp.Body), armed, true, time.Now(), nil),
 		l.tuner, l.name))
 	l.mu.Lock()
 	if l.closed {
@@ -593,4 +593,24 @@ func holdRate(since time.Duration) (time.Duration, int) {
 		return nullPace, nullBurst
 	}
 	return nullIdle, tsPacketSize
+}
+
+// stallTolerant wraps the encoder in the stall reader whether or not
+// NULL_FRAME_INSERTION is switched on. A held tune is opened on a client that
+// times out reading the body, so the hold is what breaks the stream every
+// twenty seconds and the hold has to be what survives it. Without this, a
+// container running the delay with NULL frame insertion off loses the stream
+// twenty seconds after the programme starts, every time.
+func (l *lateEncoder) stallTolerant(body io.ReadCloser) io.ReadCloser {
+	return newStallTolerantReader(body, func() (io.ReadCloser, error) {
+		r, e := http.Get(l.url)
+		if e != nil {
+			return nil, e
+		}
+		if r.StatusCode != 200 {
+			r.Body.Close()
+			return nil, fmt.Errorf("status %s", r.Status)
+		}
+		return r.Body, nil
+	}, l.label)
 }

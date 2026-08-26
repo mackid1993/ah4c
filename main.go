@@ -1968,6 +1968,15 @@ func videoPIDs(s []byte) map[int]bool {
 		}
 		i += 5 + (int(s[i+3]&0x0F)<<8 | int(s[i+4]))
 	}
+	if len(out) == 0 {
+		// No stream type this knows. Encoders vary, and a codec nobody here
+		// has heard of should still gate on a picture rather than falling back
+		// to starting unaligned. The PCR is carried on the video PID on every
+		// encoder seen so far, so that is the one to watch.
+		if pcr := int(s[8]&0x1F)<<8 | int(s[9]); pcr != 0 && pcr != 0x1FFF {
+			out[pcr] = true
+		}
+	}
 	return out
 }
 
