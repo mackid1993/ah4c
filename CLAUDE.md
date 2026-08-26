@@ -187,24 +187,29 @@ Each of these cost a recording before it was written down.
   there for twenty-one seconds and works; a sixty second hold leaves it there
   for thirty-six and the DVR tunes again. So the volume comes back for a second
   every five, and the thin stretch is four seconds whatever the hold's length.
-  `PLAYBACK_DELAY` was capped at forty-five seconds because that was the
-  longest hold watched land at the live edge, and a ninety second hold that
-  came in five seconds behind seemed to confirm it. Measured 2026-08-26,
-  against the encoder's own clock with two independent captures agreeing to
-  the millisecond: the bytes leaving the DVR's raw stream at ninety are live
-  to within 0.1s. Nothing in the pipe was old. The five seconds was the
-  player's buffer, and it stayed because that build reopened the encoder five
-  seconds into the program (rule 11's break, which is what sheds the buffer)
-  instead of twenty. Fifteen, twenty-seven and thirty all land a ninety second
-  hold at the live edge; five does not, and the band is reported to close at
-  forty-five. `refreshAfterHold` scales the reopen with the hold inside that
-  band — never below twenty, never above thirty, the longest watched — so it
-  cannot produce a number that has not been seen to work. The cap is gone. Two wrong explanations were written that night before
-  the measurement and are recorded so they are not rebuilt: that the DVR
-  starts its clock at the headers and only media moves it, and that a longer
-  hold starves the DVR on the keepalive — that log was the client hanging up
-  2.8 seconds after the headers, inside the volume window, and its retry ran
-  through. The heartbeat is harmless. It was not the fix.
+  `PLAYBACK_DELAY` is capped at forty-five seconds because that is the longest
+  hold watched land at the live edge; sixty and ninety come in behind the
+  guide and stay there, on NULL packets, whenever the encoder is reopened.
+  **Why is not settled, and the night this was chased produced four wrong
+  answers — record them so they are not rebuilt.** (1) That the DVR starts its
+  clock at the headers and only media moves it. (2) That a longer hold starves
+  the DVR on the keepalive — that log was the client hanging up 2.8 seconds
+  after the headers, inside the volume window, and its retry ran through; the
+  heartbeat is harmless but was not the fix. (3) That the reopen timing is a
+  band that scales with the hold — a misreading of the user's numbers, which
+  were `PLAYBACK_DELAY` values, not reopen offsets. (4) Filling a long wait
+  with black frames — forbidden, and the user said so repeatedly; NULL packets
+  are the only filler.
+
+  One measurement was taken and is real as far as it goes: at a ninety second
+  hold the bytes leaving the DVR's raw stream are live to within 0.1s of the
+  encoder's own clock (two independent captures agreed on the clock to the
+  millisecond). But the same probe was never run at forty-five, so it has not
+  been shown to tell a working hold from a broken one — do not lean on it as
+  proof the fault is in the player until it has. The one thing in what ah4c
+  sends that scales with hold length is `holdRate`: the count of four-second
+  keepalive stretches roughly triples between forty-five and ninety. That is
+  the next thing to test, and it is NULL-packets-only.
 
   The explanation that got there first was that a hold carries no *service* —
   only PID 0x1FFF, no PAT, no PMT — so the DVR gives up for want of a program.
