@@ -187,9 +187,22 @@ Each of these cost a recording before it was written down.
   there for twenty-one seconds and works; a sixty second hold leaves it there
   for thirty-six and the DVR tunes again. So the volume comes back for a second
   every five, and the thin stretch is four seconds whatever the hold's length.
-  `PLAYBACK_DELAY` is still capped at `holdMost`, because keeping the DVR fed
-  and leaving the viewer at the live edge are different things and only the
-  first has been shown past forty-five seconds.
+  `PLAYBACK_DELAY` is still capped at `holdMost`, and the reason is now
+  measured rather than guessed: **the DVR's timeline starts when the response
+  headers land and advances only when media arrives.** Its log says `Opened
+  connection` at request plus 18.9 seconds on every held tune — the end of the
+  1xx window — and NULL packets carry no time, so every second of hold after
+  that is a second the viewer is behind, for the whole session. A forty-five
+  second hold is at the live edge; ninety is far behind it. Reopening the
+  encoder five seconds into the program — a timestamp jump — changed nothing,
+  because a DVR stitches over discontinuities rather than resetting its clock.
+  Nothing sent after a hold can put those seconds back. Only the pre-roll
+  moves the clock during the wait, because it is real frames, which is also
+  why it lands in the recording; a longer hold has to be one or the other.
+  (The log that started the starvation theory does not match it either: the
+  sixty second run that "tuned again at thirty-one seconds" was the client
+  hanging up 2.8 seconds after the headers, inside the volume window, and its
+  retry ran through. The heartbeat is harmless. It was not the fix.)
 
   The explanation that got there first was that a hold carries no *service* —
   only PID 0x1FFF, no PAT, no PMT — so the DVR gives up for want of a program.

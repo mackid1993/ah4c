@@ -23,13 +23,21 @@ import (
 var holdDelay time.Duration
 
 // holdMost is as long as a tune is held, whatever PLAYBACK_DELAY asks for.
-// Forty-five seconds is the longest confirmed against a real DVR: half again
-// the thirty seconds a DVR allows a tune, which is the whole point of holding
-// one, and a length that has been tuned over and over rather than argued for.
-// Longer holds do keep the DVR fed — the filler goes on indefinitely — but
-// have not been confirmed to leave the viewer at the live edge, and a hold
-// that records behind the live edge is worse than no hold at all. Raise this
-// when there is a tune to point at, not before.
+// Forty-five seconds is at the live edge; ninety is far behind it, and the
+// reason is the DVR's clock, not anything sent here. The DVR starts the
+// channel's timeline when the response headers land — request plus 18.9s
+// on every held tune in its log, right after the 1xx window — and from then
+// on that timeline advances only when media arrives. NULL packets carry no
+// time, so every second of hold past the headers is a second the timeline
+// falls behind the wall, and it stays behind for the session: a timestamp
+// jump does not reset it (reopening the encoder five seconds into the
+// program was tried and changed nothing), because a DVR has to stitch over
+// discontinuities for its recordings to keep their length. So a NULL hold
+// is bounded by the 1xx window plus however much lag the client puts up
+// with, which comes to about forty-five seconds here. The pre-roll is not
+// bounded this way — real frames move the clock at 1x for the whole wait —
+// and is the only thing here that can hold longer. Longer holds also keep
+// the DVR fed; that was never the limit.
 const holdMost = 45 * time.Second
 
 const (
