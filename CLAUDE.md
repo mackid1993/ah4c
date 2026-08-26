@@ -85,6 +85,28 @@ Each of these cost a recording before it was written down.
     listener is where it belongs, bounded so a container that cannot do it still
     comes up.
 
+11. **A thing that looks like a bug may be the thing that works.** The hold
+    opened the encoder with `http.Client{Timeout: 20 * time.Second}`. That field
+    covers reading the body, not just connecting, so twenty seconds into every
+    held tune the encoder's body was force-closed mid-stream — which reads
+    exactly like a mistake, and was removed as one. It was load-bearing. The
+    stall reader reconnects on that error and serves NULL packets across the
+    join; NULL packets carry no time, so the encoder output produced during the
+    gap is never delivered and the player crosses the join in zero playback
+    time. That is the only mechanism here that *sheds* lag — the DVR's buffer is
+    downstream and nothing in this program can take bytes out of it. Removing
+    the timeout removed the only thing pulling the viewer back to the live edge,
+    and the tune went seconds behind and stayed there. Three builds prove it:
+    with the timeout, at the live edge; without it, behind; with it restored, at
+    the live edge again.
+
+    Two things follow. Before deleting something that looks wrong, find out what
+    goes quiet when it is gone — here it was `encoder stream ended …;
+    reconnecting` every twenty seconds, and that line disappearing *was* the
+    regression. And a log going silent is a symptom, not the absence of one: a
+    reader that has stopped produces no errors because nothing is flowing
+    through it.
+
 ## Working here
 
 - **`main.go` is being broken up, not grown.** New behavior goes in its own
@@ -112,6 +134,15 @@ Each of these cost a recording before it was written down.
   and a test.** Two of them have been silently wrong — one because an edit never
   saved and the mistake was only visible in a commit message. Conditions buried
   in loops cannot be checked.
+- **A hold has to keep a program in the stream, not just bytes.** NULL packets
+  carry no picture, no sound and no clock, which is why they are what a hold
+  sends — but they carry no service either, and a DVR handed PID 0x1FFF and
+  nothing else eventually decides there is nothing there and tunes again. That
+  is what bounded `PLAYBACK_DELAY` to about forty-five seconds before anyone
+  noticed there was a bound. The hold sends a PAT and a PMT naming PIDs it never
+  sends a packet on, version_number 1 so the encoder's own version 0 tables are
+  not mistaken for a repeat at the hand-off.
+
 - **Say what was measured and what was assumed.** The log prints the real-time
   factor, the backend actually chosen, and the numbers behind anything held
   back, so a disagreement can be settled with evidence rather than opinion.
