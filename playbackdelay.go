@@ -649,16 +649,6 @@ type refreshSource struct {
 	at    time.Time
 	done  bool
 	label string
-	// The reopen is a fresh encoder session with its own time base, so its
-	// first packets carry the discontinuity indicator — the same signal the
-	// hand-off carries — to tell the player the clock is new and to reset to
-	// it. Without it the reopen delivers fresh live content with no reset, and
-	// the outer marker is already spent from the hand-off, so a player that
-	// built a buffer over a long hold fits the new content behind that buffer
-	// and stays there. This is what the reopen was meant to do all along and
-	// silently was not.
-	mark bool
-	seen map[int]bool
 }
 
 func (r *refreshSource) Read(p []byte) (int, error) {
@@ -671,36 +661,8 @@ func (r *refreshSource) Read(p []byte) (int, error) {
 			old := r.ReadCloser
 			r.ReadCloser = fresh
 			old.Close()
-			r.mark, r.seen = true, map[int]bool{}
-			logger("[HOLD] %s reopened the encoder, marked the new time base, dropping what the DVR had stored ahead of the show", r.label)
+			logger("[HOLD] %s reopened the encoder, dropping what the DVR had stored ahead of the show", r.label)
 		}
 	}
-	n, err := r.ReadCloser.Read(p)
-	if r.mark && n > 0 {
-		r.markReopen(p[:n])
-	}
-	return n, err
-}
-
-// markReopen sets the discontinuity indicator on the first packet of each PID
-// after a reopen, then steps aside once a read has marked any — the same rule
-// the hand-off's marker follows.
-func (r *refreshSource) markReopen(p []byte) {
-	marked := 0
-	for i := 0; i+tsPacketSize <= len(p); i += tsPacketSize {
-		pkt := p[i : i+tsPacketSize]
-		if pkt[0] != 0x47 || pkt[3]>>4&2 == 0 || pkt[4] == 0 {
-			continue
-		}
-		pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
-		if pid == 0x1FFF || r.seen[pid] {
-			continue
-		}
-		r.seen[pid] = true
-		pkt[5] |= 0x80
-		marked++
-	}
-	if marked > 0 {
-		r.mark = false
-	}
+	return r.ReadCloser.Read(p)
 }
