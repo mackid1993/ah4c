@@ -31,6 +31,15 @@ const (
 	// a trickle from the first byte starves it, and it gives up.
 	nullDetect = 6 * time.Second
 	nullIdle   = 500 * time.Millisecond
+	// A DVR decides the body is a stream, and then keeps deciding. The
+	// keepalive after nullDetect is three kilobits a second, and a DVR will
+	// sit through about twenty seconds of that before concluding the stream
+	// has died — which is why a forty-five second hold worked and a sixty
+	// second one tuned again part way through. So the volume comes back for a
+	// moment every nullBeat, which costs a few kilobytes and refreshes
+	// whatever patience the DVR is keeping.
+	nullBeat    = 12 * time.Second
+	nullBeatFor = 1 * time.Second
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -270,10 +279,7 @@ func (l *lateEncoder) showPreroll(p []byte, d time.Duration) (int, error) {
 // detection window, a keepalive after. Every byte here is one the DVR stores
 // ahead of the show.
 func (l *lateEncoder) serveNulls(p []byte, d time.Duration) (int, error) {
-	pace, burst := nullPace, nullBurst
-	if time.Since(l.dietFrom()) > nullDetect {
-		pace, burst = nullIdle, tsPacketSize
-	}
+	pace, burst := holdRate(time.Since(l.dietFrom()))
 	if d > pace || d <= 0 {
 		d = pace
 	}
@@ -556,4 +562,18 @@ func holdOnHints(w http.ResponseWriter, src io.Reader, tuner, channel string) (*
 		return nil, true
 	}
 	return h, true
+}
+
+// holdRate is how fast filler goes out, given how long the DVR has had a body
+// to look at. Volume while it is deciding it has a stream, a keepalive after,
+// and volume again for a moment every nullBeat so it goes on deciding that.
+// Kept as its own function so the shape can be checked without a DVR.
+func holdRate(since time.Duration) (time.Duration, int) {
+	if since <= nullDetect {
+		return nullPace, nullBurst
+	}
+	if (since-nullDetect)%nullBeat < nullBeatFor {
+		return nullPace, nullBurst
+	}
+	return nullIdle, tsPacketSize
 }
