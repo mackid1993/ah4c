@@ -119,6 +119,40 @@ Each of these cost a recording before it was written down.
     going silent is a symptom, not the absence of one: a reader that has stopped
     produces no errors because nothing is flowing through it.
 
+12. **The ffmpeg in the image is not the ffmpeg on your machine.** A PNG
+    pre-roll never appeared. Every test of it passed here, because a Homebrew
+    ffmpeg decodes everything. The one in the image is Channels' build, meant
+    for transcoding video, and among still formats it decodes mjpeg and nothing
+    else — `Decoder (codec png) not found`. It has no `setsar` filter either,
+    which was separately breaking JPEG stills. A still is now decoded with Go's
+    own decoders and handed over as a JPEG, so nothing is asked of ffmpeg that
+    it cannot do.
+
+    The image is right there: `docker run --rm --entrypoint /bin/sh <image> -c
+    'ffmpeg -decoders'`. Two minutes of that would have saved an evening.
+    Anything that shells out — ffmpeg, ffprobe, adb — gets checked in the
+    container before it is believed.
+
+13. **Reasoning is not evidence, and a log line beats an argument.** In one
+    evening these all shipped and all were wrong: rewriting the program's
+    tables so the player would re-read them; making a discontinuity marker
+    actually mark, on the one path that was working *because* it was inert;
+    moving the caption engine to start at the hand-off, which put its whole
+    start-up cost between dropping the encoder's queue and the first frame;
+    and inventing a service for the hold to advertise. Every one was coherent,
+    tested, and aimed at something that was not the problem.
+
+    What found each real cause was a measurement or a line of the user's log —
+    `Client.Timeout ... while reading body`, `Decoder (codec png) not found`,
+    `start on keyframe, 1.629s from the mark`. Before changing behaviour, have
+    a number or a log line that says what is wrong. "This should help" is how
+    a working build gets broken.
+
+    Two corollaries. Change one thing between comparisons: forty-five seconds
+    was tested on one build and sixty on another, and hours went into
+    explaining a difference that may not have existed. And if something looks
+    inert on a path that works, leave it — see rule 11.
+
 ## Working here
 
 - **`main.go` is being broken up, not grown.** New behavior goes in its own
@@ -146,14 +180,24 @@ Each of these cost a recording before it was written down.
   and a test.** Two of them have been silently wrong — one because an edit never
   saved and the mistake was only visible in a commit message. Conditions buried
   in loops cannot be checked.
-- **A hold has to keep a program in the stream, not just bytes.** NULL packets
-  carry no picture, no sound and no clock, which is why they are what a hold
-  sends — but they carry no service either, and a DVR handed PID 0x1FFF and
-  nothing else eventually decides there is nothing there and tunes again. That
-  is what bounded `PLAYBACK_DELAY` to about forty-five seconds before anyone
-  noticed there was a bound. The hold sends a PAT and a PMT naming PIDs it never
-  sends a packet on, version_number 1 so the encoder's own version 0 tables are
-  not mistaken for a repeat at the hand-off.
+- **What bounds a hold is how long the DVR is left starving, not how long the
+  hold is.** After the detection window the filler drops to one packet every
+  half second — three kilobits — and a DVR sits through about twenty seconds of
+  that and then decides the stream has died. A forty-five second hold leaves it
+  there for twenty-one seconds and works; a sixty second hold leaves it there
+  for thirty-six and the DVR tunes again. So the volume comes back for a second
+  every five, and the thin stretch is four seconds whatever the hold's length.
+  `PLAYBACK_DELAY` is still capped at `holdMost`, because keeping the DVR fed
+  and leaving the viewer at the live edge are different things and only the
+  first has been shown past forty-five seconds.
+
+  The explanation that got there first was that a hold carries no *service* —
+  only PID 0x1FFF, no PAT, no PMT — so the DVR gives up for want of a program.
+  A version of this built and shipped tables naming PIDs nothing was ever sent
+  on, and the DVR locked onto them and never played at all. It is wrong twice
+  over: a forty-five second hold carries no program either and forty-five
+  works, and tables invented here cannot name what the encoder is about to
+  send. Do not rebuild it.
 
 - **Say what was measured and what was assumed.** The log prints the real-time
   factor, the backend actually chosen, and the numbers behind anything held
