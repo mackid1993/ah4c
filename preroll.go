@@ -91,7 +91,7 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	var kind []string
 	if still {
 		args = append(args, "-loop", "1", "-framerate", "30", "-t", fmt.Sprint(prerollStillSeconds))
-		kind = append(kind, fmt.Sprintf("%s still fitted to %s as a %d second clip", video, prerollFrame, prerollStillSeconds))
+		kind = append(kind, fmt.Sprintf("%s still cropped to %s as a %d second clip", video, prerollFrame, prerollStillSeconds))
 	}
 	args = append(args, "-i", src)
 	if audio == "" {
@@ -113,15 +113,19 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 		if still {
 			// A photograph is whatever size the camera made it. Encoded at
 			// that size a phone picture is a 4032x3024 H.264 stream at level
-			// 6, past what most decoders will touch, and it simply never
-			// appears; a portrait picture becomes a portrait channel. Video
-			// pre-rolls do not have this problem because a video is already a
-			// sensible size, which is why they work and stills did not. So a
-			// still is fitted into a broadcast frame: scaled to fit, centred,
-			// and padded rather than stretched, so nothing is cropped or
-			// squashed whatever shape it came in.
-			vf = "scale=" + prerollFrame + ":force_original_aspect_ratio=decrease," +
-				"pad=" + prerollFrame + ":(ow-iw)/2:(oh-ih)/2,setsar=1"
+			// 6, past what most decoders will touch, and it never appears at
+			// all; a portrait picture becomes a portrait channel; and a
+			// picture of any odd size makes a pre-roll whose resolution
+			// differs from the programme's, so the stream changes resolution
+			// part way through. Video pre-rolls never had this because a video
+			// is already a sensible size.
+			//
+			// So every still becomes the same thing: scaled up until it covers
+			// a broadcast frame, then cropped to it from the centre. It fills
+			// the screen, it is never stretched, and it is the resolution the
+			// programme arrives at, so nothing changes at the hand-off.
+			vf = "scale=" + prerollFrame + ":force_original_aspect_ratio=increase," +
+				"crop=" + prerollFrame + ",setsar=1"
 		}
 		args = append(args, "-vf", vf, "-c:v", "h264", "-pix_fmt", "yuv420p", "-g", "30")
 		if !still {
