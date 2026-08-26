@@ -35,10 +35,12 @@ const (
 	// keepalive after nullDetect is three kilobits a second, and a DVR will
 	// sit through about twenty seconds of that before concluding the stream
 	// has died — which is why a forty-five second hold worked and a sixty
-	// second one tuned again part way through. So the volume comes back for a
-	// moment every nullBeat, which costs a few kilobytes and refreshes
-	// whatever patience the DVR is keeping.
-	nullBeat    = 12 * time.Second
+	// second one tuned again part way through. So the volume comes back for
+	// nullBeatFor every nullBeat, and the thin stretch never runs longer than
+	// four seconds however long the hold is. Four rather than eleven because
+	// twenty-one seconds is one measurement on one box, and a DVR with less
+	// patience than that one should hold too.
+	nullBeat    = 5 * time.Second
 	nullBeatFor = 1 * time.Second
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
