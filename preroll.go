@@ -7,6 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"os"
 	"os/exec"
@@ -84,9 +88,7 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	if video == "" {
 		return prerollPlan{}, fmt.Errorf("has no video stream")
 	}
-	// ffprobe reports a still image as a one-frame video from an image
-	// demuxer; those are named image2 or end in _pipe.
-	still := strings.Contains(info.Format.FormatName, "image2") || strings.HasSuffix(info.Format.FormatName, "_pipe")
+	still := stillFormat(info)
 	var args []string
 	var kind []string
 	if still {
@@ -124,8 +126,10 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 			// a broadcast frame, then cropped to it from the centre. It fills
 			// the screen, it is never stretched, and it is the resolution the
 			// programme arrives at, so nothing changes at the hand-off.
+			// No setsar: the ffmpeg bundled here does not have that filter,
+			// and a still's pixels are square already.
 			vf = "scale=" + prerollFrame + ":force_original_aspect_ratio=increase," +
-				"crop=" + prerollFrame + ",setsar=1"
+				"crop=" + prerollFrame
 		}
 		args = append(args, "-vf", vf, "-c:v", "h264", "-pix_fmt", "yuv420p", "-g", "30")
 		if !still {
@@ -217,6 +221,21 @@ func preparePreroll(src string) {
 	if err := json.Unmarshal(out, &info); err != nil {
 		logger("[PREROLL] ffprobe's report on %s did not parse: %v; holds will use NULL packets", src, err)
 		return
+	}
+	// The ffmpeg bundled here decodes almost no still formats — PNG among
+	// them — so a still is decoded with Go's own decoders and handed over as a
+	// JPEG, which is the one image format it always reads.
+	if stillFormat(info) {
+		if jpg, jerr := stillToJPEG(src); jerr != nil {
+			logger("[PREROLL] %s could not be read as a picture (%v); letting ffmpeg try it as it is", src, jerr)
+		} else if out, perr := exec.CommandContext(ctx, "ffprobe", "-v", "error",
+			"-show_entries", "stream=codec_type,codec_name:format=format_name",
+			"-of", "json", jpg).Output(); perr == nil {
+			var reread prerollProbe
+			if json.Unmarshal(out, &reread) == nil {
+				src, info = jpg, reread
+			}
+		}
 	}
 	plan, err := planPreroll(src, info)
 	if err != nil {
@@ -711,4 +730,43 @@ func (e *earlyReader) Close() error {
 		}
 	}()
 	return nil
+}
+
+// stillFormat reports whether ffprobe is describing a still image rather than
+// a video. It reports one as a one-frame video from an image demuxer, and
+// those are named image2 or end in _pipe.
+func stillFormat(info prerollProbe) bool {
+	return strings.Contains(info.Format.FormatName, "image2") ||
+		strings.HasSuffix(info.Format.FormatName, "_pipe")
+}
+
+// stillToJPEG decodes a picture with Go's own decoders and writes it back as a
+// JPEG. The ffmpeg bundled with this image has no decoder for PNG, BMP, GIF,
+// WebP or TIFF — a PNG pre-roll failed with "Decoder (codec png) not found"
+// and the hold quietly fell back to NULL packets — while mjpeg is always
+// there. Go reads PNG, JPEG and GIF from the standard library, so the formats
+// people actually drop in are covered without asking anything of ffmpeg.
+func stillToJPEG(src string) (string, error) {
+	f, err := os.Open(src)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	img, kind, err := image.Decode(f)
+	if err != nil {
+		return "", err
+	}
+	out := filepath.Join(filepath.Dir(prerollCache), "preroll-still.jpg")
+	w, err := os.Create(out)
+	if err != nil {
+		return "", err
+	}
+	defer w.Close()
+	if err := jpeg.Encode(w, img, &jpeg.Options{Quality: 95}); err != nil {
+		return "", err
+	}
+	b := img.Bounds()
+	logger("[PREROLL] read %s as a %dx%d %s and handed it over as a JPEG, which is the one still format ffmpeg here decodes",
+		filepath.Base(src), b.Dx(), b.Dy(), kind)
+	return out, nil
 }
