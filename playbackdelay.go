@@ -109,6 +109,9 @@ func tuneHoldStartup() {
 	}
 	prerollStartup()
 	detect := strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE")
+	if holdDelay > 0 && detect {
+		logger("[HOLD] PLAYBACK_DELAY is set, so PLAYBACK_DETECTION does not run: the delay decides when the program starts")
+	}
 	switch {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
@@ -179,6 +182,10 @@ type lateEncoder struct {
 	until   time.Time
 	preroll *prerollPlayer
 	pend    []byte
+	// tuner and name are what captions are wrapped with, applied to the
+	// encoder's own stream rather than to the hold in front of it.
+	tuner int
+	name  string
 
 	mu     sync.Mutex
 	body   io.ReadCloser
@@ -188,8 +195,8 @@ type lateEncoder struct {
 
 // newLateEncoder holds from t0 until the delay is up, then opens url. early is
 // a pre-roll already playing, which it takes over and shows for the wait.
-func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer) *lateEncoder {
-	l := &lateEncoder{url: url, label: label, t0: t0, until: t0.Add(holdDelay), preroll: early}
+func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner int, name string) *lateEncoder {
+	l := &lateEncoder{url: url, label: label, t0: t0, until: t0.Add(holdDelay), preroll: early, tuner: tuner, name: name}
 	if l.preroll != nil {
 		l.preroll.adopted.Store(true)
 	} else {
@@ -304,7 +311,13 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	liveEdge(resp.Body, l.label)
 	armed := make(chan struct{})
 	close(armed)
-	body := markDiscontinuity(newGateReader(maybeWrapNullFrameInsertion(resp.Body, l.url, l.label), armed, true, time.Now(), nil))
+	// Captions wrap the encoder's stream, not the hold in front of it.
+	// Wrapping the hold hands the caption engine the pre-roll to work on and
+	// lets it rewrite the pre-roll's own video packets on the way past.
+	// Playback detection wraps it this way round, and its hand-off is clean.
+	body := markDiscontinuity(maybeWrapCaptions(
+		newGateReader(maybeWrapNullFrameInsertion(resp.Body, l.url, l.label), armed, true, time.Now(), nil),
+		l.tuner, l.name))
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()

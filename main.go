@@ -425,7 +425,10 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			var ready chan struct{}
 			var base map[string]bool
 			var sig string
-			if strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE") {
+			// The delay decides when the program starts, so playback detection
+			// does not run at all alongside it: no adb baseline before the
+			// tune, and nothing polling the box while the hold is in flight.
+			if holdDelay == 0 && strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE") {
 				ready = make(chan struct{})
 				base = audioBaseline(t.tunerip)
 				sig = mediaSignature(t.tunerip)
@@ -443,7 +446,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// wait is the pre-roll or NULL packets, and the encoder is
 				// opened when the delay is up, so the program starts at the
 				// top of its own session rather than joined in progress.
-				body = maybeWrapCaptions(newLateEncoder(t.url, label, early.from(tuneStart), early.player()), i, fmt.Sprintf("tuner%d", i))
+				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i))
 			} else {
 				resp, err := http.Get(t.url)
 				if err != nil {
