@@ -22,6 +22,16 @@ import (
 // holdDelay is the playback delay as parsed at startup; zero when unset.
 var holdDelay time.Duration
 
+// holdMost is as long as a tune is held, whatever PLAYBACK_DELAY asks for.
+// Forty-five seconds is the longest confirmed against a real DVR: half again
+// the thirty seconds a DVR allows a tune, which is the whole point of holding
+// one, and a length that has been tuned over and over rather than argued for.
+// Longer holds do keep the DVR fed — the filler goes on indefinitely — but
+// have not been confirmed to leave the viewer at the live edge, and a hold
+// that records behind the live edge is worse than no hold at all. Raise this
+// when there is a tune to point at, not before.
+const holdMost = 45 * time.Second
+
 const (
 	// The wait's byte diet: volume through the DVR's detection window, then
 	// a keepalive. Every byte here is one the DVR stores ahead of the show.
@@ -116,6 +126,11 @@ func tuneHoldStartup() {
 			logger("[HOLD] PLAYBACK_DELAY %q %v; tunes are not being held", s, err)
 		} else {
 			holdDelay = d
+			if holdDelay > holdMost {
+				logger("[HOLD] PLAYBACK_DELAY %s is longer than %s, which is as long as a hold has been confirmed to keep a tune at the live edge; holding for %s",
+					holdWords(holdDelay), holdWords(holdMost), holdWords(holdMost))
+				holdDelay = holdMost
+			}
 		}
 	}
 	prerollStartup()
