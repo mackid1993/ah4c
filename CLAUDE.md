@@ -87,13 +87,15 @@ Each of these cost a recording before it was written down.
 
 ## Working here
 
-- **Do not change `main.go`.** Its diff against upstream is kept purely
-  additive, and `ui-refactor` is the pull request that carries it. Caption work
-  lives in `captions.go` and the model files. This holds even when `main.go`
-  looks like the right place: the playback gate there is 40s plus an 8s
-  keyframe wait against the DVR's 30, which is a real problem and still not a
-  reason to edit that file. Fix the contention instead, or raise it and wait to
-  be told.
+- **`main.go` is being broken up, not grown.** New behavior goes in its own
+  file, named for the feature or the environment variable that switches it on
+  (`nullframeinsertion.go`, `nullframedelay.go`, `preroll.go`, the caption and
+  model files), and the edit to `main.go` is the wiring: a call at the place
+  the feature hooks in, an `[ENV]` line, and nothing else. When something in
+  `main.go` needs more than that, move it out into a file first and change it
+  there. The playback gate there is 40s plus an 8s keyframe wait against the
+  DVR's 30, which is a real problem; `NULL_FRAME_DELAY` is the answer to it
+  from outside the gate, so fix the contention rather than the gate.
 - **American spelling everywhere.** Code, comments, commit messages, log lines,
   user-facing text. See `~/.claude/CLAUDE.md`.
 - **Each speech model owns a file.** `cohere.go`, `nemotron.go`, `moonshine.go`

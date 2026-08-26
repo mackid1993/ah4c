@@ -10,3 +10,4 @@
 # Scratch tests written by review agents
 /zz_*_test.go
 /guard_test.go
+_todo/
