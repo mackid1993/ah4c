@@ -87,25 +87,37 @@ Each of these cost a recording before it was written down.
 
 11. **A thing that looks like a bug may be the thing that works.** The hold
     opened the encoder with `http.Client{Timeout: 20 * time.Second}`. That field
-    covers reading the body, not just connecting, so twenty seconds into every
-    held tune the encoder's body was force-closed mid-stream — which reads
-    exactly like a mistake, and was removed as one. It was load-bearing. The
-    stall reader reconnects on that error and serves NULL packets across the
-    join; NULL packets carry no time, so the encoder output produced during the
-    gap is never delivered and the player crosses the join in zero playback
-    time. That is the only mechanism here that *sheds* lag — the DVR's buffer is
-    downstream and nothing in this program can take bytes out of it. Removing
-    the timeout removed the only thing pulling the viewer back to the live edge,
-    and the tune went seconds behind and stayed there. Three builds prove it:
-    with the timeout, at the live edge; without it, behind; with it restored, at
-    the live edge again.
+    covers reading the body, not just connecting, so twenty seconds into a held
+    tune the encoder's body was force-closed mid-stream — which reads exactly
+    like a mistake, and was removed as one. It was load-bearing. Breaking the
+    connection is what discards whatever the DVR has stored ahead of the show,
+    because reopening starts again at the encoder's live output. It is the only
+    thing here that *sheds* lag: the DVR's buffer is downstream and nothing in
+    this program can take bytes out of it. Removing the timeout removed the only
+    thing pulling the viewer back to the live edge, and the tune went seconds
+    behind and stayed there. Three builds: with it, at the live edge; without
+    it, behind; with it restored, at the live edge again.
 
-    Two things follow. Before deleting something that looks wrong, find out what
-    goes quiet when it is gone — here it was `encoder stream ended …;
-    reconnecting` every twenty seconds, and that line disappearing *was* the
-    regression. And a log going silent is a symptom, not the absence of one: a
-    reader that has stopped produces no errors because nothing is flowing
-    through it.
+    It is not a timeout any more. A break by timeout happens at a moment nothing
+    chose and leaves nothing able to decline it — the connection is closed by
+    force and then has to be opened again, and an encoder that will not take a
+    second reader while a tuner owns the stream has no way to say so. So
+    `refreshSource` makes the break instead of suffering it: the new connection
+    is opened first, and only once it is up is the old one closed. An encoder
+    that refuses costs nothing, and is not asked twice.
+
+    Say what is known and what is inferred. It happens **once** per tune, not
+    every twenty seconds — the reopened connection has no body timeout, so after
+    one break the stream runs on. Nobody has yet watched a recording across that
+    mark. That removing the break puts the viewer behind is measured; that a
+    discarded buffer is *why* is the best explanation available, not a proven
+    one.
+
+    Two things follow generally. Before deleting something that looks wrong,
+    find out what goes quiet when it is gone — here it was `encoder stream ended
+    …; reconnecting`, and that line disappearing *was* the regression. And a log
+    going silent is a symptom, not the absence of one: a reader that has stopped
+    produces no errors because nothing is flowing through it.
 
 ## Working here
 
