@@ -373,8 +373,9 @@ func parseCommand(cmd string) []string {
 	return args
 }
 
-// Tune into a application or network encoder
-func tune(idx, channel string) (io.ReadCloser, error) {
+// Tune into a application or network encoder. early is the pre-roll already
+// playing for this request, for the hold to carry on with, or nil.
+func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 	tunerLock.Lock()
 	defer tunerLock.Unlock()
 	intidx, _ := strconv.Atoi(idx)
@@ -434,41 +435,9 @@ func tune(idx, channel string) (io.ReadCloser, error) {
 				t.active = false
 				continue
 			}
-			if secs, _ := strconv.Atoi(os.Getenv("PLAYBACK_DELAY")); secs > 0 && ready == nil {
-				if secs > 30 {
-					logger("[PLAYBACK] %s PLAYBACK_DELAY %d is above the 30 second maximum, using 30", t.tunerip, secs)
-					secs = 30
-				}
-				if secs < 2 {
-					logger("[PLAYBACK] %s PLAYBACK_DELAY %d is below the 2 second minimum, using 2", t.tunerip, secs)
-					secs = 2
-				}
-				skip := secs - int(time.Since(tuneStart).Seconds()) - 2
-				if skip < 2 {
-					skip = 2
-				}
-				logger("[PLAYBACK] %s delaying playback for %d seconds", t.tunerip, secs)
-				cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
-					"-i", t.url, "-ss", strconv.Itoa(skip), "-c:v", "copy", "-c:a", "copy", "-f", "mpegts", "pipe:1")
-				cmd.Stderr = os.Stderr
-				pipe, err := cmd.StdoutPipe()
-				if err == nil {
-					err = cmd.Start()
-				}
-				if err != nil {
-					logger("[ERR] Failed to start ffmpeg for PLAYBACK_DELAY: %v", err)
-					t.active = false
-					continue
-				}
-				t.active = true
-				t.index = i
-				return &reader{
-					ReadCloser: maybeWrapCaptions(pipe, i, fmt.Sprintf("tuner%d", i)),
-					channel:    channel,
-					t:          t,
-					cmd:        cmd,
-				}, nil
-			}
+			label := fmt.Sprintf("tuner=%s", t.tunerip)
+			var body io.ReadCloser
+			var gate *gateReader
 			resp, err := http.Get(t.url)
 			if err != nil {
 				logger("[ERR] Failed to fetch source: %v", err)
@@ -481,7 +450,7 @@ func tune(idx, channel string) (io.ReadCloser, error) {
 				continue
 			}
 			// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
-			var body io.ReadCloser = resp.Body
+			body = resp.Body
 			if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 				body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
 					r, e := http.Get(t.url)
@@ -493,14 +462,16 @@ func tune(idx, channel string) (io.ReadCloser, error) {
 						return nil, fmt.Errorf("status %s", r.Status)
 					}
 					return r.Body, nil
-				}, fmt.Sprintf("tuner=%s", t.tunerip))
+				}, label)
 			}
-			var gate *gateReader
-			if ready != nil {
-				gate = newGateReader(body, ready)
+			// The gate holds the stream back until the hold says so:
+			// playback detection with a pre-roll to show while it waits.
+			hold := newTuneHold(tuneStart, ready, label, early.player())
+			if hold != nil {
+				gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
 				body = gate
 			}
-			body = maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i))
+			body = hold.wrap(maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i)))
 			t.active = true
 			t.index = i
 			r := &reader{
@@ -690,23 +661,23 @@ func run() error {
 	r.GET("/play/tuner:tuner/:channel", func(c *gin.Context) {
 		tuner := c.Param("tuner")
 		channel := c.Param("channel")
-		reader, err := tune(tuner, channel)
+		reader, err := tuneEarly(tuner, channel)
 		if err != nil {
 			logger("[ERR] Failed to tune %s", err)
 			errorMessage := fmt.Sprintf("<html><body><h1>Error: %s</h1></body></html>", err.Error())
 			c.Data(500, "text/html; charset=utf-8", []byte(errorMessage))
 			return
 		}
+		// Closing the reader is what releases the tuner, runs the stop script
+		// and closes the encoder's connection, so every path must reach it.
+		defer reader.Close()
+		starttime := time.Now()
+		var bytesCopied int64
 		c.Header("Transfer-Encoding", "identity")
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
-		defer func() {
-			reader.Close()
-		}()
-		starttime := time.Now()
-		var bytesCopied int64
-		if bytesCopied, err = io.Copy(c.Writer, reader); err != nil {
+		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
@@ -1297,6 +1268,7 @@ func loadenv() {
 func main() {
 	logger("[START] ah4c %s is starting", buildVersion())
 	loadenv()
+	prerollStartup()
 	loadCaptionConfig()
 	warnIfNotPersistent()
 	restoreGPURuntime()
@@ -1848,14 +1820,24 @@ type gateReader struct {
 	peak     int
 	vid      map[int]bool
 
+	// timed is set when a timer chose the wait, so the gate releases on the
+	// keyframe nearest the moment the timer named rather than weighing motion.
+	timed  bool
+	target time.Time
+	// detect closes when playback detection has seen the app playing; nil
+	// when detection is off. It is what allows the gate to take a keyframe
+	detect <-chan struct{}
+
 	sess       sessionSource
 	sessSeen   int64
 	sess0      int64
 	expectSwap atomic.Bool
 }
 
-func newGateReader(src io.ReadCloser, ready <-chan struct{}) *gateReader {
-	g := &gateReader{src: src, ready: ready, t0: time.Now()}
+// newGateReader gates src until ready closes. timed says the wait was a timer,
+// so the gate releases on the first keyframe after it rather than waiting to
+func newGateReader(src io.ReadCloser, ready <-chan struct{}, timed bool, target time.Time, detect <-chan struct{}) *gateReader {
+	g := &gateReader{src: src, ready: ready, t0: time.Now(), timed: timed, target: target, detect: detect}
 	if sc, ok := src.(sessionSource); ok {
 		g.sess = sc
 		g.sessSeen = sc.sessions()
@@ -1877,6 +1859,11 @@ func (g *gateReader) resync() {
 func (g *gateReader) expectNewStream() { g.expectSwap.Store(true) }
 
 func (g *gateReader) releaseKind() string {
+	// A timer decided how long to wait, so the gate's only remaining job is to
+	// start on a picture rather than in the middle of one. Weighing motion here
+	if g.timed {
+		return "timed"
+	}
 	if g.floor > 0 && g.lastWin >= g.floor*riseFactor {
 		return "moving"
 	}
@@ -1889,6 +1876,18 @@ func (g *gateReader) releaseKind() string {
 }
 
 func (g *gateReader) armed() bool {
+	return g.armedAtTime(time.Now())
+}
+
+// armedAtTime is armed as of a given moment, so the rule can be tested.
+// The hand-off lands on the keyframe nearest the timer's moment: the first
+func (g *gateReader) armedAtTime(now time.Time) bool {
+	if g.timed && !g.target.IsZero() {
+		if !now.Before(g.target) {
+			return true
+		}
+		return false
+	}
 	select {
 	case <-g.ready:
 		return true
@@ -1898,13 +1897,34 @@ func (g *gateReader) armed() bool {
 }
 
 func (g *gateReader) release(reason string) {
+	// Tables, then the keyframe, and nothing timestamped before the program:
+	// the DVR keeps time by the stream's own timestamps, so anything stamped
 	g.pend = append(append(append([]byte{}, g.pat...), g.pmt...), g.keep...)
 	g.open, g.keep = true, nil
-	logger("[PLAYBACK] started on a %s keyframe after %v", reason, time.Since(g.t0).Round(time.Millisecond))
+	if g.timed && !g.target.IsZero() {
+		logger("[PLAYBACK] start on keyframe, %v from the mark", time.Since(g.target).Round(time.Millisecond))
+		return
+	}
+	logger("[PLAYBACK] start on a %s keyframe after %v", reason, time.Since(g.t0).Round(time.Millisecond))
 }
 
-func videoPIDs(pkt []byte) map[int]bool {
-	s := pkt[5:]
+// gatePSI is the table section in pkt from its table_id on, however the
+// encoder packs it — payload only, or behind an adaptation field — or nil
+func gatePSI(pkt []byte, pusi bool, afc byte) []byte {
+	if !pusi || afc == 0 || afc == 2 {
+		return nil
+	}
+	off := 4
+	if afc == 3 {
+		off = 5 + int(pkt[4])
+	}
+	if off+1 >= 188 || pkt[off] != 0 {
+		return nil
+	}
+	return pkt[off+1:]
+}
+
+func videoPIDs(s []byte) map[int]bool {
 	if len(s) < 12 || s[0] != 0x02 {
 		return nil
 	}
@@ -1913,7 +1933,7 @@ func videoPIDs(pkt []byte) map[int]bool {
 	if end > len(s) {
 		end = len(s)
 	}
-	i := 12 + int(s[10]&0x0F)<<8 | int(s[11])
+	i := 12 + (int(s[10]&0x0F)<<8 | int(s[11]))
 	out := map[int]bool{}
 	for i+4 < end {
 		st := s[i]
@@ -1921,7 +1941,7 @@ func videoPIDs(pkt []byte) map[int]bool {
 		if st == 0x01 || st == 0x02 || st == 0x1B || st == 0x24 {
 			out[pid] = true
 		}
-		i += 5 + int(s[i+3]&0x0F)<<8 | int(s[i+4])
+		i += 5 + (int(s[i+3]&0x0F)<<8 | int(s[i+4]))
 	}
 	return out
 }
@@ -1937,15 +1957,15 @@ func (g *gateReader) scan(b []byte) int {
 		pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
 		afc, pusi := pkt[3]>>4&3, pkt[1]&0x40 != 0
 		if pid == 0 {
-			if pusi && afc == 1 && pkt[4] == 0 && pkt[5] == 0x00 {
+			if sec := gatePSI(pkt, pusi, afc); len(sec) > 0 && sec[0] == 0x00 {
 				g.pat = append(g.pat[:0], pkt...)
 			}
 			i += 188
 			continue
 		}
-		if pusi && afc == 1 && pkt[4] == 0 && pkt[5] == 0x02 {
+		if sec := gatePSI(pkt, pusi, afc); len(sec) > 0 && sec[0] == 0x02 {
 			g.pmt = append(g.pmt[:0], pkt...)
-			if v := videoPIDs(pkt); len(v) > 0 {
+			if v := videoPIDs(sec); len(v) > 0 {
 				g.vid = v
 			}
 			i += 188
@@ -2016,13 +2036,13 @@ func (g *gateReader) Read(p []byte) (int, error) {
 			break
 		}
 		if !g.open && !g.armed0.IsZero() && time.Since(g.armed0) > keyframeCeiling {
-			logger("[PLAYBACK] the encoder kept replacing its stream for %v after playback, starting unaligned",
+			logger("[PLAYBACK] encoder kept restarting for %v; starting unaligned",
 				time.Since(g.armed0).Round(time.Second))
 			g.pend = append(append([]byte{}, g.pat...), g.pmt...)
 			g.open, g.carry = true, nil
 		}
 		if !g.open && !g.armedAt.IsZero() && time.Since(g.armedAt) > keyframeWait {
-			logger("[PLAYBACK] no keyframe within %v of playback, starting unaligned", keyframeWait)
+			logger("[PLAYBACK] no keyframe within %v; starting unaligned", keyframeWait)
 			g.pend = append(append([]byte{}, g.pat...), g.pmt...)
 			g.open, g.carry = true, nil
 		}
@@ -2333,6 +2353,35 @@ func waitForPlayback(tunerip string, base map[string]bool, sig string, done <-ch
 	logger("[PLAYBACK] %s not confirmed within %v, gating on motion alone; baseline had %s, the box now has %s, media session %s",
 		tunerip, budget, piidList(base), piidList(last), session)
 	return swapComing
+}
+
+// flushWriter is a response that can be pushed all the way out.
+type flushWriter interface {
+	io.Writer
+	Flush()
+}
+
+// copyFlush is io.Copy, flushed after every write.
+func copyFlush(dst flushWriter, src io.Reader) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var n int64
+	for {
+		r, rerr := src.Read(buf)
+		if r > 0 {
+			w, werr := dst.Write(buf[:r])
+			n += int64(w)
+			if werr != nil {
+				return n, werr
+			}
+			dst.Flush()
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return n, nil
+			}
+			return n, rerr
+		}
+	}
 }
 
 // readWithDeadline does r.Read with a timeout: on expiry the body is closed,
