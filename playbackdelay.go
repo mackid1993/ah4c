@@ -321,8 +321,11 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 		preroll = l.preroll.stop()
 		l.preroll = nil
 	}
-	c := http.Client{Timeout: 20 * time.Second}
-	resp, err := c.Get(l.url)
+	// http.Get, not a client with a Timeout: that field covers reading the
+	// body, so it breaks the stream by force at a moment nothing chose and
+	// leaves nothing able to decline. The break is wanted — see refreshAt —
+	// but it is made deliberately below, and made so it can fail safely.
+	resp, err := http.Get(l.url)
 	if err == nil && resp.StatusCode != 200 {
 		resp.Body.Close()
 		err = fmt.Errorf("status %s", resp.Status)
@@ -339,7 +342,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// lets it rewrite the pre-roll's own video packets on the way past.
 	// Playback detection wraps it this way round, and its hand-off is clean.
 	body := markDiscontinuity(maybeWrapCaptions(
-		newGateReader(l.stallTolerant(resp.Body), armed, true, time.Now(), nil),
+		newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil),
 		l.tuner, l.name))
 	l.mu.Lock()
 	if l.closed {
@@ -613,4 +616,54 @@ func (l *lateEncoder) stallTolerant(body io.ReadCloser) io.ReadCloser {
 		}
 		return r.Body, nil
 	}, l.label)
+}
+
+// refreshAt is how long after the programme starts the encoder connection is
+// reopened once. The break discards whatever the DVR has stored ahead of the
+// show and starts again at the encoder's live output, which is what pulls the
+// viewer back to the live edge; without it the viewer stays wherever the
+// hand-off left them.
+const refreshAt = 20 * time.Second
+
+// refreshing reopens the encoder once, shortly after the programme starts, and
+// only if the encoder will have it. The new connection is opened before the old
+// one is closed, so an encoder that refuses a second reader — and some do,
+// while a tuner owns the stream — costs nothing at all: the refresh is declined,
+// said so once, and never tried again for this tune.
+func (l *lateEncoder) refreshing(body io.ReadCloser) io.ReadCloser {
+	return &refreshSource{ReadCloser: body, at: time.Now().Add(refreshAt), label: l.label, open: func() (io.ReadCloser, error) {
+		r, e := http.Get(l.url)
+		if e != nil {
+			return nil, e
+		}
+		if r.StatusCode != 200 {
+			r.Body.Close()
+			return nil, fmt.Errorf("status %s", r.Status)
+		}
+		return r.Body, nil
+	}}
+}
+
+type refreshSource struct {
+	io.ReadCloser
+	open  func() (io.ReadCloser, error)
+	at    time.Time
+	done  bool
+	label string
+}
+
+func (r *refreshSource) Read(p []byte) (int, error) {
+	if !r.done && !time.Now().Before(r.at) {
+		r.done = true
+		fresh, err := r.open()
+		if err != nil {
+			logger("[HOLD] %s the encoder would not open a second time (%v); leaving the stream as it is", r.label, err)
+		} else {
+			old := r.ReadCloser
+			r.ReadCloser = fresh
+			old.Close()
+			logger("[HOLD] %s reopened the encoder, dropping what the DVR had stored ahead of the show", r.label)
+		}
+	}
+	return r.ReadCloser.Read(p)
 }
