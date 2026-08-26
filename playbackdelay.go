@@ -427,7 +427,7 @@ const (
 	// hintCeiling is how long hints may run. The DVR's clock for the real
 	// response headers runs from the request and no 1xx resets it: measured
 	// at twenty-two seconds, so this keeps a wide margin under it.
-	hintCeilingDefault = 18 * time.Second
+	hintCeilingDefault = 0 * time.Second // EXPERIMENT: no 1xx window, so a 45s hold is 45s of NULL packets from the first byte
 	// hintProbe is how long to watch for a DVR that refuses 1xx outright.
 	hintProbe = 750 * time.Millisecond
 )
