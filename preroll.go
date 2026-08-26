@@ -27,6 +27,9 @@ const (
 	// prerollStillSeconds is how long a clip a still image is made into. It
 	// loops, so this only bounds the file's size.
 	prerollStillSeconds = 10
+	// prerollFrame is the frame a still is fitted into, whatever size and
+	// shape it arrives in. 1080p is what a DVR and its players expect.
+	prerollFrame = "1920:1080"
 	// prerollPrepareBudget bounds preparation, so a container handed a file
 	// it cannot turn into a transport stream still comes up.
 	prerollPrepareBudget = 10 * time.Minute
@@ -88,7 +91,7 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	var kind []string
 	if still {
 		args = append(args, "-loop", "1", "-framerate", "30", "-t", fmt.Sprint(prerollStillSeconds))
-		kind = append(kind, fmt.Sprintf("%s still as a %d second clip", video, prerollStillSeconds))
+		kind = append(kind, fmt.Sprintf("%s still fitted to %s as a %d second clip", video, prerollFrame, prerollStillSeconds))
 	}
 	args = append(args, "-i", src)
 	if audio == "" {
@@ -106,7 +109,21 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	} else {
 		// -c:v h264 picks whichever H.264 encoder this ffmpeg was built with.
 		// Even dimensions and yuv420p are what every H.264 encoder accepts;
-		args = append(args, "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "h264", "-pix_fmt", "yuv420p", "-g", "30")
+		vf := "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+		if still {
+			// A photograph is whatever size the camera made it. Encoded at
+			// that size a phone picture is a 4032x3024 H.264 stream at level
+			// 6, past what most decoders will touch, and it simply never
+			// appears; a portrait picture becomes a portrait channel. Video
+			// pre-rolls do not have this problem because a video is already a
+			// sensible size, which is why they work and stills did not. So a
+			// still is fitted into a broadcast frame: scaled to fit, centred,
+			// and padded rather than stretched, so nothing is cropped or
+			// squashed whatever shape it came in.
+			vf = "scale=" + prerollFrame + ":force_original_aspect_ratio=decrease," +
+				"pad=" + prerollFrame + ":(ow-iw)/2:(oh-ih)/2,setsar=1"
+		}
+		args = append(args, "-vf", vf, "-c:v", "h264", "-pix_fmt", "yuv420p", "-g", "30")
 		if !still {
 			kind = append(kind, video+" video encoded to h264")
 		}
