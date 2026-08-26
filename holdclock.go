@@ -98,6 +98,7 @@ func (c *holdClock) probe(url string) (string, bool) {
 	seen := map[int]int{}
 	var pat, pmt []byte
 	pmtPID, pcrPID := -1, -1
+	var sawPCR bool
 	for time.Now().Before(deadline) {
 		n, rerr := resp.Body.Read(tmp)
 		if n > 0 {
@@ -133,7 +134,7 @@ func (c *holdClock) probe(url string) (string, bool) {
 			// latest one starts the clock at the encoder's live edge.
 			if pcrPID >= 0 && pid == pcrPID {
 				if b, ok := packetPCR(pkt); ok {
-					latest, haveLatest = b, true
+					latest, haveLatest, sawPCR = b, true, true
 				}
 			}
 		}
@@ -147,7 +148,7 @@ func (c *holdClock) probe(url string) (string, bool) {
 		}
 	}
 	return fmt.Sprintf("read %s, pids %v; pat=%v pmt(pid %d)=%v pcr(pid %d)=%v",
-		byteCount(int64(len(buf))), topPIDs(seen), pat != nil, pmtPID, pmt != nil, pcrPID, haveBase), false
+		byteCount(int64(len(buf))), topPIDs(seen), pat != nil, pmtPID, pmt != nil, pcrPID, sawPCR), false
 }
 
 // topPIDs lists the busiest PIDs seen, for a probe that could not parse.
