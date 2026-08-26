@@ -31,18 +31,25 @@ var holdDelay time.Duration
 const holdMost = 10 * time.Minute
 
 const (
-	// The wait's filler: null packets at a steady volume for the whole hold,
-	// nullBurst every nullPace, about 3.7 KB/s. An earlier diet dropped to a
-	// thin keepalive after a six second detection window and brought the
-	// volume back for a second every five. That made the number of near-dead
-	// stretches grow with the hold — about four at forty-five seconds, about
-	// thirteen at ninety — which is the one thing in what the hold sends that
-	// scales with its length, and forty-five is where holds stop landing at
-	// the live edge. So the volume is now steady, to see whether those
-	// stretches were what bounded the hold. Null packets carry no time, so
-	// this is bytes and nothing else.
+	// The wait's byte diet: volume through the DVR's detection window, then
+	// a keepalive. Every byte here is one the DVR stores ahead of the show.
 	nullPace  = 100 * time.Millisecond
 	nullBurst = 2 * tsPacketSize
+	// Volume while the DVR decides the body is a stream, a keepalive after:
+	// a trickle from the first byte starves it, and it gives up.
+	nullDetect = 6 * time.Second
+	nullIdle   = 500 * time.Millisecond
+	// A DVR decides the body is a stream, and then keeps deciding. The
+	// keepalive after nullDetect is three kilobits a second, and a DVR will
+	// sit through about twenty seconds of that before concluding the stream
+	// has died — which is why a forty-five second hold worked and a sixty
+	// second one tuned again part way through. So the volume comes back for
+	// nullBeatFor every nullBeat, and the thin stretch never runs longer than
+	// four seconds however long the hold is. Four rather than eleven because
+	// twenty-one seconds is one measurement on one box, and a DVR with less
+	// patience than that one should hold too.
+	nullBeat    = 5 * time.Second
+	nullBeatFor = 1 * time.Second
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -575,15 +582,18 @@ func holdOnHints(w http.ResponseWriter, src io.Reader, tuner, channel string) (*
 	return h, true
 }
 
-// holdRate is how fast filler goes out: a steady volume for the whole hold,
-// nullBurst every nullPace. It once tapered to a keepalive after a detection
-// window, which made the stream go nearly dead in bursts whose count grew
-// with the hold; that is being removed to see whether it was what bounded the
-// hold at forty-five seconds. The argument is kept so the plumbing is there
-// to taper again if steady volume turns out to matter. Its own function so
-// the shape can be checked without a DVR.
-func holdRate(time.Duration) (time.Duration, int) {
-	return nullPace, nullBurst
+// holdRate is how fast filler goes out, given how long the DVR has had a body
+// to look at. Volume while it is deciding it has a stream, a keepalive after,
+// and volume again for a moment every nullBeat so it goes on deciding that.
+// Kept as its own function so the shape can be checked without a DVR.
+func holdRate(since time.Duration) (time.Duration, int) {
+	if since <= nullDetect {
+		return nullPace, nullBurst
+	}
+	if (since-nullDetect)%nullBeat < nullBeatFor {
+		return nullPace, nullBurst
+	}
+	return nullIdle, tsPacketSize
 }
 
 // stallTolerant wraps the encoder in the stall reader whether or not
