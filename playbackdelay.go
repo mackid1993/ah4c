@@ -211,6 +211,10 @@ type lateEncoder struct {
 	tuner int
 	name  string
 
+	// clock keeps a program and PCR alive through a long wait, so the player
+	// does not re-acquire at the hand-off. nil for short waits and pre-rolls.
+	clock *holdClock
+
 	mu     sync.Mutex
 	body   io.ReadCloser
 	closed bool
@@ -225,6 +229,12 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 		l.preroll.adopted.Store(true)
 	} else {
 		l.preroll = startPreroll(label)
+	}
+	// A long wait runs the encoder's own program so the player keeps its
+	// clock; a short one is already at the live edge on NULL packets, and a
+	// pre-roll fills the wait itself.
+	if l.preroll == nil && holdDelay > holdClockMinDelay {
+		l.clock = startHoldClock(url, label)
 	}
 	return l
 }
@@ -257,6 +267,9 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	if d := time.Until(l.until); d > 0 {
 		if l.preroll != nil {
 			return l.showPreroll(p, d)
+		}
+		if l.clock != nil && l.clock.ready.Load() {
+			return l.serveHoldClock(p, d)
 		}
 		return l.serveNulls(p, d)
 	}
