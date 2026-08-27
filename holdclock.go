@@ -252,10 +252,11 @@ func (c *holdClock) pcrNow() uint64 {
 const clockPCRPID = 0x0100
 
 // clockPCREvery is how far apart the wait's PCRs are, in wall time. Every
-// packet the wait injects is one the player then sits behind, so this is as
-// sparse as keeps the receiver's clock locked — the spec ceiling — not the
-// tight cadence a real encoder can afford. serveHoldClock paces to it.
-const clockPCREvery = 100 * time.Millisecond
+// packet the wait injects is one the player then sits behind, and the measured
+// lag fell as this rose, so it is as sparse as keeps the receiver's clock
+// locked — past the spec ceiling, but far denser than the NULL hold that
+// drifted with no PCR at all. serveHoldClock paces to it.
+const clockPCREvery = 200 * time.Millisecond
 
 // serve emits the wait's program as thinly as possible: the tables now and
 // then, and one PCR on its own PID. No NULL fill — every extra packet is a
@@ -265,7 +266,7 @@ func (c *holdClock) serve(p []byte) int {
 	defer c.mu.Unlock()
 	var out []byte
 	now := time.Now()
-	if now.Sub(c.lastPSI) >= 400*time.Millisecond {
+	if now.Sub(c.lastPSI) >= time.Second {
 		c.lastPSI = now
 		out = append(out, c.pat...)
 		out = append(out, c.pmt...)
@@ -309,8 +310,8 @@ func (c *holdClock) pcrPacket() []byte {
 // the clock all but stops — just enough PCR to hold the lock — so almost
 // nothing is between the filler and the picture when it arrives.
 const (
-	clockTrickleWithin = 4 * time.Second
-	clockTricklePace   = 500 * time.Millisecond
+	clockTrickleWithin = 6 * time.Second
+	clockTricklePace   = 1500 * time.Millisecond
 )
 
 // serveHoldClock paces the wait's program and counts its bytes. untilHandoff is
