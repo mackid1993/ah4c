@@ -925,13 +925,17 @@ type clockSplice struct {
 	psiVer  map[int]byte
 	psiSeen map[int]uint32
 	pmtPID  int
-	// srcVideo and srcAudio are the current source's elementary PIDs, learned
-	// from its own table. Everything is renumbered onto the fixed PIDs below,
-	// and cc is the continuity counter for each of those, so the streams the
-	// player sees never stop or restart.
-	srcVideo, srcAudio int
-	cc                 map[int]byte
-	started, said      bool
+	// pending is set when a presentation time announced a new source before
+	// any of its clock had arrived; the next PCR is then adopted rather than
+	// treated as a second new source.
+	pending bool
+	// marking is whether the first packet of each PID after a source change
+	// is still to be flagged as a discontinuity; marked is which have been,
+	// and markFrom is when the first was.
+	marking       bool
+	marked        map[int]bool
+	markFrom      time.Time
+	started, said bool
 	// pend is rewritten and ready to go out; tail is what has been read but
 	// does not yet make a whole packet. synced is whether the packet boundary
 	// has been found, and err is kept until pend has drained.
@@ -1050,28 +1054,21 @@ func (c *clockSplice) rewrite(b []byte) {
 		if pid == 0x1FFF {
 			continue // NULL packets carry nothing to map
 		}
-		switch {
-		case pid == 0:
+		if pid == 0 {
 			c.notePMTPID(pkt)
-			c.patchPAT(pkt)
 			c.bumpPSI(pkt)
-			c.stamp(pkt, 0)
 			continue
-		case pid == c.pmtPID:
-			c.patchPMT(pkt)
-			c.bumpPSI(pkt)
-			c.setPID(pkt, outPMTPID)
-			c.stamp(pkt, outPMTPID)
-			continue
-		case c.srcVideo > 0 && pid == c.srcVideo:
-			c.setPID(pkt, outVideoPID)
-			c.stamp(pkt, outVideoPID)
-		case c.srcAudio > 0 && pid == c.srcAudio:
-			c.setPID(pkt, outAudioPID)
-			c.stamp(pkt, outAudioPID)
 		}
+		if pid == c.pmtPID {
+			c.bumpPSI(pkt)
+			continue
+		}
+		// Clocks first, then the flag: it is mapPCR or mapPES that notices a
+		// new source, and the very packet that carries the news is the one
+		// that has to be marked.
 		c.mapPCR(pkt)
 		c.mapPES(pkt)
+		c.markPacket(pkt, pid)
 	}
 }
 
@@ -1090,16 +1087,55 @@ func (c *clockSplice) rewrite(b []byte) {
 // mapped to just past everything already sent, and the offset that achieves it
 // becomes the offset for every timestamp after — so PCR, PTS and DTS all keep
 // their spacing.
-func (c *clockSplice) newSource(ts uint64) {
+func (c *clockSplice) newSource(ts uint64, fromPCR bool) {
 	ref := c.out
 	if forward(c.high, ref) {
 		ref = c.high
 	}
 	c.delta = (ref + splicePickup - ts) & (ptsMod - 1)
-	c.in = ts
+	// c.in is the transmission clock's last reading and only a PCR may set it.
+	// A source announced by a presentation time — an audio PES ahead of the
+	// first PCR, which a real tune produced — used to write that PTS into c.in,
+	// so the source's own first PCR then looked like a third source and the
+	// offset was picked twice, after some of the new source's timestamps had
+	// already gone out on the first one. Measured at half a second of timeline
+	// running backwards inside one GOP. Now the next PCR is adopted instead.
+	if fromPCR {
+		c.in = ts
+	} else {
+		c.pending = true
+	}
+	// Every PID of the new source gets its first packet flagged as a
+	// discontinuity. The clocks are continuous, so it is not one — but the flag
+	// is what a player acts on when a source changes underneath it: it re-reads
+	// the tables and re-selects its tracks, which is the difference between the
+	// build that switched to the program and the one that sat on the pre-roll's
+	// last frame for ever. Rule 11: the marker looked inert and was removed as
+	// dead; it was the thing that worked.
+	c.marking, c.marked, c.markFrom = true, map[int]bool{}, time.Time{}
 	if !c.said {
 		c.said = true
 		logger("[HOLD] %s the program's clock was carried on from the pre-roll's rather than left as a jump", c.label)
+	}
+}
+
+// markPacket flags the first packet of each elementary PID after a source
+// change, for markWindow after the first one so audio arriving a read or two
+// behind the video is told as well. Only a packet with an adaptation field can
+// carry the flag; the next one that has one is marked instead.
+func (c *clockSplice) markPacket(pkt []byte, pid int) {
+	if !c.marking || c.marked[pid] {
+		return
+	}
+	if pkt[3]&0x20 == 0 || pkt[4] == 0 {
+		return
+	}
+	pkt[5] |= 0x80
+	c.marked[pid] = true
+	if c.markFrom.IsZero() {
+		c.markFrom = time.Now()
+	} else if time.Since(c.markFrom) > markWindow {
+		c.marking = false
 	}
 }
 
@@ -1112,9 +1148,14 @@ func (c *clockSplice) advance(pcr uint64) {
 		c.started, c.delta, c.out, c.high, c.in = true, 0, pcr, pcr, pcr
 		return
 	}
-	if !forward(pcr, c.in) {
-		c.newSource(pcr)
-	} else {
+	switch {
+	case c.pending:
+		// A presentation time already announced this source and set the
+		// offset; this is its clock arriving. Adopt it.
+		c.pending, c.in = false, pcr
+	case !forward(pcr, c.in):
+		c.newSource(pcr, true)
+	default:
 		c.in = pcr
 	}
 	if o := (pcr + c.delta) & (ptsMod - 1); forward(o, c.out) {
@@ -1139,7 +1180,7 @@ func (c *clockSplice) at(ts uint64) uint64 {
 		return ts
 	}
 	if !near(ts, c.in) {
-		c.newSource(ts)
+		c.newSource(ts, false)
 	}
 	o := (ts + c.delta) & (ptsMod - 1)
 	if forward(o, c.high) {
@@ -1374,144 +1415,14 @@ func (c *clockSplice) notePMTPID(pkt []byte) {
 	}
 }
 
-// --- One program, whatever is feeding it ---
-//
-// The pre-roll, the black and the encoder each arrive as their own program on
-// their own PIDs: ffmpeg numbers video 0x100 and audio 0x101, and the encoder
-// here uses 100 and 101. Versioning the tables so a demuxer re-reads them is
-// not enough, because a player picks its video track when the stream opens and
-// does not necessarily change its mind when the table does. What that looks
-// like is the last thing reported: the program decoding away while the
-// pre-roll's final frame sits on the screen, because the track the player
-// chose is the pre-roll's and it has simply stopped.
-//
-// So nothing downstream is ever told the streams changed. Every source is
-// renumbered onto one set of PIDs, its table is rewritten to declare them, and
-// the continuity counters are regenerated so each PID runs unbroken from the
-// first byte to the last. The player sees one program that never stops.
-//
-// These are ffmpeg's own numbers, so the pre-roll and the black pass through
-// untouched and only the encoder is renumbered.
-const (
-	outVideoPID = 0x100
-	outAudioPID = 0x101
-	outPMTPID   = 0x1000
-)
-
-func (c *clockSplice) setPID(pkt []byte, pid int) {
-	pkt[1] = pkt[1]&0xE0 | byte(pid>>8)&0x1F
-	pkt[2] = byte(pid & 0xFF)
-}
-
-// stamp regenerates the continuity counter for a PID this program is
-// synthesising. Two sources merged onto one PID each bring their own counter,
-// and the jump where they meet is a discontinuity to every demuxer that reads
-// it. Only packets carrying payload advance it, which is what the standard
-// says and what the frozen table counter got wrong.
-func (c *clockSplice) stamp(pkt []byte, pid int) {
-	if c.cc == nil {
-		c.cc = map[int]byte{}
-	}
-	if pkt[3]&0x10 == 0 { // no payload, counter stands still
-		pkt[3] = pkt[3]&0xF0 | c.cc[pid]
-		return
-	}
-	c.cc[pid] = (c.cc[pid] + 1) & 0x0F
-	pkt[3] = pkt[3]&0xF0 | c.cc[pid]
-}
-
-// psiBody finds the section inside a PSI packet, or nil when it is not one or
-// does not fit whole.
-func psiBody(pkt []byte) []byte {
-	if pkt[1]&0x40 == 0 {
-		return nil
-	}
-	off := 4
-	if pkt[3]&0x20 != 0 {
-		off += 1 + int(pkt[4])
-	}
-	if off >= tsPacketSize {
-		return nil
-	}
-	off += 1 + int(pkt[off])
-	if off+8 > tsPacketSize {
-		return nil
-	}
-	sec := pkt[off:]
-	slen := int(sec[1]&0x0F)<<8 | int(sec[2])
-	if slen < 9 || 3+slen > len(sec) {
-		return nil
-	}
-	return sec
-}
-
-// patchPAT points the single program at the fixed table PID.
-func (c *clockSplice) patchPAT(pkt []byte) {
-	sec := psiBody(pkt)
-	if sec == nil || sec[0] != 0x00 {
-		return
-	}
-	sec[10] = sec[10]&0xE0 | byte(outPMTPID>>8)&0x1F
-	sec[11] = byte(outPMTPID & 0xFF)
-}
-
-// patchPMT learns the source's elementary PIDs and rewrites the table to
-// declare the fixed ones instead.
-func (c *clockSplice) patchPMT(pkt []byte) {
-	sec := psiBody(pkt)
-	if sec == nil || sec[0] != 0x02 {
-		return
-	}
-	slen := int(sec[1]&0x0F)<<8 | int(sec[2])
-	end := 3 + slen - 4
-	il := int(sec[10]&0x0F)<<8 | int(sec[11])
-	i := 12 + il
-	if i > end {
-		return
-	}
-	video, audio := 0, 0
-	for i+4 < end {
-		st := sec[i]
-		pid := int(sec[i+1]&0x1F)<<8 | int(sec[i+2])
-		esil := int(sec[i+3]&0x0F)<<8 | int(sec[i+4])
-		if i+5+esil > end {
-			return
-		}
-		var to int
-		switch st {
-		case 0x01, 0x02, 0x1B, 0x24: // MPEG-2, H.264, HEVC
-			if video == 0 {
-				video, to = pid, outVideoPID
-			}
-		case 0x03, 0x04, 0x0F, 0x11, 0x81, 0x87: // MPEG audio, AAC, AC-3
-			if audio == 0 {
-				audio, to = pid, outAudioPID
-			}
-		}
-		if to != 0 {
-			sec[i+1] = sec[i+1]&0xE0 | byte(to>>8)&0x1F
-			sec[i+2] = byte(to & 0xFF)
-		}
-		i += 5 + esil
-	}
-	if video == 0 {
-		return // nothing recognisable; leave this source alone
-	}
-	c.srcVideo, c.srcAudio = video, audio
-	// The clock rides the video PID on every encoder seen here.
-	sec[8] = sec[8]&0xE0 | byte(outVideoPID>>8)&0x1F
-	sec[9] = byte(outVideoPID & 0xFF)
-}
-
 // --- One recipe for everything that fills a wait ---
 //
-// The pre-roll and the black are the two things a decoder sees before the
-// program, and since everything now leaves on one PID that decoder carries
-// them and the program alike. Every distinct SPS on that PID is a
-// reconfiguration, and each reconfiguration is a flicker. So the pre-roll and
-// the black are made with exactly this and nothing else, and their parameter
-// sets come out identical: pre-roll to black costs nothing, and black to
-// program is the single reconfiguration the NULL-packet path has always had.
+// The pre-roll and the black share one stream and one decoder, and every
+// distinct SPS on that stream is a reconfiguration a viewer can see. Made with
+// exactly this and nothing else, their parameter sets come out identical, so
+// the black follows the pre-roll with no reconfiguration at all. The program
+// is a separate stream on its own PIDs and its own decoder; nothing about the
+// filler — rate, level, profile — crosses over to it.
 //
 // No B-frames, because a stream with B-frames cut anywhere but a GOP boundary
 // leaves the decoder holding pictures whose references never arrive. One
@@ -1519,15 +1430,13 @@ func (c *clockSplice) patchPMT(pkt []byte) {
 // clean. Colour signalled explicitly, so a photograph's metadata and a lavfi
 // source do not produce different VUI.
 //
-// fillerRate is sixty because the direction of the mismatch is what matters.
-// Ten seconds of pre-roll is long enough for a player to commit to a rate, and
-// a program faster than that commitment has every other frame dropped — which
-// is what "the content flickers, not the pre-roll" was, measured against a
-// program stretch that was otherwise byte-equivalent to the NULL path's. A
-// program slower than the filler is ordinary frame doubling and looks like
-// nothing. So the filler runs at the top of what these HDMI encoders produce
-// and is right for 24, 25, 30, 50 and 60 alike. Half a second of black on the
-// NULL path never had this because half a second is not long enough to commit.
+// fillerRate is the filler's own rate and nothing else's. It once had to be
+// the encoder's, because filler and program shared a PID and a decoder and a
+// ten second pre-roll at thirty frames a second committed the player to thirty
+// before a sixty frame program arrived — every other frame dropped, "the
+// content flickers, not the pre-roll". The program is its own stream now and
+// starts on its own decoder, so an encoder at fifty, or anything else, meets a
+// pre-roll that never told it what to expect.
 const fillerRate = 60
 
 func fillerEncodeArgs() []string {

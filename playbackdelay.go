@@ -135,6 +135,14 @@ func liveEdge(body io.ReadCloser, label string) (uint64, bool) {
 	var have bool
 	var dropped int64
 	var ahead float64
+	// carry holds the part packet at the end of one read for the start of
+	// the next. Every read used to be scanned from byte zero as if it were a
+	// packet boundary, and only the first one is: after that the PCR fields
+	// were read from the wrong bytes, the "ahead" figure was wrong exactly
+	// when the backlog was large, and the drain stopped early. Measured on a
+	// synthetic body: 23.8s reported at one chunk size, 0.2s at another, for
+	// the same bytes.
+	var carry []byte
 	t0, settled := time.Now(), time.Now()
 	for time.Since(t0) < liveEdgeBudget && dropped < liveEdgeMost {
 		n, err := body.Read(buf)
@@ -142,8 +150,13 @@ func liveEdge(body io.ReadCloser, label string) (uint64, bool) {
 			return last, have
 		}
 		dropped += int64(n)
-		for i := 0; i+tsPacketSize <= n; i += tsPacketSize {
-			p := buf[i : i+tsPacketSize]
+		data := append(carry, buf[:n]...)
+		i := 0
+		for i+tsPacketSize <= len(data) && data[i] != 0x47 {
+			i++
+		}
+		for ; i+tsPacketSize <= len(data); i += tsPacketSize {
+			p := data[i : i+tsPacketSize]
 			if p[0] != 0x47 || p[3]>>4&2 == 0 || p[4] < 7 || p[5]&0x10 == 0 {
 				continue
 			}
@@ -155,6 +168,7 @@ func liveEdge(body io.ReadCloser, label string) (uint64, bool) {
 				settled = time.Now()
 			}
 		}
+		carry = append(carry[:0], data[i:]...)
 		if have {
 			if by := float64(last-start)/90000 - time.Since(t0).Seconds(); by > ahead+0.05 {
 				ahead, settled = by, time.Now()
@@ -280,6 +294,16 @@ type lateEncoder struct {
 	// encoder's own stream rather than to the hold in front of it.
 	tuner int
 	name  string
+	// prerollDead is set when the pre-roll's ffmpeg stopped during the wait.
+	// l.preroll is deliberately NOT cleared then: Read reaches open() only
+	// through l.preroll != nil, and this lateEncoder has no drain and no
+	// hand-off channel, so clearing it stranded the tune on NULL packets for
+	// ever — the encoder never contacted, the DVR kept alive on three kilobits
+	// of nothing, the tuner never released. Two reviewers reproduced it. The
+	// guard that was meant to catch it was unreachable: showPreroll only runs
+	// while the mark is ahead and sleeps at most that long, so the mark could
+	// never have passed inside it.
+	prerollDead bool
 	// channel is what heldRecently is keyed by. name is the caption engine's
 	// label and is per tuner, which is not the same thing at all.
 	channel string
@@ -387,6 +411,14 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 // the features that work.
 func (l *lateEncoder) drainEarly() {
 	var body io.ReadCloser
+	// The bound covers the open as well as the drain. It used to be set after
+	// the open succeeded, so an encoder that would not open — off, rebooting,
+	// wrong URL — was retried every second for ever, nothing ever reached the
+	// hand-off, and the filler's keepalive kept the DVR from concluding the
+	// stream had died. A failed tune was withheld the ending that would have
+	// let the DVR fail over. Retrying is right while the scripts are still
+	// driving the box; retrying without end is not.
+	giveUp := l.until.Add(drainGiveUp)
 	for {
 		l.mu.Lock()
 		closed := l.closed
@@ -489,6 +521,14 @@ func (l *lateEncoder) drainEarly() {
 			logger("[HOLD] %s encoder open and draining for the wait", l.label)
 			break
 		}
+		if time.Now().After(giveUp) {
+			logger("[HOLD] %s encoder would not open within %v of the mark (%v); ending the stream so the DVR can try again", l.label, drainGiveUp, err)
+			select {
+			case l.handoff <- nil:
+			default:
+			}
+			return
+		}
 		logger("[HOLD] %s encoder would not open for the wait (%v); trying again", l.label, err)
 		time.Sleep(time.Second)
 	}
@@ -506,7 +546,6 @@ func (l *lateEncoder) drainEarly() {
 	// So the loop checks whether the tune has been closed, rather than relying
 	// only on Close reaching in and breaking the read — and it gives up on its
 	// own a bounded time past the mark, whatever else has gone wrong.
-	giveUp := l.until.Add(drainGiveUp)
 	for {
 		l.mu.Lock()
 		closed := l.closed
@@ -574,6 +613,9 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	}
 	if l.preroll != nil {
 		if d := time.Until(l.until); d > 0 {
+			if l.prerollDead {
+				return l.serveNulls(p, d)
+			}
 			return l.showPreroll(p, d)
 		}
 		return l.open(p)
@@ -779,22 +821,14 @@ func (l *lateEncoder) showPreroll(p []byte, d time.Duration) (int, error) {
 	select {
 	case data, ok := <-l.preroll.out():
 		if !ok {
-			// Read only reaches open() through l.preroll != nil, and this
-			// lateEncoder has no drain and a nil handoff — newLateEncoder
-			// starts drainEarly only when there is no pre-roll. So clearing
-			// the pre-roll here and returning to the filler meant the encoder
-			// was never opened at all: NULL packets for ever, and a failed
-			// tune, whenever ffmpeg died during the hold.
-			//
-			// Detection's holdReader has the same branch and is safe, because
-			// its hand-off arrives on a channel rather than through the
-			// pre-roll being present. Same shape, one path fixed, which is the
-			// mistake this file keeps making.
+			// The player is gone. Leave l.preroll set — see prerollDead — and
+			// fill until the mark, where Read takes the same route to open()
+			// it would have taken with the pre-roll alive. This is also how a
+			// player that died during the adb scripts arrives: earlyTune
+			// handed over its pointer to a process that had already ended,
+			// and the first receive here is the one that finds out.
 			logger("[HOLD] %s pre-roll ended early; NULL packets for the rest of the wait", l.label)
-			l.preroll = nil
-			if time.Until(l.until) <= 0 {
-				return l.open(p)
-			}
+			l.prerollDead = true
 			return l.serveNulls(p, d)
 		}
 		l.pend = append(l.pend, data...)

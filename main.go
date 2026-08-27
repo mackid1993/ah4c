@@ -1805,7 +1805,28 @@ func (s *stallTolerantReader) producer() {
 			s.reconnects.Add(1)
 			s.bodyMu.Lock()
 			s.body = nb
+			// Re-check closed under the same lock, as drainEarly does when it
+			// publishes its body. For the whole round trip of the reconnect
+			// s.body was nil, so a Close that landed then closed nothing; if
+			// it did, this new body would be published, the loop would see
+			// closed and return, and nb would be held open by nobody for the
+			// life of the process. The encoder will not hand the same stream
+			// to a second reader, so the next tune on this tuner would get no
+			// video from a tuner that reported itself idle.
+			var gone bool
+			select {
+			case <-s.closed:
+				gone = true
+			default:
+			}
+			if gone {
+				s.body = nil
+			}
 			s.bodyMu.Unlock()
+			if gone {
+				nb.Close()
+				return
+			}
 			continue
 		}
 		n, err := readWithDeadline(body, chunk, srcStallReconnect)
