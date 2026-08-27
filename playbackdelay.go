@@ -59,6 +59,10 @@ const (
 	// this encoder — so three seconds means the hunt has gone wrong, and a
 	// silent stream is worse than an unplayable one at that point.
 	keyframeQuiet = 3 * time.Second
+	// quietBeforeMark is how long before the mark the filler stops, so the
+	// seconds directly in front of the picture are not NULL packets. Measured
+	// against what is reported in front of the playhead: two to three seconds.
+	quietBeforeMark = 4 * time.Second
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -448,7 +452,19 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	// Bounded, because silence is not free either: after keyframeQuiet the
 	// filler comes back rather than let a DVR conclude the stream has died.
 	// That is a hunt gone wrong, and the log says so.
-	if left <= 0 {
+	// The last stretch before the mark is the same problem as the hunt after
+	// it. Filler sent in the seconds immediately before the program is what
+	// ends up directly in front of the picture: NULL packets, no frames,
+	// nothing a playhead can cross and nothing fast forward can land on —
+	// "two or three seconds of nulls in front of me". So the wait goes quiet
+	// early and stays quiet through the hand-off, and the program is the first
+	// thing the DVR sees for that whole stretch.
+	//
+	// A DVR sits through far longer than this before deciding a stream has
+	// died — the diet's own keepalive leaves it in a three kilobit trickle for
+	// four seconds at a time — so a few seconds of nothing at the very end,
+	// with a program arriving at the end of it, is well inside what it takes.
+	if left <= quietBeforeMark {
 		select {
 		case r := <-l.handoff:
 			return l.takeHandoff(p, r)
@@ -785,6 +801,9 @@ type egressDrift struct {
 	pcr0 uint64    // the first PCR seen, 27 MHz units
 	t0   time.Time // when it was seen
 	last time.Time // last report
+	// nulls and prog count what has gone to the DVR since the hand-off.
+	nulls atomic.Int64
+	prog  atomic.Int64
 }
 
 // watchEgress dresses the program with the pace report. The DVR is handed the
@@ -811,15 +830,33 @@ func (e *egressDrift) Read(p []byte) (int, error) {
 func (e *egressDrift) watch(b []byte) {
 	var pcr uint64
 	var ok bool
+	var nulls, prog int
 	for i := 0; i+tsPacketSize <= len(b); i += tsPacketSize {
 		pkt := b[i : i+tsPacketSize]
 		if pkt[0] != 0x47 {
+			// Re-sync rather than step blindly over a misaligned buffer. Not
+			// doing this is why this watcher once reported a pace of minus
+			// twenty-one hours: it was reading random bytes as a PCR.
+			for ; i+tsPacketSize <= len(b) && b[i] != 0x47; i++ {
+			}
+			i--
 			continue
+		}
+		// Count what is going out. NULL packets after the hand-off are the
+		// thing being looked for: packets ahead of the playhead that carry no
+		// frame, that no player can cross and fast forward cannot land on. If
+		// this count is zero, ah4c is not putting them there.
+		if int(pkt[1]&0x1F)<<8|int(pkt[2]) == 0x1FFF {
+			nulls++
+		} else {
+			prog++
 		}
 		if v, yes := packetPCR(pkt); yes {
 			pcr, ok = v, true
 		}
 	}
+	e.nulls.Add(int64(nulls))
+	e.prog.Add(int64(prog))
 	if !ok {
 		return
 	}
@@ -845,6 +882,7 @@ func (e *egressDrift) watch(b []byte) {
 	e.mu.Unlock()
 	if e.gauge != nil {
 		standing, deepest := e.gauge()
+		logger("[HOLD] %s since the hand-off: %s NULL packets and %s program packets have gone to the DVR", e.label, byteCount(e.nulls.Load()*tsPacketSize), byteCount(e.prog.Load()*tsPacketSize))
 		logger("[HOLD] %s stream pace %+.0fms against the wall since the hand-off; stall queue %d of %d standing, deepest %d since the last report",
 			e.label, float64((stream - wall).Milliseconds()), standing, queueDepth, deepest)
 		return
