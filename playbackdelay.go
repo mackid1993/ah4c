@@ -270,8 +270,36 @@ type handoffResult struct {
 
 // newLateEncoder holds from t0 until the delay is up, then opens url. early is
 // a pre-roll already playing, which it takes over and shows for the wait.
+// heldRecently remembers when a channel last finished its hold, so a DVR that
+// reconnects does not get held all over again.
+var heldRecently sync.Map // name -> time.Time of the last hand-off
+
+// holdAgainAfter is how long a channel keeps the benefit of a hold it has
+// already served. Inside this, a fresh request is the DVR reconnecting to
+// something already tuned and playing, not a new tune-in to clean up.
+const holdAgainAfter = 10 * time.Minute
+
 func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner int, name string) *lateEncoder {
-	l := &lateEncoder{url: url, label: label, t0: t0, until: t0.Add(holdDelay), preroll: early, tuner: tuner, name: name}
+	until := t0.Add(holdDelay)
+	// The hold exists to cover the box tuning in, and that happens once. But a
+	// hold was started on every request, and the DVR reconnects — on a broken
+	// pipe, on a client switching, on its own retry — so each reconnect wrote
+	// another ninety seconds of NULL packets into the same recording. That is
+	// what "there is real video and there is null, and it pauses when I fast
+	// forward into the null zone" is: the timeline is programme, NULL zone,
+	// programme, NULL zone, and fast forward runs into the next one and stops,
+	// because NULL packets carry no frames for it to land on.
+	//
+	// So a channel that has already been held keeps the benefit of it. The
+	// box is tuned and playing; there is nothing left to cover up.
+	if v, ok := heldRecently.Load(name); ok {
+		if since := time.Since(v.(time.Time)); since < holdAgainAfter {
+			logger("[HOLD] %s %s was held %v ago and is already playing; starting the programme at once rather than holding again",
+				label, name, since.Round(time.Second))
+			until = t0
+		}
+	}
+	l := &lateEncoder{url: url, label: label, t0: t0, until: until, preroll: early, tuner: tuner, name: name}
 	if l.preroll != nil {
 		l.preroll.adopted.Store(true)
 	} else {
@@ -341,7 +369,24 @@ func (l *lateEncoder) drainEarly() {
 			src := maybeWrapCaptions(st, l.tuner, l.name)
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
-			body = markDiscontinuityFor(newGateReader(src, nil, true, l.until, nil), l.label)
+			// No discontinuity marker. Playback detection does not mark — main.go
+			// builds its gate and hands the body straight on — and detection is
+			// the hold that works. This one marked, and marking is what splits
+			// the streams apart: the player is told the video's time base is
+			// new and flushes it, and what it plays while the video
+			// re-anchors is audio with no picture. Fast forward navigates by
+			// video keyframes, finds none in that stretch, and MPV pauses
+			// instead of moving — which is exactly what is seen.
+			//
+			// Marking every PID instead of only the video was tried first and
+			// did not clear it: 0x64, 0x65 and 0x852 all marked, the same
+			// pause on fast forward. So the marker goes, and the seam is what
+			// detection's seam is — the encoder's own stream, told nothing.
+			// CLAUDE.md already records "making a discontinuity marker
+			// actually mark, on the one path that was working because it was
+			// inert" as one of four fixes that were coherent and wrong; this
+			// is that marker.
+			body = newGateReader(src, nil, true, l.until, nil)
 			// Empty the queue just before the gate arms. The gate takes the
 			// first keyframe after the delay is up, and a queue that is full at
 			// that moment means it takes one out of two megabytes of stored-up
@@ -522,6 +567,7 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	if l.refresh != nil {
 		l.refresh.arm(time.Now().Add(refreshAfterHold(holdDelay)))
 	}
+	heldRecently.Store(l.name, time.Now())
 	logger("[HOLD] %s hold %v, %s sent, program starts", l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls))
 	if st != nil {
 		standing, deepest := st.queueGauge()
