@@ -268,13 +268,16 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	if closed {
 		return 0, io.EOF
 	}
-	if body != nil {
-		return body.Read(p)
-	}
+	// Pending bytes first, then the body: the clock hand-off leaves the gate's
+	// first release (tables and the keyframe) in pend and sets body at once, so
+	// draining pend before reading body keeps a large first chunk whole.
 	if len(l.pend) > 0 {
 		n := copy(p, l.pend)
 		l.pend = l.pend[n:]
 		return n, nil
+	}
+	if body != nil {
+		return body.Read(p)
 	}
 	if d := time.Until(l.until); d > 0 {
 		if l.preroll != nil {
