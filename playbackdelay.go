@@ -67,6 +67,11 @@ const (
 	// seconds directly in front of the picture are not NULL packets. Measured
 	// against what is reported in front of the playhead: two to three seconds.
 	quietBeforeMark = 4 * time.Second
+	// nullKeepEvery is how often a single NULL packet goes out once the DVR
+	// has accepted the stream. It is the least that keeps a DVR from deciding
+	// the stream has died, and everything above it is padding in front of the
+	// picture.
+	nullKeepEvery = 10 * time.Second
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -742,6 +747,17 @@ func (l *lateEncoder) serveNulls(p []byte, d time.Duration) (int, error) {
 // wait on the diet's clock and on that other thing at once.
 func (l *lateEncoder) nullPace(d time.Duration) (time.Duration, int) {
 	pace, burst := holdRate(time.Since(l.dietFrom()))
+	// Past the window where the DVR is deciding it has a stream, send the
+	// least that keeps it from giving up and nothing more. Every NULL packet
+	// sent during the wait is padding in front of the picture that no player
+	// can cross — cutting the filler already made that visibly smaller — and
+	// after the detection window their only job is to prove the stream is
+	// alive. One small burst every nullKeepEvery does that, well inside the
+	// twenty seconds of quiet a DVR is known to sit through, and sends a
+	// fraction of what a continuous trickle does.
+	if since := time.Since(l.dietFrom()); since > nullDetect {
+		pace, burst = nullKeepEvery, tsPacketSize
+	}
 	if d > pace || d <= 0 {
 		d = pace
 	}
