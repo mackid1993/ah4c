@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -170,6 +171,7 @@ func tuneHoldStartup() {
 		}
 	}
 	prerollStartup()
+	blackStartup()
 	detect := strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE")
 	if holdDelay > 0 && detect {
 		logger("[HOLD] PLAYBACK_DELAY is set, so PLAYBACK_DETECTION does not run: the delay decides when the program starts")
@@ -268,7 +270,11 @@ type lateEncoder struct {
 	// tables with its filler. lastTables is when they last went out.
 	// primer is real picture sent before the filler, so the player has a time
 	// base to carry across the wait.
-	primer     []byte
+	primer []byte
+	// black fills the wait with real frames; pendBlack is what is left of the
+	// last chunk it handed over.
+	black      *prerollPlayer
+	pendBlack  []byte
 	gate       *gateReader
 	lastTables time.Time
 	// quietSaid keeps the "no keyframe" note to once a tune.
@@ -349,6 +355,10 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 	// A pre-roll hold is left exactly as it was — it is a different feature
 	// and it works.
 	if l.preroll == nil {
+		// Black fills the wait with real frames, so the player has a time base
+		// before any filler and can carry it across. Nil if the clip could not
+		// be made, which leaves the wait on NULL packets as before.
+		l.black = startBlack(label)
 		l.handoff = make(chan *handoffResult, 1)
 		go l.drainEarly()
 	}
@@ -535,14 +545,14 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	if closed {
 		return 0, io.EOF
 	}
-	// The primer goes out before anything else: it is the picture the player
-	// anchors its time base on, and every NULL packet after it is then a gap
-	// in a stream it already understands.
+	// Black first, and for as long as the wait lasts. Real frames, a real time
+	// base, and nothing to see — which is what a fragment of the encoder's own
+	// picture could not give: fourteen kilobytes is tables and part of a
+	// keyframe, and a piece big enough to decode would show the box tuning in.
 	l.mu.Lock()
-	if len(l.primer) > 0 {
-		n := copy(p, l.primer)
-		l.primer = l.primer[n:]
-		l.nulls += 0
+	if len(l.pendBlack) > 0 {
+		n := copy(p, l.pendBlack)
+		l.pendBlack = l.pendBlack[n:]
 		l.mu.Unlock()
 		return n, nil
 	}
@@ -627,6 +637,21 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	case r := <-l.handoff:
 		wait.Stop()
 		return l.takeHandoff(p, r)
+	case data, ok := <-l.black.out():
+		wait.Stop()
+		if !ok {
+			l.mu.Lock()
+			l.black = nil
+			l.mu.Unlock()
+			logger("[BLACK] %s the black clip ended; the rest of the wait is NULL packets", l.label)
+			return l.emitNulls(p, burst)
+		}
+		l.mu.Lock()
+		l.pendBlack = append(l.pendBlack, data...)
+		n := copy(p, l.pendBlack)
+		l.pendBlack = l.pendBlack[n:]
+		l.mu.Unlock()
+		return n, nil
 	case <-wait.C:
 	}
 	return l.emitNulls(p, burst)
@@ -702,6 +727,12 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// The pace watcher rides the drained hand-off too — it was only ever
 	// wired on the paths that open the encoder late, so the one path the
 	// user actually runs had gone silent.
+	// Cut the black the moment the picture is ready.
+	if l.black != nil {
+		l.black.stop()
+		l.black = nil
+		l.pendBlack = nil
+	}
 	if l.stall != nil {
 		l.stall.fillStalls()
 	}
@@ -1533,4 +1564,78 @@ func (r *refreshSource) Read(p []byte) (int, error) {
 		}
 	}
 	return r.ReadCloser.Read(p)
+}
+
+// --- Black frames for the wait ---
+// The hold's problem was never how much filler it sent. It was that the filler
+// came before there had ever been a picture. When an encoder reboots and the
+// stall reader covers ninety seconds with NULL packets the stream comes back
+// fine — same packets, same length — because video came first and the player
+// had a time base to carry across the gap. The hold sent NULL packets from the
+// very first byte, so there was nothing to anchor on and a playhead could not
+// get past them.
+//
+// A fragment of the encoder's own picture was tried first and was not enough:
+// fourteen kilobytes is tables and part of a keyframe, not a frame anything can
+// decode, and a piece big enough to decode would show the box tuning in, which
+// is what this feature exists to hide. So the wait is black. Real frames, a
+// real time base, and nothing to see. Generated here rather than shipped, so
+// there is no file to mount and nothing to keep in step with the image.
+
+const (
+	// blackCache is where the generated clip lives. It is looped, so its
+	// length only bounds the file's size.
+	blackCache   = "/tmp/black.ts"
+	blackSeconds = 2
+	// blackGOP is a keyframe every half second, so a player joining the loop
+	// at any point has one to start on almost at once.
+	blackGOP  = "15"
+	blackSize = "1920x1080"
+	blackRate = "30"
+)
+
+// blackTS is the generated clip, or empty if it could not be made.
+var blackTS string
+
+// blackStartup makes the clip once, before the listener binds. Nothing can be
+// tuning yet, which is the whole reason it happens here (rule 10): ffmpeg gets
+// a quiet machine, and a container that cannot make it still comes up and
+// falls back to NULL packets.
+func blackStartup() {
+	if prerollTS != "" {
+		// A pre-roll is a different feature and it fills the wait itself.
+		return
+	}
+	t0 := time.Now()
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "color=c=black:s="+blackSize+":r="+blackRate,
+		"-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+		"-t", "2",
+		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+		"-pix_fmt", "yuv420p", "-g", blackGOP, "-keyint_min", blackGOP,
+		"-c:a", "aac", "-b:a", "64k",
+		"-muxrate", "6000k", "-f", "mpegts", blackCache)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		logger("[BLACK] could not make the wait's black clip (%v): %s; the wait will use NULL packets", err, firstLine(string(out)))
+		return
+	}
+	st, err := os.Stat(blackCache)
+	if err != nil || st.Size() == 0 {
+		logger("[BLACK] the black clip came out empty; the wait will use NULL packets")
+		return
+	}
+	blackTS = blackCache
+	logger("[BLACK] made %s of black in %v (%s, %s fps, keyframe every %s frames), so a held tune has a picture to keep time by",
+		byteCount(st.Size()), time.Since(t0).Round(time.Millisecond), blackSize, blackRate, blackGOP)
+}
+
+// startBlack plays the black clip on a loop, at real time, the way the pre-roll
+// player does. nil when there is no clip, which leaves the wait on NULL
+// packets exactly as before.
+func startBlack(label string) *prerollPlayer {
+	if blackTS == "" {
+		return nil
+	}
+	return startPlayer(label, "BLACK", "-re", "-stream_loop", "-1", "-i", blackTS,
+		"-c", "copy", "-f", "mpegts", "pipe:1")
 }
