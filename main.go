@@ -1891,7 +1891,19 @@ func (s *stallTolerantReader) producer() {
 func (s *stallTolerantReader) Read(p []byte) (int, error) {
 	// Pre-first-chunk: nil channel disables the NULL-fill case, so Read blocks on chunks/closed only.
 	var stall <-chan time.Time
-	if s.hasFirstChunk.Load() {
+	// No stall timer at all while a hold has the filling switched off. There
+	// is nothing to do when it fires — the wait is quiet on purpose — so the
+	// timer only exists to make Read return (0, nil), and a reader that
+	// returns (0, nil) in a loop is a spin: gateReader.Read calls src.Read in
+	// a tight loop until it opens, so every held tuner pegged a core doing
+	// nothing. The drain then could not keep up with its own encoder, the
+	// queue sat permanently full, and every push threw the whole thing away —
+	// fourteen hundred chunks discarded every ten seconds on a tune that had
+	// not even handed over yet, and tunes failing outright.
+	//
+	// With no timer the select simply blocks on chunks or closed, which is
+	// what a reader with nothing to say should do.
+	if s.hasFirstChunk.Load() && s.fill.Load() {
 		t := time.NewTimer(stallReadGap)
 		defer t.Stop()
 		stall = t.C
@@ -1918,18 +1930,6 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		}
 		return n, nil
 	case <-stall:
-		// Not during a hold. The wait deliberately holds the stream back, so
-		// quiet here is not a stalled encoder — it is the hold doing its job,
-		// and answering it with NULL packets is this reader manufacturing
-		// filler into a stream that is being held on purpose. It stays off
-		// until the programme starts.
-		//
-		// It is not disabled outright, because this is also what recovers an
-		// encoder that cuts out mid-programme: the reconnect above keeps
-		// running throughout. Only the filling waits.
-		if !s.fill.Load() {
-			return 0, nil
-		}
 		// This puts NULL packets into a live program. It exists so a stalled
 		// encoder does not show the DVR a zero-byte gap, and that is worth
 		// having — but the cost has never been said out loud, and it is the
