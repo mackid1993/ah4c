@@ -581,10 +581,11 @@ func (h *holdReader) handoff(p []byte, f holdFirst) (int, error) {
 	// Half a second of black between the pre-roll and the program, the same as
 	// the delay's own wait gets. The trim above has just put the stream on a
 	// packet boundary, so this lands whole.
-	if len(blackPool) > 0 {
-		h.pend = append(h.pend, blackPool...)
-		logger("[BLACK] %s %s of black went out between the pre-roll and the picture", h.hold.label, byteCount(int64(len(blackPool))))
-	}
+	// No black here. The pre-roll is its own stream and the program starts
+	// on its own decoder; the half second of black is what a NULL-packet
+	// wait needs to give the player a time base, and a pre-roll has had one
+	// for the whole wait. The build the maintainer confirmed working sent
+	// none — by accident, as it happened — and this makes that deliberate.
 	// The encoder's clock goes out untouched.
 	h.pend = append(h.pend, f.data...)
 	n := copy(p, h.pend)
@@ -952,9 +953,17 @@ type clockSplice struct {
 	// marking is whether the first packet of each PID after a source change
 	// is still to be flagged as a discontinuity; marked is which have been,
 	// and markFrom is when the first was.
-	marking       bool
-	marked        map[int]bool
-	markFrom      time.Time
+	marking  bool
+	marked   map[int]bool
+	markFrom time.Time
+	// known is every elementary PID this stream has carried. Only a PID that
+	// first appears after a source change is flagged: that is the program
+	// arriving on new PIDs, which is what the flag is for. The pre-roll
+	// looping is a source change too — its clock steps back and is picked up
+	// — but it stays on its own PID, and flagging it there made the player
+	// flush every ten seconds for as long as the pre-roll ran. Twelve seconds
+	// survived that once; ninety would have had eight of them.
+	known         map[int]bool
 	started, said bool
 	// pend is rewritten and ready to go out; tail is what has been read but
 	// does not yet make a whole packet. synced is whether the packet boundary
@@ -1144,7 +1153,12 @@ func (c *clockSplice) newSource(ts uint64, fromPCR bool) {
 // behind the video is told as well. Only a packet with an adaptation field can
 // carry the flag; the next one that has one is marked instead.
 func (c *clockSplice) markPacket(pkt []byte, pid int) {
-	if !c.marking || c.marked[pid] {
+	if c.known == nil {
+		c.known = map[int]bool{}
+	}
+	seenBefore := c.known[pid]
+	c.known[pid] = true
+	if !c.marking || c.marked[pid] || seenBefore {
 		return
 	}
 	if pkt[3]&0x20 == 0 || pkt[4] == 0 {

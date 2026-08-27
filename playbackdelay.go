@@ -984,13 +984,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	}
 	l.body = body
 	l.finishFiller()
-	// Half a second of black between the filler and the program, the same as
-	// the NULL-packet path gets. finishFiller has just put the stream on a
-	// packet boundary, so this lands whole.
-	if len(blackPool) > 0 {
-		l.pend = append(l.pend, blackPool...)
-		logger("[BLACK] %s %s of black went out between the pre-roll and the picture", l.label, byteCount(int64(len(blackPool))))
-	}
+	// No black between a pre-roll and the program; see holdReader.handoff.
 	nulls := l.nulls
 	pend := len(l.pend) > 0
 	l.mu.Unlock()
@@ -1321,7 +1315,12 @@ func blackStartup() {
 		rate = stillRate
 	}
 	args := []string{"-hide_banner", "-loglevel", "error", "-y",
-		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%s:r=%d", prerollFrame, rate),
+		// lavfi wants 1920x1080; prerollFrame is the crop filter's 1920:1080.
+		// Passing it straight through made the colour source read "1920" as
+		// the whole size and refuse, and the black was missing from every
+		// hand-off on that build. Checked in the container with the real
+		// value this time, not a hand-typed one.
+		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%s:r=%d", strings.ReplaceAll(prerollFrame, ":", "x"), rate),
 		"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds())}
 	args = append(args, fillerEncodeArgs(rate)...)
 	args = append(args, "-f", "mpegts", at)
