@@ -702,7 +702,12 @@ func run() error {
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
-		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
+		var dst flushWriter = c.Writer
+		if holdDelay > 0 {
+			// A held tune's write side gets the instrument; see writestall.go.
+			dst = watchWriteStalls(dst, "tuner="+tuner+" channel="+channel)
+		}
+		if bytesCopied, err = copyFlush(dst, reader); err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
@@ -1682,6 +1687,14 @@ type stallTolerantReader struct {
 	// place lag lives. lastDropLog is only touched by the producer.
 	dropped     atomic.Int64
 	lastDropLog time.Time
+	// depthHigh is the deepest the queue has stood since queueGauge last read
+	// it. The queue is the one place inside ah4c that can hold whole seconds
+	// of video, and until now only the full-at-the-brim moment had a voice —
+	// a queue standing at any depth below full said nothing at all. So the
+	// depth is reported, not inferred: a queue that stands deep says the DVR
+	// is the slow side, and one that stands empty says whatever the viewer is
+	// behind lives somewhere else.
+	depthHigh atomic.Int64
 }
 
 type sessionSource interface{ sessions() int64 }
@@ -1786,6 +1799,7 @@ func (s *stallTolerantReader) producer() {
 			copy(data, chunk[:n])
 			select {
 			case s.chunks <- data:
+				s.noteDepth()
 			case <-s.closed:
 				return
 			default:
@@ -1829,6 +1843,7 @@ func (s *stallTolerantReader) producer() {
 				case <-s.closed:
 					return
 				}
+				s.noteDepth()
 				if time.Since(s.lastDropLog) > dropLogEvery {
 					s.lastDropLog = time.Now()
 					logger("[%s] the DVR is reading slower than the encoder sends; threw away %s of stored-up stream to get back to the live edge (%d chunks in all this tune)",
@@ -1870,6 +1885,22 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		n := min(len(p)/188*188, len(nullFill))
 		return copy(p, nullFill[:n]), nil
 	}
+}
+
+// noteDepth records how deep the queue stands after a send. Only the producer
+// calls it, and queueGauge's clear can race a lost update at worst, which
+// costs nothing but a slightly shy high-water mark — it is a gauge, not a
+// ledger.
+func (s *stallTolerantReader) noteDepth() {
+	if d := int64(len(s.chunks)); d > s.depthHigh.Load() {
+		s.depthHigh.Store(d)
+	}
+}
+
+// queueGauge is the queue's depth now and the deepest it has stood since the
+// last call, which it clears so each report covers its own interval.
+func (s *stallTolerantReader) queueGauge() (standing, deepest int) {
+	return len(s.chunks), int(s.depthHigh.Swap(0))
 }
 
 // flush throws away everything waiting in the queue, so what is read next is

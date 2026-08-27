@@ -236,6 +236,11 @@ type lateEncoder struct {
 	body   io.ReadCloser
 	closed bool
 	nulls  int64
+	// stall is the drained path's stall reader, kept so the hand-off and the
+	// pace watcher can say how deep its queue stands instead of leaving the
+	// depth to be inferred from drop events. nil on the pre-roll path, which
+	// never drains. Written and read under mu.
+	stall *stallTolerantReader
 }
 
 // handoffResult is the gated encoder, primed past its keyframe wait: first is
@@ -312,6 +317,9 @@ func (l *lateEncoder) drainEarly() {
 			// The wait's own filler is never handed to them — this is the
 			// encoder's stream, not the NULL packets in front of it.
 			st := l.stallTolerant(l.refresh)
+			l.mu.Lock()
+			l.stall = st
+			l.mu.Unlock()
 			src := maybeWrapCaptions(st, l.tuner, l.name)
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
@@ -424,19 +432,28 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 		r.body.Close()
 		return 0, io.EOF
 	}
-	l.body, l.pend = r.body, r.first
+	// The pace watcher rides the drained hand-off too — it was only ever
+	// wired on the paths that open the encoder late, so the one path the
+	// user actually runs had gone silent.
+	l.body, l.pend = l.watchEgress(r.body), r.first
+	body, st := l.body, l.stall
 	nulls := l.nulls
 	l.mu.Unlock()
 	if l.refresh != nil {
 		l.refresh.arm(time.Now().Add(refreshAfterHold(holdDelay)))
 	}
 	logger("[HOLD] %s hold %v, %s sent, program starts", l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls))
+	if st != nil {
+		standing, deepest := st.queueGauge()
+		logger("[HOLD] %s stall queue at the hand-off: %d of %d standing, deepest %d during the wait",
+			l.label, standing, queueDepth, deepest)
+	}
 	if len(l.pend) > 0 {
 		n := copy(p, l.pend)
 		l.pend = l.pend[n:]
 		return n, nil
 	}
-	return r.body.Read(p)
+	return body.Read(p)
 }
 
 // clockHandoff opens and gates the encoder on a goroutine, and keeps the wait's
@@ -692,6 +709,10 @@ const egressDriftEvery = 15 * time.Second
 type egressDrift struct {
 	io.ReadCloser
 	label string
+	// gauge, when set, is the stall queue's depth report, folded into the
+	// pace line so the two numbers that matter — is the stream on pace, and
+	// is anything standing between the encoder and the DVR — arrive together.
+	gauge func() (int, int)
 
 	mu   sync.Mutex
 	have bool
@@ -701,9 +722,14 @@ type egressDrift struct {
 }
 
 // watchEgress dresses the program with the pace report. The DVR is handed the
-// wrapper; the program inside it is untouched.
+// wrapper; the program inside it is untouched. Callers hold l.mu, which is
+// what l.stall is read under.
 func (l *lateEncoder) watchEgress(body io.ReadCloser) io.ReadCloser {
-	return &egressDrift{ReadCloser: body, label: l.label}
+	e := &egressDrift{ReadCloser: body, label: l.label}
+	if l.stall != nil {
+		e.gauge = l.stall.queueGauge
+	}
+	return e
 }
 
 func (e *egressDrift) Read(p []byte) (int, error) {
@@ -751,7 +777,13 @@ func (e *egressDrift) watch(b []byte) {
 	}
 	e.last = now
 	e.mu.Unlock()
-	logger("[HOLD] %s stream pace %+.0fms against the wall since the hand-off", e.label, float64((stream-wall).Milliseconds()))
+	if e.gauge != nil {
+		standing, deepest := e.gauge()
+		logger("[HOLD] %s stream pace %+.0fms against the wall since the hand-off; stall queue %d of %d standing, deepest %d since the last report",
+			e.label, float64((stream - wall).Milliseconds()), standing, queueDepth, deepest)
+		return
+	}
+	logger("[HOLD] %s stream pace %+.0fms against the wall since the hand-off", e.label, float64((stream - wall).Milliseconds()))
 }
 
 // --- The hand-off's discontinuity marker ---
@@ -827,6 +859,7 @@ type hintHold struct {
 	rw    *bufio.ReadWriter
 	sent  int
 	began time.Time
+	label string
 }
 
 // beginHintHold takes the connection over and probes the DVR with one hint,
@@ -841,7 +874,7 @@ func beginHintHold(w http.ResponseWriter, label string) *hintHold {
 		logger("[HOLD] %s the connection could not be taken over (%v); filling the body", label, err)
 		return nil
 	}
-	h := &hintHold{conn: conn, rw: rw, began: time.Now()}
+	h := &hintHold{conn: conn, rw: rw, began: time.Now(), label: label}
 	if !h.hint() {
 		h.refused(label, "would not take the first one")
 		return nil
@@ -906,7 +939,8 @@ func (h *hintHold) stream(src io.Reader) (int64, error) {
 	if err := h.rw.Flush(); err != nil {
 		return 0, err
 	}
-	return copyFlush(bufWriter{h.rw}, src)
+	// The write side gets the instrument here too; see writestall.go.
+	return copyFlush(watchWriteStalls(bufWriter{h.rw}, h.label), src)
 }
 
 func (h *hintHold) Close() error { return h.conn.Close() }
@@ -985,7 +1019,7 @@ func holdRate(since time.Duration) (time.Duration, int) {
 // times out reading the body, so the hold is what breaks the stream every
 // twenty seconds and the hold has to be what survives it. Without this, a
 // container running the delay with NULL frame insertion off loses the stream
-// twenty seconds after the programme starts, every time.
+// twenty seconds after the program starts, every time.
 func (l *lateEncoder) stallTolerant(body io.ReadCloser) *stallTolerantReader {
 	return newStallTolerantReader(body, func() (io.ReadCloser, error) {
 		r, e := http.Get(l.url)
@@ -1031,7 +1065,7 @@ func refreshAfterHold(hold time.Duration) time.Duration {
 	return d
 }
 
-// refreshing reopens the encoder once, shortly after the programme starts, and
+// refreshing reopens the encoder once, shortly after the program starts, and
 // only if the encoder will have it. The new connection is opened before the old
 // one is closed, so an encoder that refuses a second reader — and some do,
 // while a tuner owns the stream — costs nothing at all: the refresh is declined,
