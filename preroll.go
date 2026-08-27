@@ -656,25 +656,8 @@ func (e *earlyReader) Read(p []byte) (int, error) {
 }
 
 // serveNulls sends NULL packets, which carry no time.
-//
-// One packet per read, not a whole buffer. This covers the seconds the tuning
-// scripts take, and it used to fill the caller's buffer every time — sixty-five
-// kilobytes a go, a hundred and sixty kilobytes across three and a half
-// seconds, which measured as ninety-five per cent of every NULL packet in the
-// stream. The ninety second hold behind it sends eight. Those bytes sit at the
-// very front of what the DVR keeps, ahead of anything a player can start on,
-// and a viewer cannot cross them because NULL packets carry no frames.
-//
-// The stream stays constant — a packet every read gap, no silence — because
-// silence here is what a DVR gives up on, and it is the first thing it sees.
-// It is the volume that had no reason to be this high.
 func (e *earlyReader) serveNulls(p []byte) int {
-	n := 0
-	if len(p) >= tsPacketSize {
-		n = copy(p, nullTSPacket[:])
-	} else {
-		n = copy(p, nullTSPacket[:len(p)])
-	}
+	n := nullPackets(p)
 	e.nulls += int64(n)
 	return n
 }

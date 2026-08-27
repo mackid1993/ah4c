@@ -702,12 +702,7 @@ func run() error {
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
-		var dst flushWriter = c.Writer
-		if holdDelay > 0 {
-			// A held tune's write side gets the instrument; see playbackdelay.go.
-			dst = watchWriteStalls(dst, "tuner="+tuner+" channel="+channel)
-		}
-		if bytesCopied, err = copyFlush(dst, reader); err != nil {
+		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
@@ -1208,10 +1203,7 @@ func run() error {
 		}()
 	}
 	logger("[START] ah4c is ready")
-	// Not r.Run: it builds its own listener and leaves the send buffer to the
-	// kernel, which autotunes it into the megabytes of stale video. See
-	// playbackdelay.go.
-	return serveLive(r, ":7654")
+	return r.Run(":7654")
 }
 
 // Helper function to extract attribute from a line
@@ -1683,25 +1675,6 @@ type stallTolerantReader struct {
 	label         string
 	hasFirstChunk atomic.Bool
 	reconnects    atomic.Int64
-	// dropped counts chunks thrown away to keep the queue from becoming a
-	// place lag lives. lastDropLog is only touched by the producer.
-	// rest is what would not fit in the last caller's buffer, handed over on
-	// the next Read. Only the reading goroutine touches it.
-	rest    []byte
-	dropped atomic.Int64
-	// filled counts NULL bytes put into a live program to cover an encoder
-	// stall. lastFillLog is only touched by the reading goroutine.
-	filled      atomic.Int64
-	lastFillLog time.Time
-	lastDropLog time.Time
-	// depthHigh is the deepest the queue has stood since queueGauge last read
-	// it. The queue is the one place inside ah4c that can hold whole seconds
-	// of video, and until now only the full-at-the-brim moment had a voice —
-	// a queue standing at any depth below full said nothing at all. So the
-	// depth is reported, not inferred: a queue that stands deep says the DVR
-	// is the slow side, and one that stands empty says whatever the viewer is
-	// behind lives somewhere else.
-	depthHigh atomic.Int64
 }
 
 type sessionSource interface{ sessions() int64 }
@@ -1709,41 +1682,14 @@ type sessionSource interface{ sessions() int64 }
 func (s *stallTolerantReader) sessions() int64 { return s.reconnects.Load() }
 
 const (
-	stallReadGap        = 500 * time.Millisecond
-	srcStallReconnect   = 5 * time.Second
-	srcReconnectBackoff = 2 * time.Second
-	reconnectLogEvery   = 10 * time.Second
-	// dropLogEvery is how often a full queue is mentioned. It is a real
-	// symptom — the DVR is not keeping up — so it is said, but not per chunk.
-	dropLogEvery = 10 * time.Second
-	// fillLogEvery is how often NULL fill into a live program is mentioned.
-	fillLogEvery = 10 * time.Second
-	// stallQuietGap keeps a hold's quiet reader from spinning without making
-	// it block: long enough that a core is not burned, short enough that the
-	// hand-off is not delayed by it.
-	stallQuietGap        = 20 * time.Millisecond
+	stallReadGap         = 500 * time.Millisecond
+	srcStallReconnect    = 5 * time.Second
+	srcReconnectBackoff  = 2 * time.Second
+	reconnectLogEvery    = 10 * time.Second
 	preFirstChunkBudget  = 15 * time.Second // fail over fast on a dead tuner
 	postFirstChunkBudget = 3 * time.Minute  // ride through mid-stream glitches
 	chunkSize            = 32 * 1024
-	// queueDepth is how many chunks may wait between the encoder and the DVR.
-	// It was sixty-four — two megabytes, and the only constant here without a
-	// reason written beside it. Two megabytes is between one and a half and
-	// three and a half seconds of video, and a queue that deep is not headroom,
-	// it is a place for lag to live: the moment the DVR reads slower than the
-	// encoder sends, it fills, and then every slot the consumer frees is
-	// filled again at once. On this user's hardware it refilled two megabytes
-	// within about seven seconds of the hand-off and stood full for the rest of
-	// the recording — the picture correct, the timeline seconds behind, never
-	// catching up, and fast forward snapping back because the viewer really is
-	// at the live edge of a recording that is itself late.
-	//
-	// The depth was never what rode out a stall. A stall is bytes not arriving,
-	// so it can only drain this queue, never fill it; what covers a stall is
-	// the NULL fill Read manufactures after stallReadGap, which does not care
-	// how deep this is. So the depth only ever bought latency. Four chunks is
-	// a hundred and twenty-eight kilobytes, enough to cover the scheduling gap
-	// between one producer read and one consumer read and no more.
-	queueDepth = 16
+	queueDepth           = 64
 )
 
 func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadCloser, error), label string) *stallTolerantReader {
@@ -1812,56 +1758,8 @@ func (s *stallTolerantReader) producer() {
 			copy(data, chunk[:n])
 			select {
 			case s.chunks <- data:
-				s.noteDepth()
 			case <-s.closed:
 				return
-			default:
-				// The queue is full, which means the DVR has been reading
-				// slower than the encoder sends. This send used to block, and
-				// blocking is what made the queue a place lag goes to live:
-				// once queueDepth chunks are in it, every slot the consumer
-				// frees is filled again at once, so the viewer stays a full
-				// queue behind the encoder for the rest of the tune — two
-				// megabytes, which is between one and a half and three and a
-				// half seconds of video depending on the bitrate. Nothing
-				// drained it. That is what "behind, and it stays behind, and
-				// fast forward snaps back" is: the viewer is at the live edge
-				// of a recording that is itself late.
-				//
-				// A live stream would rather lose a moment than carry it for
-				// ever, so the oldest chunk goes and the newest is kept. This
-				// is the encoder reopen's trick — discard what is stored ahead
-				// of the show — made continuous and cheap instead of once and
-				// by force.
-				// The whole queue is the lag, not the newest chunk in it.
-				// Freeing one slot and filling it again leaves the queue full
-				// and the viewer exactly as far behind as they were — which
-				// is what a first attempt at this did, and the log said so:
-				// "dropped 1 chunk(s)", over and over, with the other
-				// sixty-three still sitting there. So empty it: everything
-				// waiting is old, and the newest chunk goes in alone.
-				gone := 0
-			drain:
-				for {
-					select {
-					case <-s.chunks:
-						gone++
-					default:
-						break drain
-					}
-				}
-				s.dropped.Add(int64(gone))
-				select {
-				case s.chunks <- data:
-				case <-s.closed:
-					return
-				}
-				s.noteDepth()
-				if time.Since(s.lastDropLog) > dropLogEvery {
-					s.lastDropLog = time.Now()
-					logger("[%s] the DVR is reading slower than the encoder sends; threw away %s of stored-up stream to get back to the live edge (%d chunks in all this tune)",
-						s.label, byteCount(int64(gone)*chunkSize), s.dropped.Load())
-				}
 			}
 			if err == nil {
 				continue
@@ -1880,125 +1778,23 @@ func (s *stallTolerantReader) producer() {
 func (s *stallTolerantReader) Read(p []byte) (int, error) {
 	// Pre-first-chunk: nil channel disables the NULL-fill case, so Read blocks on chunks/closed only.
 	var stall <-chan time.Time
-	// No stall timer at all while a hold has the filling switched off. There
-	// is nothing to do when it fires — the wait is quiet on purpose — so the
-	// timer only exists to make Read return (0, nil), and a reader that
-	// returns (0, nil) in a loop is a spin: gateReader.Read calls src.Read in
-	// a tight loop until it opens, so every held tuner pegged a core doing
-	// nothing. The drain then could not keep up with its own encoder, the
-	// queue sat permanently full, and every push threw the whole thing away —
-	// fourteen hundred chunks discarded every ten seconds on a tune that had
-	// not even handed over yet, and tunes failing outright.
-	//
-	// With no timer the select simply blocks on chunks or closed, which is
-	// what a reader with nothing to say should do.
 	if s.hasFirstChunk.Load() {
 		t := time.NewTimer(stallReadGap)
 		defer t.Stop()
 		stall = t.C
-	}
-	// A chunk left over from a caller whose buffer could not take all of the
-	// last one goes first. Without this, copy silently threw the tail away:
-	// every caller today reads with thirty-two kilobytes or more so nothing
-	// lost a byte, but a caller reading smaller would have quietly dropped
-	// most of every chunk — a hole in the video, with nothing said. That is
-	// the shape of fault this program has been bitten by twice tonight.
-	if len(s.rest) > 0 {
-		n := copy(p, s.rest)
-		s.rest = s.rest[n:]
-		return n, nil
 	}
 	select {
 	case <-s.closed:
 		return 0, io.EOF
 	case data := <-s.chunks:
 		s.hasFirstChunk.Store(true)
-		n := copy(p, data)
-		if n < len(data) {
-			s.rest = append(s.rest[:0], data[n:]...)
-		}
-		return n, nil
+		return copy(p, data), nil
 	case <-stall:
-		// This reader once had its filling switched off during a hold, on the
-		// grounds that a stream held back on purpose should not be papered
-		// over. It is not worth what it costs. Returning no bytes here breaks
-		// captionStream.Read, which only starts its pump on a read that
-		// returns bytes — so the caption wrapper never started, the gate never
-		// saw a packet, the drain never logged, and no tune reached its
-		// hand-off at all. Blocking instead hung it just as hard, and
-		// returning (0, nil) in a loop spun a core.
-		//
-		// It never earned the risk either: the counter below, added to prove
-		// the filling was firing during holds, never once fired.
-		//
-		// This puts NULL packets into a live program. It exists so a stalled
-		// encoder does not show the DVR a zero-byte gap, and that is worth
-		// having — but the cost has never been said out loud, and it is the
-		// cost that matters here: NULLs carry no frames, so whatever is filled
-		// this way is stream the viewer cannot play or seek through. It sits
-		// between the playhead and the DVR's live edge and does not move.
-		//
-		// So it counts and it speaks. If a tune shows seconds of this, the
-		// encoder is stalling and the filler is turning those stalls into
-		// unplayable time in the recording.
 		if len(p) < 188 {
-			s.filled.Add(188)
-			s.sayFilled()
 			return copy(p, nullTSPacket[:]), nil
 		}
 		n := min(len(p)/188*188, len(nullFill))
-		s.filled.Add(int64(n))
-		s.sayFilled()
 		return copy(p, nullFill[:n]), nil
-	}
-}
-
-// sayFilled reports NULL fill put into a live program, at most once every
-// fillLogEvery. Called only from Read, so lastFillLog needs no lock.
-func (s *stallTolerantReader) sayFilled() {
-	if time.Since(s.lastFillLog) < fillLogEvery {
-		return
-	}
-	s.lastFillLog = time.Now()
-	logger("[%s] the encoder went quiet; %s of NULL packets have gone into the live program this tune, which is stream the viewer cannot play through",
-		s.label, byteCount(s.filled.Load()))
-}
-
-// noteDepth records how deep the queue stands after a send. Only the producer
-// calls it, and queueGauge's clear can race a lost update at worst, which
-// costs nothing but a slightly shy high-water mark — it is a gauge, not a
-// ledger.
-func (s *stallTolerantReader) noteDepth() {
-	if d := int64(len(s.chunks)); d > s.depthHigh.Load() {
-		s.depthHigh.Store(d)
-	}
-}
-
-// queueGauge is the queue's depth now and the deepest it has stood since the
-// last call, which it clears so each report covers its own interval.
-func (s *stallTolerantReader) queueGauge() (standing, deepest int) {
-	return len(s.chunks), int(s.depthHigh.Swap(0))
-}
-
-// flush throws away everything waiting in the queue, so what is read next is
-// the live edge. The hold calls this just before its gate arms: a gate that
-// arms against a full queue picks its keyframe out of two megabytes of
-// stored-up stream and hands the DVR video that is already seconds old, and
-// emptying the queue afterwards is too late — the stale frames have gone.
-func (s *stallTolerantReader) flush(label string) {
-	gone := 0
-	for {
-		select {
-		case <-s.chunks:
-			gone++
-		default:
-			if gone > 0 {
-				s.dropped.Add(int64(gone))
-				logger("[%s] dropped %s of stored-up stream before the hand-off, so the program starts live",
-					label, byteCount(int64(gone)*chunkSize))
-			}
-			return
-		}
 	}
 }
 
@@ -2031,9 +1827,6 @@ const (
 )
 
 type gateReader struct {
-	// tables holds the encoder's real PAT and PMT once seen, for the hold in
-	// front of the gate to send with its filler.
-	tables   atomic.Value
 	src      io.ReadCloser
 	ready    <-chan struct{}
 	open     bool
@@ -2076,30 +1869,6 @@ func newGateReader(src io.ReadCloser, ready <-chan struct{}, timed bool, target 
 		g.sess0 = g.sessSeen
 	}
 	return g
-}
-
-// publishTables snapshots the encoder's real PAT and PMT the moment the gate
-// has both, so the hold in front of it can send them with its filler. They are
-// the encoder's own tables, read off the connection that is draining — not
-// tables invented here, which is the thing that failed before: invented tables
-// name PIDs nothing will ever send on, and a DVR locks onto them and waits for
-// ever. These name exactly what is about to arrive.
-func (g *gateReader) publishTables() {
-	if len(g.pat) == 0 || len(g.pmt) == 0 {
-		return
-	}
-	b := make([]byte, 0, len(g.pat)+len(g.pmt))
-	b = append(b, g.pat...)
-	b = append(b, g.pmt...)
-	g.tables.Store(&b)
-}
-
-// realTables is the encoder's PAT and PMT, or nil until the gate has seen both.
-func (g *gateReader) realTables() []byte {
-	if v, ok := g.tables.Load().(*[]byte); ok && v != nil {
-		return *v
-	}
-	return nil
 }
 
 func (g *gateReader) resync() {
@@ -2224,14 +1993,12 @@ func (g *gateReader) scan(b []byte) int {
 		if pid == 0 {
 			if sec := gatePSI(pkt, pusi, afc); len(sec) > 0 && sec[0] == 0x00 {
 				g.pat = append(g.pat[:0], pkt...)
-				g.publishTables()
 			}
 			i += 188
 			continue
 		}
 		if sec := gatePSI(pkt, pusi, afc); len(sec) > 0 && sec[0] == 0x02 {
 			g.pmt = append(g.pmt[:0], pkt...)
-			g.publishTables()
 			if v := videoPIDs(sec); len(v) > 0 {
 				g.vid = v
 			}
