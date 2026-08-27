@@ -950,6 +950,23 @@ func (c *clockSplice) mapPES(pkt []byte) {
 	if es[0] != 0 || es[1] != 0 || es[2] != 1 {
 		return
 	}
+	// Only the stream kinds that actually carry the optional PES header. A
+	// padding or private_stream_2 packet has payload where that header would
+	// be, so reading es[7] as flags there and writing five bytes back is not a
+	// wrong timestamp, it is corrupt payload. Nothing in this stream sends one
+	// today; the guard is here because "nothing sends one today" is how the
+	// last several faults in this file started.
+	//
+	// This layer is the same for H.264 and HEVC. PCR lives in the adaptation
+	// field and PTS/DTS in the PES header, and neither knows what codec is
+	// inside — so an HEVC encoder is mapped by exactly this code, and the
+	// only thing HEVC changes is how expensive it is to get this wrong.
+	if !pesHasHeader(es[3]) {
+		return
+	}
+	if es[6]&0xC0 != 0x80 { // not an MPEG-2 PES optional header
+		return
+	}
 	flags := es[7] >> 6
 	if flags < 2 || int(es[8]) < 5 {
 		return // no PTS
@@ -958,6 +975,23 @@ func (c *clockSplice) mapPES(pkt []byte) {
 	if flags == 3 && int(es[8]) >= 10 && off+19 <= tsPacketSize {
 		writeTS(es[14:19], c.pick(readTS(es[14:19])))
 	}
+}
+
+// pesHasHeader says whether a stream_id carries the optional PES header that
+// holds PTS and DTS. Everything does except these, per ISO 13818-1 2.4.3.7.
+func pesHasHeader(streamID byte) bool {
+	switch streamID {
+	case 0xBC, // program_stream_map
+		0xBE, // padding_stream
+		0xBF, // private_stream_2
+		0xF0, // ECM
+		0xF1, // EMM
+		0xF2, // DSMCC
+		0xF8, // H.222.1 type E
+		0xFF: // program_stream_directory
+		return false
+	}
+	return true
 }
 
 // readTS and writeTS are the five-byte PTS/DTS field, marker bits and all. The
