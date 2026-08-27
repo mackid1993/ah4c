@@ -485,7 +485,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				hold := newTuneHold(tuneStart, ready, label, early.player())
 				if hold != nil {
 					gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
-					hold.gate = gate
 					body = gate
 				}
 				body = hold.wrap(maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i)))
@@ -2033,22 +2032,17 @@ const (
 )
 
 type gateReader struct {
-	src     io.ReadCloser
-	ready   <-chan struct{}
-	open    bool
-	pat     []byte
-	pmt     []byte
-	pend    []byte
-	carry   []byte
-	keep    []byte
-	t0      time.Time
-	armedAt time.Time
-	armed0  time.Time
-	// lastPTS and gaps measure the encoder's picture rate while the gate is
-	// still discarding, so the filler in front of the programme can be chosen
-	// to match it before the hand-off rather than after one.
-	lastPTS  uint64
-	gaps     []uint64
+	src      io.ReadCloser
+	ready    <-chan struct{}
+	open     bool
+	pat      []byte
+	pmt      []byte
+	pend     []byte
+	carry    []byte
+	keep     []byte
+	t0       time.Time
+	armedAt  time.Time
+	armed0   time.Time
 	winBytes int
 	winStart time.Time
 	lastWin  int
@@ -2218,7 +2212,6 @@ func (g *gateReader) scan(b []byte) int {
 		}
 		if g.vid[pid] {
 			g.winBytes += 188
-			g.notePicture(pkt, pusi, afc)
 		}
 		if g.winStart.IsZero() {
 			g.winStart = time.Now()
@@ -2660,61 +2653,4 @@ func readWithDeadline(r io.ReadCloser, buf []byte, timeout time.Duration) (int, 
 	defer cancel()
 	defer context.AfterFunc(ctx, func() { r.Close() })()
 	return r.Read(buf)
-}
-
-// notePicture records the gap between one picture's presentation time and the
-// next, on the video PID, while the gate is still throwing everything away.
-//
-// The rate has to be known BEFORE the hand-off, because what is put in front of
-// the programme has to match it: one decoder now carries the filler and the
-// programme on a single PID, and handing it new parameters mid-stream makes it
-// reconfigure, which costs frames. Learning it after a hand-off would mean one
-// tune paying for the lesson, and a tune is never the price of knowing
-// something.
-//
-// The gate is already reading every packet and skipping past them, so this is
-// a few bytes of arithmetic on data that was going by regardless.
-func (g *gateReader) notePicture(pkt []byte, pusi bool, afc byte) {
-	if !pusi || afc&1 == 0 {
-		return
-	}
-	off := 4
-	if afc&2 != 0 {
-		off += 1 + int(pkt[4])
-	}
-	if off+14 > len(pkt) {
-		return
-	}
-	es := pkt[off:]
-	if es[0] != 0 || es[1] != 0 || es[2] != 1 || es[6]&0xC0 != 0x80 || es[7]>>6 < 2 || es[8] < 5 {
-		return
-	}
-	pts := uint64(es[9]>>1&0x07)<<30 | uint64(es[10])<<22 |
-		uint64(es[11]>>1&0x7F)<<15 | uint64(es[12])<<7 | uint64(es[13]>>1&0x7F)
-	if g.lastPTS != 0 && len(g.gaps) < 240 {
-		if d := (pts - g.lastPTS) & (1<<33 - 1); d > 0 && d < 90000 {
-			g.gaps = append(g.gaps, d)
-		}
-	}
-	g.lastPTS = pts
-}
-
-// pictureRate is the encoder's rate in pictures a second, or zero when too
-// little has gone past to say. The middle gap, not the mean: reordered frames
-// leave outliers on both sides and the middle is not moved by them.
-func (g *gateReader) pictureRate() int {
-	if g == nil || len(g.gaps) < 8 {
-		return 0
-	}
-	s := append([]uint64(nil), g.gaps...)
-	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
-	mid := s[len(s)/2]
-	if mid == 0 {
-		return 0
-	}
-	r := int((90000 + mid/2) / mid)
-	if r < 1 || r > 240 {
-		return 0
-	}
-	return r
 }

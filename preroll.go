@@ -93,7 +93,7 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	var args []string
 	var kind []string
 	if still {
-		args = append(args, "-loop", "1", "-framerate", "30", "-t", fmt.Sprint(prerollStillSeconds))
+		args = append(args, "-loop", "1", "-framerate", fmt.Sprint(fillerRate), "-t", fmt.Sprint(prerollStillSeconds))
 		kind = append(kind, fmt.Sprintf("%s still cropped to %s as a %d second clip", video, prerollFrame, prerollStillSeconds))
 	}
 	args = append(args, "-i", src)
@@ -106,10 +106,17 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	} else {
 		args = append(args, "-map", "0:a:0")
 	}
-	if !still && tsVideoCodecs[video] {
-		args = append(args, "-c:v", "copy")
-		kind = append(kind, video+" video copied")
-	} else {
+	// Always encoded, never copied, and always with fillerEncodeArgs — the
+	// same recipe the black is made with. A copied stream carries whatever
+	// SPS the file had, and a differently-encoded one carries a different SPS
+	// from the black; either way the decoder has to reconfigure where the
+	// pre-roll meets the black, and then again where the black meets the
+	// program. Two reconfigurations on one PID, and the picture flickers
+	// through both. With one recipe the pre-roll's SPS and PPS are the
+	// black's, byte for byte, and there is one reconfiguration — black to
+	// program — which is the one the NULL-packet path has always had and
+	// which has been watched working.
+	{
 		// -c:v h264 picks whichever H.264 encoder this ffmpeg was built with.
 		// Even dimensions and yuv420p are what every H.264 encoder accepts;
 		vf := "scale=trunc(iw/2)*2:trunc(ih/2)*2"
@@ -132,9 +139,10 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 			vf = "scale=" + prerollFrame + ":force_original_aspect_ratio=increase," +
 				"crop=" + prerollFrame
 		}
-		args = append(args, "-vf", vf, "-c:v", "h264", "-pix_fmt", "yuv420p", "-g", "30")
+		args = append(args, "-vf", vf+",fps="+fmt.Sprint(fillerRate))
+		args = append(args, fillerEncodeArgs()...)
 		if !still {
-			kind = append(kind, video+" video encoded to h264")
+			kind = append(kind, video+" video encoded to match the black")
 		}
 	}
 	switch {
@@ -386,9 +394,6 @@ func (p *prerollPlayer) stop() int64 {
 // The playback delay does not come this way — it holds in lateEncoder, which
 // leaves the encoder shut until the delay is up.
 type tuneHold struct {
-	// gate is the reader that measures the encoder's picture rate while it is
-	// still discarding, so the black in front of the programme can match it.
-	gate *gateReader
 	// ready closes when the gate may release.
 	ready <-chan struct{}
 	label string
@@ -505,15 +510,6 @@ func (h *holdReader) Read(p []byte) (int, error) {
 	}
 }
 
-// rate is the encoder's picture rate as its gate measured it during the wait,
-// or zero if too little went past to say.
-func (h *holdReader) rate() int {
-	if h.hold == nil {
-		return 0
-	}
-	return h.hold.gate.pictureRate()
-}
-
 func (h *holdReader) serveNulls(p []byte) int {
 	n := nullPackets(p)
 	h.nulls += int64(n)
@@ -565,10 +561,9 @@ func (h *holdReader) handoff(p []byte, f holdFirst) (int, error) {
 	// Half a second of black between the pre-roll and the program, the same as
 	// the delay's own wait gets. The trim above has just put the stream on a
 	// packet boundary, so this lands whole.
-	if blk := blackAt(h.rate()); len(blk) > 0 {
-		h.pend = append(h.pend, blk...)
-		logger("[BLACK] %s %s of black at %d pictures a second went out between the pre-roll and the picture",
-			h.hold.label, byteCount(int64(len(blk))), h.rate())
+	if len(blackPool) > 0 {
+		h.pend = append(h.pend, blackPool...)
+		logger("[BLACK] %s %s of black went out between the pre-roll and the picture", h.hold.label, byteCount(int64(len(blackPool))))
 	}
 	// The encoder's clock goes out untouched.
 	h.pend = append(h.pend, f.data...)
@@ -1506,4 +1501,42 @@ func (c *clockSplice) patchPMT(pkt []byte) {
 	// The clock rides the video PID on every encoder seen here.
 	sec[8] = sec[8]&0xE0 | byte(outVideoPID>>8)&0x1F
 	sec[9] = byte(outVideoPID & 0xFF)
+}
+
+// --- One recipe for everything that fills a wait ---
+//
+// The pre-roll and the black are the two things a decoder sees before the
+// program, and since everything now leaves on one PID that decoder carries
+// them and the program alike. Every distinct SPS on that PID is a
+// reconfiguration, and each reconfiguration is a flicker. So the pre-roll and
+// the black are made with exactly this and nothing else, and their parameter
+// sets come out identical: pre-roll to black costs nothing, and black to
+// program is the single reconfiguration the NULL-packet path has always had.
+//
+// No B-frames, because a stream with B-frames cut anywhere but a GOP boundary
+// leaves the decoder holding pictures whose references never arrive. One
+// reference frame and a keyframe every half second, so any cut is close to
+// clean. Colour signalled explicitly, so a photograph's metadata and a lavfi
+// source do not produce different VUI.
+//
+// fillerRate is sixty because the direction of the mismatch is what matters.
+// Ten seconds of pre-roll is long enough for a player to commit to a rate, and
+// a program faster than that commitment has every other frame dropped — which
+// is what "the content flickers, not the pre-roll" was, measured against a
+// program stretch that was otherwise byte-equivalent to the NULL path's. A
+// program slower than the filler is ordinary frame doubling and looks like
+// nothing. So the filler runs at the top of what these HDMI encoders produce
+// and is right for 24, 25, 30, 50 and 60 alike. Half a second of black on the
+// NULL path never had this because half a second is not long enough to commit.
+const fillerRate = 60
+
+func fillerEncodeArgs() []string {
+	return []string{
+		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+		"-profile:v", "high",
+		"-x264-params", fmt.Sprintf("keyint=%d:min-keyint=%d:scenecut=0:bframes=0:ref=1:aud=1", fillerRate/2, fillerRate/2),
+		"-pix_fmt", "yuv420p",
+		"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+		"-r", fmt.Sprint(fillerRate),
+	}
 }

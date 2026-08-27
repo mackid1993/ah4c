@@ -744,7 +744,7 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// whether one ever reached a seam has never been in the log, so the one
 	// thing this was built to do could not be confirmed from outside — "I
 	// didn't see any lines about it creating black frames". Once per tune.
-	if blk := blackAt(l.gateRate()); len(blk) > 0 {
+	if blk := blackPool; len(blk) > 0 {
 		first = append(append([]byte(nil), blk...), first...)
 		logger("[BLACK] %s %s of black went out at the seam, immediately in front of the picture, against %s of NULL packets in the wait",
 			l.label, byteCount(int64(len(blk))), byteCount(l.nulls))
@@ -882,15 +882,6 @@ func (l *lateEncoder) emitNulls(p []byte, burst int) (int, error) {
 // The same rule is in holdReader for playback detection. Both need it, because
 // a pre-roll routes around drainEarly entirely — which is how four separate
 // faults have already reached only the people who have a pre-roll file.
-// gateRate is the picture rate the drained gate measured while it was
-// discarding, or zero if it never saw enough.
-func (l *lateEncoder) gateRate() int {
-	l.mu.Lock()
-	g := l.gate
-	l.mu.Unlock()
-	return g.pictureRate()
-}
-
 func (l *lateEncoder) finishFiller() {
 	k := (l.sent + int64(len(l.pend))) % tsPacketSize
 	if k == 0 {
@@ -948,8 +939,9 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// line before his connection broke. Every shed timing was tried on the
 	// other path and every one came back behind; playback detection, the hold
 	// that works, never breaks the connection at all.
-	g := newGateReader(l.stallTolerant(resp.Body), armed, true, time.Now(), nil)
-	body := maybeWrapCaptions(g, l.tuner, l.name)
+	body := maybeWrapCaptions(
+		newGateReader(l.stallTolerant(resp.Body), armed, true, time.Now(), nil),
+		l.tuner, l.name)
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
@@ -961,10 +953,9 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// Half a second of black between the filler and the program, the same as
 	// the NULL-packet path gets. finishFiller has just put the stream on a
 	// packet boundary, so this lands whole.
-	if blk := blackAt(g.pictureRate()); len(blk) > 0 {
-		l.pend = append(l.pend, blk...)
-		logger("[BLACK] %s %s of black at %d pictures a second went out between the pre-roll and the picture",
-			l.label, byteCount(int64(len(blk))), g.pictureRate())
+	if len(blackPool) > 0 {
+		l.pend = append(l.pend, blackPool...)
+		logger("[BLACK] %s %s of black went out between the pre-roll and the picture", l.label, byteCount(int64(len(blackPool))))
 	}
 	nulls := l.nulls
 	pend := len(l.pend) > 0
@@ -1276,69 +1267,33 @@ const (
 	blackCosts = blackSeamFor
 )
 
-// blackPool holds one clip per plausible picture rate, made at startup where
-// nothing can be tuning (rule 10). The rate the encoder actually runs at is not
-// known until a stream is seen, and it must not cost a tune to find out — so
-// every likely answer is prepared in advance and the hand-off picks one. Five
-// half-second clips is a few tens of kilobytes and a couple of seconds of boot.
-//
-// blackRates are the rates worth having ready. Anything else falls back to the
-// nearest, which is closer than not matching at all.
-var blackPool = map[int][]byte{}
-
-var blackRates = []int{24, 25, 30, 50, 60}
-
-// blackAt is the clip for a rate, or the nearest prepared one, or nil.
-func blackAt(rate int) []byte {
-	if b, ok := blackPool[rate]; ok {
-		return b
-	}
-	best, gap := 0, 1<<30
-	for r := range blackPool {
-		d := r - rate
-		if d < 0 {
-			d = -d
-		}
-		if d < gap {
-			best, gap = r, d
-		}
-	}
-	return blackPool[best]
-}
+// blackPool is the black as a transport stream, made with fillerEncodeArgs so
+// its parameter sets are the pre-roll's byte for byte, or nil if it could not
+// be made.
+var blackPool []byte
 
 // blackStartup makes the clips once, before the listener binds, where nothing
 // can be tuning yet (rule 10). A container that cannot make them hands over
 // exactly as it did before black existed.
 func blackStartup() {
-	for _, rate := range blackRates {
-		at := fmt.Sprintf("/tmp/black-%d.ts", rate)
-		cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-			"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=1920x1080:r=%d", rate),
-			"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds()),
-			"-c:v", "libx264", "-preset", "ultrafast", "-g", fmt.Sprint(rate/2),
-			"-pix_fmt", "yuv420p", "-f", "mpegts", at)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			logger("[BLACK] could not make the %d picture black (%v): %s", rate, err, firstLine(string(out)))
-			continue
-		}
-		b, err := os.ReadFile(at)
-		if err != nil || len(b) < tsPacketSize {
-			continue
-		}
-		blackPool[rate] = b[:len(b)/tsPacketSize*tsPacketSize]
-	}
-	if len(blackPool) == 0 {
-		logger("[BLACK] no black could be made; hand-offs go out as they did before")
+	const at = "/tmp/blackframe.ts"
+	args := []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%s:r=%d", prerollFrame, fillerRate),
+		"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds())}
+	args = append(args, fillerEncodeArgs()...)
+	args = append(args, "-f", "mpegts", at)
+	if out, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
+		logger("[BLACK] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
 		return
 	}
-	have := make([]string, 0, len(blackPool))
-	for _, r := range blackRates {
-		if b, ok := blackPool[r]; ok {
-			have = append(have, fmt.Sprintf("%d at %s", r, byteCount(int64(len(b)))))
-		}
+	b, err := os.ReadFile(at)
+	if err != nil || len(b) < tsPacketSize {
+		logger("[BLACK] the black came out empty; hand-offs go out as they did before")
+		return
 	}
-	logger("[BLACK] %s of black ready for %s pictures a second; the hand-off takes whichever matches the encoder",
-		blackWords(blackSeamFor), strings.Join(have, ", "))
+	blackPool = b[:len(b)/tsPacketSize*tsPacketSize]
+	logger("[BLACK] made %s of black, %s, to go in front of the picture at the hand-off",
+		blackWords(blackSeamFor), byteCount(int64(len(blackPool))))
 }
 
 // blackWords says a black length. Not holdWords: that rounds to the second, so
