@@ -398,7 +398,25 @@ func (l *lateEncoder) drainEarly() {
 			l.mu.Lock()
 			l.stall = st
 			l.mu.Unlock()
-			src := maybeWrapCaptions(st, l.tuner, l.name)
+			// Captions do not engage during a pre-roll. With a pre-roll the
+			// wait is real video the viewer is watching, and the gate discards
+			// the encoder behind it — so wrapping the encoder here would run
+			// the injector over sixty seconds of frames nobody sees and, worse,
+			// hand the gate a caption-rewritten stream to release at the mark.
+			// That is what froze the picture: the injector was mid-flight on
+			// the program's first packets at the very moment the discontinuity
+			// marker and the PID hand-off also landed on them. On this path
+			// captions wrap the gate's OUTPUT instead (see body below), so the
+			// injector sees its first frame when the program starts, not before.
+			//
+			// Without a pre-roll the wait is NULL packets and the gate discards
+			// the encoder; wrapping here warms the engine through the wait so it
+			// is not booting in the seam, and there is no pre-roll video for it
+			// to touch. That path is left as it was.
+			var src io.ReadCloser = st
+			if l.preroll == nil {
+				src = maybeWrapCaptions(st, l.tuner, l.name)
+			}
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
 			// No discontinuity marker. Playback detection does not mark — main.go
@@ -422,7 +440,15 @@ func (l *lateEncoder) drainEarly() {
 			l.mu.Lock()
 			l.gate = g
 			l.mu.Unlock()
-			body = g
+			// On the pre-roll path captions wrap the released program, not the
+			// discarded wait. maybeWrapCaptions warms the engine the first time
+			// it is called, which is here, at tune start — so the engine is
+			// ready by the hand-off even though it injects nothing until then.
+			if l.preroll != nil {
+				body = maybeWrapCaptions(g, l.tuner, l.name)
+			} else {
+				body = g
+			}
 			// Empty the queue just before the gate arms. The gate takes the
 			// first keyframe after the delay is up, and a queue that is full at
 			// that moment means it takes one out of two megabytes of stored-up
