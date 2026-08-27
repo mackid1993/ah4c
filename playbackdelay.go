@@ -390,6 +390,14 @@ func (l *lateEncoder) drainEarly() {
 			// The wait's own filler is never handed to them — this is the
 			// encoder's stream, not the NULL packets in front of it.
 			st := l.stallTolerant(resp.Body)
+			// Off for the tuning, on for the programme. During the wait this
+			// stream is held back on purpose, so a quiet source is the hold
+			// working, not an encoder that has cut out — and answering it with
+			// NULL packets is filler manufactured into a stream nobody should
+			// be filling. Its reconnect keeps running throughout, so an
+			// encoder that really does drop is still recovered; only the
+			// filling waits for the hand-off, where takeHandoff turns it on.
+			st.holdStalls()
 			l.mu.Lock()
 			l.stall = st
 			l.mu.Unlock()
@@ -591,6 +599,9 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// The pace watcher rides the drained hand-off too — it was only ever
 	// wired on the paths that open the encoder late, so the one path the
 	// user actually runs had gone silent.
+	if l.stall != nil {
+		l.stall.fillStalls()
+	}
 	l.body, l.pend = l.watchEgress(r.body), r.first
 	body, st := l.body, l.stall
 	nulls := l.nulls

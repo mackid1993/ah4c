@@ -1691,6 +1691,9 @@ type stallTolerantReader struct {
 	dropped atomic.Int64
 	// filled counts NULL bytes put into a live program to cover an encoder
 	// stall. lastFillLog is only touched by the reading goroutine.
+	// fill is whether a quiet source may be answered with NULL packets. Off
+	// during a hold, on once the programme starts.
+	fill        atomic.Bool
 	filled      atomic.Int64
 	lastFillLog time.Time
 	lastDropLog time.Time
@@ -1707,6 +1710,14 @@ type stallTolerantReader struct {
 type sessionSource interface{ sessions() int64 }
 
 func (s *stallTolerantReader) sessions() int64 { return s.reconnects.Load() }
+
+// holdStalls turns NULL fill off, for a stream that is being held back on
+// purpose. The reconnect is untouched: an encoder that drops during the wait
+// is still recovered, it simply is not papered over with filler.
+func (s *stallTolerantReader) holdStalls() { s.fill.Store(false) }
+
+// fillStalls turns NULL fill on, once there is a programme to keep flowing.
+func (s *stallTolerantReader) fillStalls() { s.fill.Store(true) }
 
 const (
 	stallReadGap        = 500 * time.Millisecond
@@ -1750,6 +1761,10 @@ func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadClose
 		reconnectFn: reconnectFn,
 		label:       label,
 	}
+	// On by default: every other path wants a quiet encoder covered from the
+	// first byte. The hold turns it off for the wait and back on at the
+	// hand-off.
+	s.fill.Store(true)
 	go s.producer()
 	return s
 }
@@ -1903,6 +1918,18 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		}
 		return n, nil
 	case <-stall:
+		// Not during a hold. The wait deliberately holds the stream back, so
+		// quiet here is not a stalled encoder — it is the hold doing its job,
+		// and answering it with NULL packets is this reader manufacturing
+		// filler into a stream that is being held on purpose. It stays off
+		// until the programme starts.
+		//
+		// It is not disabled outright, because this is also what recovers an
+		// encoder that cuts out mid-programme: the reconnect above keeps
+		// running throughout. Only the filling waits.
+		if !s.fill.Load() {
+			return 0, nil
+		}
 		// This puts NULL packets into a live program. It exists so a stalled
 		// encoder does not show the DVR a zero-byte gap, and that is worth
 		// having — but the cost has never been said out loud, and it is the
