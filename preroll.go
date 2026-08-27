@@ -911,7 +911,12 @@ type clockSplice struct {
 	// out is the last timestamp written, in 90 kHz. delta is what is added to
 	// an input timestamp to get an output one, and in is the last input seen.
 	out, high, delta, in uint64
-	started, said        bool
+	// psi is how far the tables' version has been stepped: one per source, so a
+	// demuxer re-reads them instead of trusting the copy it already has.
+	// pmtPID is learned from the PAT of whichever source is current.
+	psi           int
+	pmtPID        int
+	started, said bool
 	// pend is rewritten and ready to go out; tail is what has been read but
 	// does not yet make a whole packet. synced is whether the packet boundary
 	// has been found, and err is kept until pend has drained.
@@ -1030,6 +1035,15 @@ func (c *clockSplice) rewrite(b []byte) {
 		if pid == 0x1FFF {
 			continue // NULL packets carry nothing to map
 		}
+		if pid == 0 {
+			c.notePMTPID(pkt)
+			c.bumpPSI(pkt)
+			continue
+		}
+		if pid == c.pmtPID {
+			c.bumpPSI(pkt)
+			continue
+		}
 		c.mapPCR(pkt)
 		c.mapPES(pkt)
 	}
@@ -1057,6 +1071,7 @@ func (c *clockSplice) newSource(ts uint64) {
 	}
 	c.delta = (ref + splicePickup - ts) & (ptsMod - 1)
 	c.in = ts
+	c.psi++
 	if !c.said {
 		c.said = true
 		logger("[HOLD] %s the program's clock was carried on from the pre-roll's rather than left as a jump", c.label)
@@ -1210,4 +1225,100 @@ func writeTS(f []byte, ts uint64) {
 	f[2] = byte(ts>>15&0x7F)<<1 | 1
 	f[3] = byte(ts >> 7)
 	f[4] = byte(ts&0x7F)<<1 | 1
+}
+
+// --- Telling the player the tables changed ---
+//
+// Every source here declares program 1 with version_number 0: the pre-roll's
+// tables, the black's, and the encoder's. A demuxer caches a table and only
+// re-reads it when the version moves, so after the filler it kept demuxing the
+// PIDs the first table named — 256 and 257 from ffmpeg — while the program
+// arrived on 100 and 101. Those PIDs had stopped, so the picture stopped.
+//
+// Measured before it was understood: two distinct tables in one capture, both
+// reading ver=0, one change between them. It was in the notes as an oddity and
+// walked past.
+//
+// So the version is stepped at every source change. That is the whole purpose
+// of the field, and it costs one byte plus a checksum.
+
+// crcMPEG is the CRC-32/MPEG-2 that closes a PSI section: polynomial
+// 0x04C11DB7, all ones in, no reflection, no final xor.
+func crcMPEG(b []byte) uint32 {
+	crc := uint32(0xFFFFFFFF)
+	for _, x := range b {
+		crc ^= uint32(x) << 24
+		for i := 0; i < 8; i++ {
+			if crc&0x80000000 != 0 {
+				crc = crc<<1 ^ 0x04C11DB7
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+}
+
+// bumpPSI steps the version of a PAT or PMT carried whole in one packet and
+// fixes its checksum. Sections that span packets are left alone: rewriting half
+// a section is worse than an unbumped version, and no encoder seen here splits
+// these.
+func (c *clockSplice) bumpPSI(pkt []byte) {
+	if pkt[1]&0x40 == 0 { // no pointer field, so not a section start
+		return
+	}
+	pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
+	off := 4
+	if pkt[3]&0x20 != 0 {
+		off += 1 + int(pkt[4])
+	}
+	if off >= tsPacketSize {
+		return
+	}
+	off += 1 + int(pkt[off]) // step over the pointer field
+	if off+8 > tsPacketSize {
+		return
+	}
+	sec := pkt[off:]
+	if sec[0] != 0x00 && sec[0] != 0x02 { // PAT or PMT only
+		return
+	}
+	if pid != 0 && sec[0] == 0x00 {
+		return
+	}
+	slen := int(sec[1]&0x0F)<<8 | int(sec[2])
+	end := 3 + slen
+	if slen < 9 || end > len(sec) {
+		return // spans packets, or nonsense
+	}
+	sec[5] = sec[5]&0xC0 | byte((int(sec[5]>>1&0x1F)+c.psi)&0x1F)<<1 | sec[5]&0x01
+	crc := crcMPEG(sec[:end-4])
+	sec[end-4] = byte(crc >> 24)
+	sec[end-3] = byte(crc >> 16)
+	sec[end-2] = byte(crc >> 8)
+	sec[end-1] = byte(crc)
+}
+
+// notePMTPID learns which PID carries the program table from the PAT, so the
+// table can be found however the source numbers it. ffmpeg says 0x1000 and an
+// encoder may say anything.
+func (c *clockSplice) notePMTPID(pkt []byte) {
+	off := 4
+	if pkt[3]&0x20 != 0 {
+		off += 1 + int(pkt[4])
+	}
+	if pkt[1]&0x40 == 0 || off >= tsPacketSize {
+		return
+	}
+	off += 1 + int(pkt[off])
+	if off+12 > tsPacketSize {
+		return
+	}
+	sec := pkt[off:]
+	if sec[0] != 0x00 {
+		return
+	}
+	if pid := int(sec[10]&0x1F)<<8 | int(sec[11]); pid > 0 && pid < 0x1FFF {
+		c.pmtPID = pid
+	}
 }
