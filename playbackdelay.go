@@ -144,7 +144,7 @@ func tuneHoldStartup() {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
-		logger("[HOLD] hold %v; the encoder is reopened %s into the program", holdDelay, holdWords(refreshAfterHold(holdDelay)))
+		logger("[HOLD] hold %v; the encoder is reopened %s into the program, %d time(s), %s apart", holdDelay, holdWords(refreshBase), refreshShedsFor(holdDelay), holdWords(refreshEvery))
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
 	case prerollTS != "":
@@ -463,7 +463,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	}
 	// http.Get, not a client with a Timeout: that field covers reading the
 	// body, so it breaks the stream by force at a moment nothing chose and
-	// leaves nothing able to decline. The break is wanted — see refreshAfterHold —
+	// leaves nothing able to decline. The break is wanted — see refreshBase —
 	// but it is made deliberately below, and made so it can fail safely.
 	resp, err := http.Get(l.url)
 	if err == nil && resp.StatusCode != 200 {
@@ -831,38 +831,31 @@ func (l *lateEncoder) stallTolerant(body io.ReadCloser) io.ReadCloser {
 }
 
 // The reopen is the only thing here that sheds what the player has stored
-// ahead of the show, and the only arithmetic left that a hold's length feeds.
-// A forty-five second hold reopens at twenty seconds and lands at the live
-// edge: a ratio of 0.444. The formula below scales that ratio — and then a cap
-// threw it away exactly where the trouble starts. Ninety's proportional point
-// is forty seconds; the cap made it thirty, a ratio of 0.333, and a hundred
-// and twenty came out at 0.250. So the two lengths that fail have never once
-// run at the ratio the length that works runs at, and forty seconds at ninety
-// has never been tried — not tonight, and not on any earlier build. Every
-// ninety second test ever run used twenty or thirty.
+// ahead of the show. A forty-five second hold sheds once, twenty seconds into
+// the program, and lands at the live edge — so twenty seconds is the one shed
+// point in this program that is actually watched working, and it is used at
+// every length rather than scaled. Scaling it was tried tonight: twenty,
+// thirty and forty at ninety, and all three came back behind.
 //
-// The cap was justified as "the longest point watched working", but those
-// numbers came off a different build with a different filler, and are not a
-// like-for-like comparison with anything running now (rule 13: change one
-// thing between comparisons). A cap that holds the failing lengths at a ratio
-// the working length never uses is not a safety rail, it is the bug.
+// What was never tried is shedding more than once. If one shed is not enough
+// at ninety, the answer is not a different moment for the one — it is another
+// shed, and another. A hold no longer than refreshPer keeps the single shed it
+// is known to work with and is not experimented on; a longer hold gets
+// refreshMore of them, refreshEvery apart.
 const (
-	refreshBase = 20 * time.Second
-	refreshPer  = 45 * time.Second
+	refreshBase  = 20 * time.Second
+	refreshPer   = 45 * time.Second
+	refreshEvery = 15 * time.Second
+	refreshMore  = 4
 )
 
-// refreshAfterHold is how long after the program starts the encoder is
-// reopened, for a hold of the given length. Its own function so the arithmetic
-// can be checked without a DVR: the ratio a forty-five second hold is watched
-// working at, held at every length. Twenty seconds at forty-five, forty at
-// ninety, fifty-three at a hundred and twenty.
-func refreshAfterHold(hold time.Duration) time.Duration {
+// refreshShedsFor is how many times the encoder is reopened, for a hold of the
+// given length. Its own function so the schedule can be read without a DVR.
+func refreshShedsFor(hold time.Duration) int {
 	if hold <= refreshPer {
-		return refreshBase
+		return 1
 	}
-	// Through float64: a Duration is nanoseconds, and nanoseconds times
-	// nanoseconds overflows int64 for any hold longer than nine seconds.
-	return time.Duration(float64(hold) * float64(refreshBase) / float64(refreshPer))
+	return refreshMore
 }
 
 // refreshing reopens the encoder once, shortly after the programme starts, and
@@ -871,7 +864,7 @@ func refreshAfterHold(hold time.Duration) time.Duration {
 // while a tuner owns the stream — costs nothing at all: the refresh is declined,
 // said so once, and never tried again for this tune.
 func (l *lateEncoder) refreshing(body io.ReadCloser) io.ReadCloser {
-	return &refreshSource{ReadCloser: body, at: time.Now().Add(refreshAfterHold(holdDelay)), label: l.label, open: func() (io.ReadCloser, error) {
+	return &refreshSource{ReadCloser: body, at: time.Now().Add(refreshBase), times: refreshShedsFor(holdDelay), label: l.label, open: func() (io.ReadCloser, error) {
 		r, e := http.Get(l.url)
 		if e != nil {
 			return nil, e
@@ -884,25 +877,31 @@ func (l *lateEncoder) refreshing(body io.ReadCloser) io.ReadCloser {
 	}}
 }
 
+// Each shed opens the new connection before closing the old, so an encoder
+// that will not take a second reader costs nothing and the next attempt still
+// comes. A shed that fails no longer ends them: the clock moves to the next.
+//
 type refreshSource struct {
 	io.ReadCloser
 	open  func() (io.ReadCloser, error)
 	at    time.Time
-	done  bool
+	done  int
+	times int
 	label string
 }
 
 func (r *refreshSource) Read(p []byte) (int, error) {
-	if !r.done && !time.Now().Before(r.at) {
-		r.done = true
+	if r.done < r.times && !time.Now().Before(r.at) {
+		r.done++
+		r.at = time.Now().Add(refreshEvery)
 		fresh, err := r.open()
 		if err != nil {
-			logger("[HOLD] %s the encoder would not open a second time (%v); leaving the stream as it is", r.label, err)
+			logger("[HOLD] %s the encoder would not open again (%v); the stream is left as it is, and the next shed still comes", r.label, err)
 		} else {
 			old := r.ReadCloser
 			r.ReadCloser = fresh
 			old.Close()
-			logger("[HOLD] %s reopened the encoder, dropping what the DVR had stored ahead of the show", r.label)
+			logger("[HOLD] %s reopened the encoder (%d of %d), dropping what the DVR had stored ahead of the show", r.label, r.done, r.times)
 		}
 	}
 	return r.ReadCloser.Read(p)
