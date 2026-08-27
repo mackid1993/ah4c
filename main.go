@@ -1686,17 +1686,35 @@ type sessionSource interface{ sessions() int64 }
 func (s *stallTolerantReader) sessions() int64 { return s.reconnects.Load() }
 
 const (
-	stallReadGap         = 500 * time.Millisecond
-	srcStallReconnect    = 5 * time.Second
-	srcReconnectBackoff  = 2 * time.Second
-	reconnectLogEvery    = 10 * time.Second
+	stallReadGap        = 500 * time.Millisecond
+	srcStallReconnect   = 5 * time.Second
+	srcReconnectBackoff = 2 * time.Second
+	reconnectLogEvery   = 10 * time.Second
 	// dropLogEvery is how often a full queue is mentioned. It is a real
 	// symptom — the DVR is not keeping up — so it is said, but not per chunk.
-	dropLogEvery = 10 * time.Second
+	dropLogEvery         = 10 * time.Second
 	preFirstChunkBudget  = 15 * time.Second // fail over fast on a dead tuner
 	postFirstChunkBudget = 3 * time.Minute  // ride through mid-stream glitches
 	chunkSize            = 32 * 1024
-	queueDepth           = 64
+	// queueDepth is how many chunks may wait between the encoder and the DVR.
+	// It was sixty-four — two megabytes, and the only constant here without a
+	// reason written beside it. Two megabytes is between one and a half and
+	// three and a half seconds of video, and a queue that deep is not headroom,
+	// it is a place for lag to live: the moment the DVR reads slower than the
+	// encoder sends, it fills, and then every slot the consumer frees is
+	// filled again at once. On this user's hardware it refilled two megabytes
+	// within about seven seconds of the hand-off and stood full for the rest of
+	// the recording — the picture correct, the timeline seconds behind, never
+	// catching up, and fast forward snapping back because the viewer really is
+	// at the live edge of a recording that is itself late.
+	//
+	// The depth was never what rode out a stall. A stall is bytes not arriving,
+	// so it can only drain this queue, never fill it; what covers a stall is
+	// the NULL fill Read manufactures after stallReadGap, which does not care
+	// how deep this is. So the depth only ever bought latency. Four chunks is
+	// a hundred and twenty-eight kilobytes, enough to cover the scheduling gap
+	// between one producer read and one consumer read and no more.
+	queueDepth = 4
 )
 
 func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadCloser, error), label string) *stallTolerantReader {
