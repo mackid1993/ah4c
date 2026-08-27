@@ -1870,6 +1870,7 @@ type gateReader struct {
 	// unless a clock hold set them, so other paths are unchanged.
 	bridge  *holdClock
 	lastPCR uint64
+	stale   int // keyframes skipped for being behind the clock's live edge
 }
 
 // newGateReader gates src until ready closes. timed says the wait was a timer,
@@ -2053,7 +2054,16 @@ func (g *gateReader) scan(b []byte) int {
 			}
 		}
 		if g.vid[pid] && afc >= 2 && pkt[4] > 0 && pkt[5]&0x40 != 0 {
-			if kind := g.releaseKind(); kind != "" && g.atLiveEdge() {
+			if kind := g.releaseKind(); kind != "" {
+				if !g.atLiveEdge() {
+					g.stale++
+					i += 188
+					continue
+				}
+				if g.bridge != nil && g.lastPCR != 0 {
+					behindMs := (float64(g.bridge.pcrNow()) - float64(g.lastPCR)) / 27000.0
+					logger("[HOLD] gate: released a keyframe %.0fms from the clock's live edge, %d stale keyframe(s) skipped first", behindMs, g.stale)
+				}
 				g.keep = append(g.keep[:0], b[i:]...)
 				g.release(kind)
 				return len(b)

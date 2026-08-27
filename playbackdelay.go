@@ -319,6 +319,11 @@ func (l *lateEncoder) clockHandoff(p []byte) (int, error) {
 		l.pend = r.first
 		nulls := l.nulls
 		l.mu.Unlock()
+		if pts, ok := firstVideoPTS(r.first); ok {
+			clockPTS := l.clock.pcrNow() / 300 // 27 MHz -> 90 kHz
+			behindMs := (float64(clockPTS) - float64(pts)) / 90.0
+			logger("[HOLD] %s seam: first picture is %.0fms from the clock's live edge", l.label, behindMs)
+		}
 		logger("[HOLD] %s hold %v, %s sent, program starts on the wait's clock",
 			l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls))
 		if len(l.pend) > 0 {
