@@ -319,7 +319,7 @@ func (l *lateEncoder) clockHandoff(p []byte) (int, error) {
 			r.body.Close()
 			return 0, io.EOF
 		}
-		l.body = r.body
+		l.body = l.watchEgress(r.body)
 		l.pend = r.first
 		nulls := l.nulls
 		l.mu.Unlock()
@@ -490,7 +490,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 		body.Close()
 		return 0, io.EOF
 	}
-	l.body = body
+	l.body = l.watchEgress(body)
 	nulls := l.nulls
 	l.mu.Unlock()
 	logger("[HOLD] %s hold %v, %s sent, program starts", l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls+preroll))
@@ -510,6 +510,86 @@ func (l *lateEncoder) Close() error {
 		return body.Close()
 	}
 	return nil
+}
+
+// --- Watching the stream's pace after the hand-off ---
+// Every instrument on the hold answers at the hand-off, and the question that
+// remains is what happens after it: a hand-off measured dead live can sit
+// behind on the TV, and nothing here said anything while it did. The encoder's
+// PCR advances with the wall, so the stream's own timestamps are the yardstick:
+// a stream that leaves here behind the wall by more and more is ah4c falling
+// behind; one that keeps pace while the TV sits behind puts the lag downstream
+// of this program. The watcher only reads and reports — the bytes pass through
+// as they arrived.
+
+// egressDriftEvery is how often the pace is reported once the program starts.
+const egressDriftEvery = 15 * time.Second
+
+// egressDrift rides the program to the DVR and reports the stream's running
+// gain or loss against the wall since the hand-off.
+type egressDrift struct {
+	io.ReadCloser
+	label string
+
+	mu   sync.Mutex
+	have bool
+	pcr0 uint64    // the first PCR seen, 27 MHz units
+	t0   time.Time // when it was seen
+	last time.Time // last report
+}
+
+// watchEgress dresses the program with the pace report. The DVR is handed the
+// wrapper; the program inside it is untouched.
+func (l *lateEncoder) watchEgress(body io.ReadCloser) io.ReadCloser {
+	return &egressDrift{ReadCloser: body, label: l.label}
+}
+
+func (e *egressDrift) Read(p []byte) (int, error) {
+	n, err := e.ReadCloser.Read(p)
+	if n > 0 {
+		e.watch(p[:n])
+	}
+	return n, err
+}
+
+// watch folds any PCR in b into the pace report. The newest PCR in the read is
+// the one that counts: it is as close to the live edge as the byte stream gets.
+func (e *egressDrift) watch(b []byte) {
+	var pcr uint64
+	var ok bool
+	for i := 0; i+tsPacketSize <= len(b); i += tsPacketSize {
+		pkt := b[i : i+tsPacketSize]
+		if pkt[0] != 0x47 {
+			continue
+		}
+		if v, yes := packetPCR(pkt); yes {
+			pcr, ok = v, true
+		}
+	}
+	if !ok {
+		return
+	}
+	now := time.Now()
+	e.mu.Lock()
+	if !e.have {
+		e.have, e.pcr0, e.t0, e.last = true, pcr, now, now
+		e.mu.Unlock()
+		logger("[HOLD] %s watching the stream's pace against the wall", e.label)
+		return
+	}
+	if now.Sub(e.last) < egressDriftEvery {
+		e.mu.Unlock()
+		return
+	}
+	stream := time.Duration(pcr-e.pcr0) * time.Microsecond / 27
+	wall := now.Sub(e.t0)
+	// The clock free-runs and wraps; a wild step is a new base, not a drift.
+	if d := (stream - wall).Abs(); d > time.Minute {
+		e.pcr0, e.t0 = pcr, now
+	}
+	e.last = now
+	e.mu.Unlock()
+	logger("[HOLD] %s stream pace %+.0fms against the wall since the hand-off", e.label, float64((stream-wall).Milliseconds()))
 }
 
 // --- The hand-off's discontinuity marker ---
