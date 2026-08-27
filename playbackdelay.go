@@ -1311,10 +1311,19 @@ var blackPool []byte
 // exactly as it did before black existed.
 func blackStartup() {
 	const at = "/tmp/blackframe.ts"
+	// At the pre-roll's own rate, whatever that turned out to be, so the two
+	// share one parameter set and the black follows the pre-roll with no
+	// reconfiguration. With no pre-roll it is stillRate, which the NULL path
+	// was watched working at. Nothing here is the program's rate; the program
+	// is a separate stream and never meets this.
+	rate := prerollRate
+	if rate == 0 {
+		rate = stillRate
+	}
 	args := []string{"-hide_banner", "-loglevel", "error", "-y",
-		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%s:r=%d", prerollFrame, fillerRate),
+		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%s:r=%d", prerollFrame, rate),
 		"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds())}
-	args = append(args, fillerEncodeArgs()...)
+	args = append(args, fillerEncodeArgs(rate)...)
 	args = append(args, "-f", "mpegts", at)
 	if out, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
 		logger("[BLACK] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
@@ -1326,8 +1335,8 @@ func blackStartup() {
 		return
 	}
 	blackPool = b[:len(b)/tsPacketSize*tsPacketSize]
-	logger("[BLACK] made %s of black, %s, to go in front of the picture at the hand-off",
-		blackWords(blackSeamFor), byteCount(int64(len(blackPool))))
+	logger("[BLACK] made %s of black at %d pictures a second, %s, to go in front of the picture at the hand-off",
+		blackWords(blackSeamFor), rate, byteCount(int64(len(blackPool))))
 }
 
 // blackWords says a black length. Not holdWords: that rounds to the second, so

@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,8 +49,9 @@ var prerollTS string
 // needs to know.
 type prerollProbe struct {
 	Streams []struct {
-		CodecType string `json:"codec_type"`
-		CodecName string `json:"codec_name"`
+		CodecType  string `json:"codec_type"`
+		CodecName  string `json:"codec_name"`
+		RFrameRate string `json:"r_frame_rate"`
 	} `json:"streams"`
 	Format struct {
 		FormatName string `json:"format_name"`
@@ -59,6 +61,10 @@ type prerollProbe struct {
 // prerollPlan is how the file becomes a transport stream: the ffmpeg arguments
 // between the program name and the output path, and a word for the log.
 type prerollPlan struct {
+	// rate is what the clip runs at once prepared: a video's own rate, kept,
+	// or stillRate for a picture, which has none. The black is made to match
+	// it so the two share one parameter set.
+	rate int
 	args []string
 	kind string
 }
@@ -74,11 +80,12 @@ var (
 // decision can be tested without ffmpeg.
 func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	video, audio := "", ""
+	rateText := ""
 	for _, s := range info.Streams {
 		switch s.CodecType {
 		case "video":
 			if video == "" {
-				video = s.CodecName
+				video, rateText = s.CodecName, s.RFrameRate
 			}
 		case "audio":
 			if audio == "" {
@@ -90,10 +97,19 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 		return prerollPlan{}, fmt.Errorf("has no video stream")
 	}
 	still := stillFormat(info)
+	// A picture has no rate and gets stillRate; a video keeps its own. If the
+	// probe could not say, stillRate stands in rather than a guess at the
+	// program's — the program never sees this stream.
+	rate := stillRate
+	if !still {
+		if r := parseRate(rateText); r > 0 {
+			rate = r
+		}
+	}
 	var args []string
 	var kind []string
 	if still {
-		args = append(args, "-loop", "1", "-framerate", fmt.Sprint(fillerRate), "-t", fmt.Sprint(prerollStillSeconds))
+		args = append(args, "-loop", "1", "-framerate", fmt.Sprint(stillRate), "-t", fmt.Sprint(prerollStillSeconds))
 		kind = append(kind, fmt.Sprintf("%s still cropped to %s as a %d second clip", video, prerollFrame, prerollStillSeconds))
 	}
 	args = append(args, "-i", src)
@@ -139,8 +155,11 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 			vf = "scale=" + prerollFrame + ":force_original_aspect_ratio=increase," +
 				"crop=" + prerollFrame
 		}
-		args = append(args, "-vf", vf+",fps="+fmt.Sprint(fillerRate))
-		args = append(args, fillerEncodeArgs()...)
+		// The clip's own rate is kept. Nothing forces it: a twenty-four frame
+		// film stays twenty-four, and a fifty frame clip stays fifty. The
+		// program is a separate stream on its own decoder and never sees it.
+		args = append(args, "-vf", vf)
+		args = append(args, fillerEncodeArgs(rate)...)
 		if !still {
 			kind = append(kind, video+" video encoded to match the black")
 		}
@@ -157,7 +176,7 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 		kind = append(kind, audio+" audio encoded to aac")
 	}
 	args = append(args, "-f", "mpegts")
-	return prerollPlan{args: args, kind: strings.Join(kind, ", ")}, nil
+	return prerollPlan{rate: rate, args: args, kind: strings.Join(kind, ", ")}, nil
 }
 
 // prerollStartup prepares whatever is mounted at prerollMount into
@@ -220,7 +239,7 @@ func preparePreroll(src string) {
 	defer cancel()
 	t0 := time.Now()
 	out, err := exec.CommandContext(ctx, "ffprobe", "-v", "error",
-		"-show_entries", "stream=codec_type,codec_name:format=format_name",
+		"-show_entries", "stream=codec_type,codec_name,r_frame_rate:format=format_name",
 		"-of", "json", src).Output()
 	if err != nil {
 		logger("[PREROLL] ffprobe could not read %s: %v; holds will use NULL packets", src, probeError(err))
@@ -238,7 +257,7 @@ func preparePreroll(src string) {
 		if jpg, jerr := stillToJPEG(src); jerr != nil {
 			logger("[PREROLL] %s could not be read as a picture (%v); letting ffmpeg try it as it is", src, jerr)
 		} else if out, perr := exec.CommandContext(ctx, "ffprobe", "-v", "error",
-			"-show_entries", "stream=codec_type,codec_name:format=format_name",
+			"-show_entries", "stream=codec_type,codec_name,r_frame_rate:format=format_name",
 			"-of", "json", jpg).Output(); perr == nil {
 			var reread prerollProbe
 			if json.Unmarshal(out, &reread) == nil {
@@ -271,8 +290,9 @@ func preparePreroll(src string) {
 		return
 	}
 	prerollTS = prerollCache
-	logger("[PREROLL] prepared %s in %v: %s, %s at %s", src,
-		time.Since(t0).Round(time.Millisecond), plan.kind, byteCount(st.Size()), prerollCache)
+	prerollRate = plan.rate
+	logger("[PREROLL] prepared %s in %v: %s at %d pictures a second, %s at %s", src,
+		time.Since(t0).Round(time.Millisecond), plan.kind, plan.rate, byteCount(st.Size()), prerollCache)
 }
 
 // probeError adds ffprobe's own words to an exec error, which otherwise only
@@ -1430,22 +1450,43 @@ func (c *clockSplice) notePMTPID(pkt []byte) {
 // clean. Colour signalled explicitly, so a photograph's metadata and a lavfi
 // source do not produce different VUI.
 //
-// fillerRate is the filler's own rate and nothing else's. It once had to be
-// the encoder's, because filler and program shared a PID and a decoder and a
-// ten second pre-roll at thirty frames a second committed the player to thirty
-// before a sixty frame program arrived — every other frame dropped, "the
-// content flickers, not the pre-roll". The program is its own stream now and
-// starts on its own decoder, so an encoder at fifty, or anything else, meets a
-// pre-roll that never told it what to expect.
-const fillerRate = 60
+// stillRate is what a picture is played at, since a picture has none of its
+// own, and what the black is made at when there is no pre-roll. Thirty, the
+// value the NULL-packet path was watched landing at the live edge with.
+const stillRate = 30
 
-func fillerEncodeArgs() []string {
+// prerollRate is what the prepared pre-roll runs at — its own rate, never
+// forced — so the black can be made to match it. Zero when there is none.
+var prerollRate int
+
+// parseRate reads ffprobe's r_frame_rate, "60000/1001" or "25/1", to the
+// nearest whole picture a second. Zero when it cannot.
+func parseRate(s string) int {
+	num, den, ok := strings.Cut(strings.TrimSpace(s), "/")
+	if !ok {
+		den = "1"
+	}
+	n, err1 := strconv.Atoi(num)
+	d, err2 := strconv.Atoi(den)
+	if err1 != nil || err2 != nil || n <= 0 || d <= 0 {
+		return 0
+	}
+	r := (n + d/2) / d
+	if r < 1 || r > 240 {
+		return 0
+	}
+	return r
+}
+
+func fillerEncodeArgs(rate int) []string {
+	if rate < 2 {
+		rate = stillRate
+	}
 	return []string{
 		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
 		"-profile:v", "high",
-		"-x264-params", fmt.Sprintf("keyint=%d:min-keyint=%d:scenecut=0:bframes=0:ref=1:aud=1", fillerRate/2, fillerRate/2),
+		"-x264-params", fmt.Sprintf("keyint=%d:min-keyint=%d:scenecut=0:bframes=0:ref=1:aud=1", rate/2, rate/2),
 		"-pix_fmt", "yuv420p",
 		"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-		"-r", fmt.Sprint(fillerRate),
 	}
 }
