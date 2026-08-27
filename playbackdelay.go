@@ -391,14 +391,25 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 		}
 		return l.open(p)
 	}
-	// The encoder has been open and draining since the tune. Take the release
-	// the moment it comes; NULL packets fill the wait until it does.
+	// The encoder has been open and draining since the tune, so the release
+	// can arrive at any moment — including in the middle of a filler wait. A
+	// look that does not block, followed by a sleep, meant the program sat in
+	// the channel until the sleep ended: measured at 468ms of a 500ms
+	// keepalive stretch, against a gate that had released a keyframe 0ms
+	// behind the newest packet it had read. The picture was fresh; it was the
+	// filler's own wait that made it stale, and it is the same 480ms whatever
+	// else is changed, because nothing else touched it. So wait for the
+	// release and the next burst of filler together, and let the release cut
+	// the wait short.
+	d, burst := l.nullPace(time.Until(l.until))
+	wait := time.NewTimer(d)
 	select {
 	case r := <-l.handoff:
+		wait.Stop()
 		return l.takeHandoff(p, r)
-	default:
+	case <-wait.C:
 	}
-	return l.serveNulls(p, time.Until(l.until))
+	return l.emitNulls(p, burst)
 }
 
 // takeHandoff swaps the filler for the released program and starts the
@@ -564,11 +575,25 @@ func (l *lateEncoder) showPreroll(p []byte, d time.Duration) (int, error) {
 // detection window, a keepalive after. Every byte here is one the DVR stores
 // ahead of the show.
 func (l *lateEncoder) serveNulls(p []byte, d time.Duration) (int, error) {
+	d, burst := l.nullPace(d)
+	time.Sleep(d)
+	return l.emitNulls(p, burst)
+}
+
+// nullPace is how long to wait before the next burst of filler and how big
+// that burst may be, for a caller with d of the wait left to fill. Split out
+// of serveNulls so a caller that has something better to do than sleep can
+// wait on the diet's clock and on that other thing at once.
+func (l *lateEncoder) nullPace(d time.Duration) (time.Duration, int) {
 	pace, burst := holdRate(time.Since(l.dietFrom()))
 	if d > pace || d <= 0 {
 		d = pace
 	}
-	time.Sleep(d)
+	return d, burst
+}
+
+// emitNulls writes one burst of filler into p and counts what it sent.
+func (l *lateEncoder) emitNulls(p []byte, burst int) (int, error) {
 	if len(p) > burst {
 		p = p[:burst]
 	}
