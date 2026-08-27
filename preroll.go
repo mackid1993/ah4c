@@ -118,14 +118,14 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 			// 6, past what most decoders will touch, and it never appears at
 			// all; a portrait picture becomes a portrait channel; and a
 			// picture of any odd size makes a pre-roll whose resolution
-			// differs from the programme's, so the stream changes resolution
+			// differs from the program's, so the stream changes resolution
 			// part way through. Video pre-rolls never had this because a video
 			// is already a sensible size.
 			//
 			// So every still becomes the same thing: scaled up until it covers
-			// a broadcast frame, then cropped to it from the centre. It fills
+			// a broadcast frame, then cropped to it from the center. It fills
 			// the screen, it is never stretched, and it is the resolution the
-			// programme arrives at, so nothing changes at the hand-off.
+			// program arrives at, so nothing changes at the hand-off.
 			// No setsar: the ffmpeg bundled here does not have that filter,
 			// and a still's pixels are square already.
 			vf = "scale=" + prerollFrame + ":force_original_aspect_ratio=increase," +
@@ -814,7 +814,7 @@ func stillToJPEG(src string) (string, error) {
 // --- One clock to the DVR ---
 //
 // A pre-roll is real video and carries its own PCR and PTS, running from zero
-// and restarting every time the clip loops. The programme that follows carries
+// and restarting every time the clip loops. The program that follows carries
 // the encoder's clock, which is an unrelated number tens of hours away. So the
 // DVR is handed two timelines with a cliff between them, and a player has only
 // bad options at that cliff: told the time base is new it flushes video and
@@ -829,9 +829,9 @@ func stillToJPEG(src string) (string, error) {
 //
 // So the cliff is removed instead of being announced. Every timestamp going to
 // the DVR is mapped onto one clock that only ever moves forward: the pre-roll's
-// loops are flattened into a continuous run, and when the programme arrives its
+// loops are flattened into a continuous run, and when the program arrives its
 // clock is offset to carry straight on from where the pre-roll stopped. After
-// the first packet of the programme the offset is a constant, so this is a few
+// the first packet of the program the offset is a constant, so this is a few
 // integer adds per packet and nothing else.
 //
 // Only where there is a pre-roll. The delay's own wait is NULL packets and half
@@ -843,7 +843,7 @@ const (
 	ptsMod = uint64(1) << 33
 	pcrMod = ptsMod * 300
 	// splicePickup is the gap left between the last filler timestamp and the
-	// first programme one — one frame at 30fps. Zero would put two pictures at
+	// first program one — one frame at 30fps. Zero would put two pictures at
 	// the same instant; a large value would put a gap in the timeline that a
 	// player waits out.
 	splicePickup = uint64(3000) // 90 kHz
@@ -897,7 +897,7 @@ func (c *clockSplice) rewrite(b []byte) {
 
 // pick decides where an input timestamp lands on the output clock, and moves
 // the clock forward. A step outside spliceJump is a new source — a clip that
-// has looped, or the programme arriving — and picks up from where the last one
+// has looped, or the program arriving — and picks up from where the last one
 // stopped rather than following the input's own number.
 func (c *clockSplice) pick(in uint64) uint64 {
 	switch {
@@ -910,7 +910,7 @@ func (c *clockSplice) pick(in uint64) uint64 {
 		c.delta = (c.out + splicePickup - in) & (ptsMod - 1)
 		if !c.said {
 			c.said = true
-			logger("[HOLD] %s the programme's clock was carried on from the pre-roll's rather than left as a jump", c.label)
+			logger("[HOLD] %s the program's clock was carried on from the pre-roll's rather than left as a jump", c.label)
 		}
 	}
 	c.in = in
