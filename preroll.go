@@ -594,7 +594,12 @@ func tuneEarlyWith(idx, channel string, tuneFn func(string, string, *earlyTune) 
 	if e.preroll != nil {
 		logger("[PREROLL] %s answered at once with the pre-roll", label)
 	} else {
-		logger("[HOLD] %s holding this tune for %s", label, holdWords(holdDelay))
+		// holdAsked, not holdDelay: what the operator set, not the NULL-packet
+		// wait left after the black at the seam is taken out of it. Reporting
+		// the internal number would have a PLAYBACK_DELAY of one second
+		// announce itself as five hundred milliseconds, which is true of the
+		// filler and wrong about the tune.
+		logger("[HOLD] %s holding this tune for %s", label, holdWords(holdAsked))
 	}
 	return e, nil
 }

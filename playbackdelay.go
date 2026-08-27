@@ -737,7 +737,7 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// the programme then follows video with video. It does not need to be a
 	// second of black, or five, or the whole wait: one frame is all it takes,
 	// and one frame is all that lands in a recording.
-	first, stripped := stripNulls(r.first)
+	first, _ := stripNulls(r.first)
 	// Say it went out. The startup line only reports that a frame was made;
 	// whether one ever reached a seam has never been in the log, so the one
 	// thing this was built to do could not be confirmed from outside — "I
@@ -748,10 +748,6 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 			l.label, byteCount(int64(len(blk))), byteCount(l.nulls))
 	} else {
 		logger("[BLACK] %s no black went out, so the picture follows the wait directly", l.label)
-	}
-	if stripped > 0 {
-		logger("[HOLD] %s took %s of NULL packets out of the hand-off, so the picture is the first thing after the wait",
-			l.label, byteCount(int64(stripped)))
 	}
 	l.body, l.pend = r.body, first
 	body := l.body
@@ -1024,10 +1020,6 @@ func (f *firstDiscontinuity) Read(p []byte) (int, error) {
 		// separate by PID; this is what tells the player the time base on the
 		// programme's own PIDs is new and it should not try to carry anything
 		// across.
-	}
-	if marked > 0 {
-		logger("[HOLD] %s discontinuity marked on %s — the wait is walled off from the programme",
-			f.label, strings.Join(on, ", "))
 	}
 	return n, err
 }

@@ -1679,7 +1679,6 @@ type stallTolerantReader struct {
 	hasFirstChunk atomic.Bool
 	reconnects    atomic.Int64
 	// dropped counts chunks thrown away to keep the queue from becoming a
-	// place lag lives. saidDrop keeps that to one line a tune.
 	// rest is what would not fit in the last caller's buffer, handed over on
 	// the next Read. Only the reading goroutine touches it.
 	rest    []byte
@@ -1688,7 +1687,6 @@ type stallTolerantReader struct {
 	// stall. saidFill keeps that to one line a tune.
 	filled   atomic.Int64
 	saidFill bool
-	saidDrop bool
 }
 
 type sessionSource interface{ sessions() int64 }
@@ -1837,10 +1835,6 @@ func (s *stallTolerantReader) producer() {
 				case <-s.closed:
 					return
 				}
-				if !s.saidDrop {
-					s.saidDrop = true
-					logger("[%s] the queue filled and the oldest stream in it was dropped so the stream stays at the live edge", s.label)
-				}
 			}
 			if err == nil {
 				continue
@@ -1958,8 +1952,6 @@ func (s *stallTolerantReader) flush(label string) {
 		default:
 			if gone > 0 {
 				s.dropped.Add(int64(gone))
-				logger("[%s] dropped %s of stored-up stream before the hand-off, so the program starts live",
-					label, byteCount(int64(gone)*chunkSize))
 			}
 			return
 		}
