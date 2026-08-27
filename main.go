@@ -1728,7 +1728,11 @@ const (
 	// symptom — the DVR is not keeping up — so it is said, but not per chunk.
 	dropLogEvery = 10 * time.Second
 	// fillLogEvery is how often NULL fill into a live program is mentioned.
-	fillLogEvery         = 10 * time.Second
+	fillLogEvery = 10 * time.Second
+	// stallQuietGap keeps a hold's quiet reader from spinning without making
+	// it block: long enough that a core is not burned, short enough that the
+	// hand-off is not delayed by it.
+	stallQuietGap        = 20 * time.Millisecond
 	preFirstChunkBudget  = 15 * time.Second // fail over fast on a dead tuner
 	postFirstChunkBudget = 3 * time.Minute  // ride through mid-stream glitches
 	chunkSize            = 32 * 1024
@@ -1903,7 +1907,7 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 	//
 	// With no timer the select simply blocks on chunks or closed, which is
 	// what a reader with nothing to say should do.
-	if s.hasFirstChunk.Load() && s.fill.Load() {
+	if s.hasFirstChunk.Load() {
 		t := time.NewTimer(stallReadGap)
 		defer t.Stop()
 		stall = t.C
@@ -1930,6 +1934,17 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		}
 		return n, nil
 	case <-stall:
+		// A hold has the filling switched off: the wait is quiet on purpose,
+		// so there is nothing to cover. Return no bytes rather than NULL
+		// packets — but sleep first, because a reader that returns (0, nil)
+		// in a loop is a spin, and gateReader.Read calls src.Read in a tight
+		// loop until it opens. Blocking here instead was tried and hung the
+		// drain outright, so this is the shape that works: no packets, no
+		// spin, and the read comes straight back when a chunk lands.
+		if !s.fill.Load() {
+			time.Sleep(stallQuietGap)
+			return 0, nil
+		}
 		// This puts NULL packets into a live program. It exists so a stalled
 		// encoder does not show the DVR a zero-byte gap, and that is worth
 		// having — but the cost has never been said out loud, and it is the
