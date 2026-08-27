@@ -76,8 +76,11 @@ func maybeWrapNullFrameInsertion(body io.ReadCloser, url, label string) io.ReadC
 	}, label)
 }
 
-// liveEdge drops whatever the encoder had queued when it was opened.
-func liveEdge(body io.ReadCloser, label string) {
+// liveEdge drops whatever the encoder had queued when it was opened, and
+// returns the last PCR it read at the live edge (33-bit, 90 kHz base) so the
+// wait's clock can be re-anchored to the encoder's true live rather than to a
+// probe taken tens of seconds earlier.
+func liveEdge(body io.ReadCloser, label string) (uint64, bool) {
 	buf := make([]byte, 64*1024)
 	var start, last uint64
 	var have bool
@@ -87,7 +90,7 @@ func liveEdge(body io.ReadCloser, label string) {
 	for time.Since(t0) < liveEdgeBudget && dropped < liveEdgeMost {
 		n, err := body.Read(buf)
 		if err != nil {
-			return
+			return last, have
 		}
 		dropped += int64(n)
 		for i := 0; i+tsPacketSize <= n; i += tsPacketSize {
@@ -113,6 +116,7 @@ func liveEdge(body io.ReadCloser, label string) {
 		}
 	}
 	logger("[HOLD] %s dropped %s the encoder had queued (%.1fs ahead)", label, byteCount(dropped), ahead)
+	return last, have
 }
 
 // tuneHoldStartup parses the delay and prepares the pre-roll, before the listener binds.
@@ -353,7 +357,13 @@ func (l *lateEncoder) prepareHandoff() {
 		l.handoff <- nil
 		return
 	}
-	liveEdge(resp.Body, l.label)
+	// Re-anchor the wait's clock to the encoder's true live PCR here, at the
+	// hand-off, instead of leaving it on a probe taken tens of seconds ago —
+	// liveEdge has just drained this fresh connection to the live edge and read
+	// its PCR (33-bit, 90 kHz; the clock is 27 MHz, so ×300).
+	if live, ok := liveEdge(resp.Body, l.label); ok {
+		l.clock.reanchor(live * 300)
+	}
 	armed := make(chan struct{})
 	close(armed)
 	// The gate starts on a keyframe so the picture is clean, and is given the

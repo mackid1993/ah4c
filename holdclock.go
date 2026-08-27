@@ -242,6 +242,15 @@ func (c *holdClock) pcrNow() uint64 {
 	return c.base + uint64(time.Since(c.anchor).Nanoseconds())*27/1000
 }
 
+// reanchor resets the clock's base to a freshly measured encoder PCR (27 MHz),
+// so it tracks the encoder's true live edge rather than an old probe. Called at
+// the hand-off; the nudge is tens of milliseconds and lands under the trickle.
+func (c *holdClock) reanchor(pcr27 uint64) {
+	c.mu.Lock()
+	c.base, c.anchor = pcr27, time.Now()
+	c.mu.Unlock()
+}
+
 // The wait's PCR rides the encoder's own PCR PID, the same one the picture
 // arrives on. It once rode a separate PID to keep the dense synthesized clock
 // off the video stream, but that made the PCR PID switch at the hand-off and
