@@ -193,7 +193,7 @@ func tuneHoldStartup() {
 		if holdDelay > blackCosts {
 			holdDelay -= blackCosts
 		} else {
-			logger("[HOLD] PLAYBACK_DELAY %s is shorter than the %s of black that bookends a wait, so the wait itself is nothing and the tune is only the black",
+			logger("[HOLD] PLAYBACK_DELAY %s is shorter than the %s of black in front of the picture, so the wait itself is nothing and the tune is only the black",
 				holdWords(holdAsked), blackWords(blackCosts))
 			holdDelay = time.Millisecond
 		}
@@ -206,8 +206,8 @@ func tuneHoldStartup() {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
-		logger("[HOLD] hold %s: %s of black, %s of NULL packets, then %s of black and the picture",
-			holdWords(holdAsked), blackWords(blackHeadFor), holdWords(holdDelay), blackWords(blackSeamFor))
+		logger("[HOLD] hold %s: %s of NULL packets, then %s of black and the picture",
+			holdWords(holdAsked), holdWords(holdDelay), blackWords(blackSeamFor))
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
 	case prerollTS != "":
@@ -308,8 +308,6 @@ type lateEncoder struct {
 	body   io.ReadCloser
 	closed bool
 	nulls  int64
-	// head is the black sent at the front of the wait, before any filler.
-	head int64
 	// stall is the drained path's stall reader, kept so the hand-off and the
 	// pace watcher can say how deep its queue stands instead of leaving the
 	// depth to be inferred from drop events. nil on the pre-roll path, which
@@ -361,19 +359,6 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 		}
 	}
 	l := &lateEncoder{url: url, label: label, t0: t0, until: until, preroll: early, tuner: tuner, name: name}
-	// Black at the head of the wait, before a single NULL packet. Read drains
-	// pend before anything else, so this is literally the first thing the DVR
-	// is sent for this tune.
-	//
-	// The seam's black fixed the picture and the user's next words were "it
-	// left nulls at the beginning". Same fault, other end: NULL packets carry
-	// no frame, and at the head of a recording there is nothing in front of
-	// them either. A pre-roll fills the wait with its own picture and needs
-	// none of this, which is also when blackPool is nil.
-	if until.After(t0) && len(blackPool) > 0 {
-		l.pend = append([]byte(nil), blackPool...)
-		l.head = int64(len(blackPool))
-	}
 	if l.preroll != nil {
 		l.preroll.adopted.Store(true)
 	} else {
@@ -810,8 +795,8 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// didn't see any lines about it creating black frames". Once per tune.
 	if blk := blackPool; len(blk) > 0 {
 		first = append(append([]byte(nil), blk...), first...)
-		logger("[BLACK] %s the wait went out bookended: %s of black at the head, %s of NULL packets, %s of black at the seam and then the picture",
-			l.label, byteCount(l.head), byteCount(l.nulls), byteCount(int64(len(blk))))
+		logger("[BLACK] %s %s of black went out at the seam, immediately in front of the picture, against %s of NULL packets in the wait",
+			l.label, byteCount(int64(len(blk))), byteCount(l.nulls))
 	} else {
 		logger("[BLACK] %s no black went out, so the picture follows the wait directly", l.label)
 	}
@@ -1539,34 +1524,33 @@ func (r *refreshSource) Read(p []byte) (int, error) {
 // coded picture and so showed nothing. Half a second is about fifteen frames,
 // with a keyframe twice a second for a scrubber to land on.
 //
-// blackHeadFor is the same again at the other end. The seam fixed the picture
-// and left NULL packets at the head of the recording, where the same argument
-// applies for the same reason: they are the first thing in the file and there
-// is no frame in front of them either. So the wait is bookended.
+// The other end was tried and taken out again. The seam fixed the picture and
+// left NULL packets at the head of the recording, so the same half second went
+// in front of those too — and rewind stopped working. One clip used twice puts
+// PTS 0 to half a second at the head, ninety seconds of clockless NULL packets,
+// and then PTS 0 to half a second again at the seam: time runs backwards inside
+// the file and a scrubber cannot cross it. Seam-only worked, seam-and-head did
+// not, one change between the two.
+//
+// So the head stays as it was. If those leading NULL packets are worth
+// answering later, the answer is not a second copy of this clip — it is a
+// separate one whose timestamps start after the seam's, or an
+// -output_ts_offset on the seam copy. Recorded so it is not rebuilt the
+// obvious way a third time.
 //
 // Constants, not settings. These numbers were being searched for and they are
 // the answer for everyone; an environment variable would ship the search.
 const (
 	blackSeamFor = 500 * time.Millisecond
-	blackHeadFor = 500 * time.Millisecond
-	// blackCosts is what the bookend adds to a wait, and is taken back off
+	// blackCosts is what the black adds to a wait, and is taken back off
 	// PLAYBACK_DELAY so a hold lasts what the user asked it to. Without this a
-	// ninety second setting is a ninety-one second hold, which is a setting
-	// that quietly means something else.
-	blackCosts = blackHeadFor + blackSeamFor
+	// ninety second setting is a ninety and a half second hold, which is a
+	// setting that quietly means something else.
+	blackCosts = blackSeamFor
 )
 
 // blackPool is the black as a transport stream, or nil if it could not be made.
-// It is exactly blackSeamFor long and goes out whole, at both ends of the wait.
-//
-// One clip, used twice, so its timestamps run 0 to half a second at the head
-// and again at the seam. Between them are ninety seconds of NULL packets, which
-// carry no clock at all, and after them the programme arrives on the encoder's
-// own base — a jump that is already there in the build that works. A second
-// jump of the same kind is very likely tolerated the same way; if it is not,
-// giving the seam copy an -output_ts_offset is the one-line answer. Said rather
-// than assumed: the seam half is byte for byte what was watched working, and
-// this leaves it that way.
+// It is exactly blackSeamFor long and goes out whole, once, at the seam.
 var blackPool []byte
 
 // blackStartup makes it once, before the listener binds, where nothing can be
