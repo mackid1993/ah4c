@@ -701,6 +701,18 @@ func tuneEarlyWith(idx, channel string, tuneFn func(string, string, *earlyTune) 
 		// filler and wrong about the tune.
 		logger("[HOLD] %s holding this tune for %s", label, holdWords(holdAsked))
 	}
+	// One clock and one set of PIDs over the WHOLE response, early filler and
+	// late program alike. The splice used to wrap only the tune's result, so
+	// the pre-roll went out raw on its own PIDs during the scripts window and
+	// renumbered afterward — a PID change mid-pre-roll, which is the one thing
+	// the player will not follow, and it froze on the pre-roll before the
+	// program ever arrived. Wrapping the early reader here means the pre-roll
+	// is renumbered onto the output PIDs from its first packet, unbroken into
+	// the program. The NULL-packet wait carries no timestamps and no program
+	// table to reconcile, so it is left alone.
+	if prerollTS != "" {
+		return spliceClock(e, label), nil
+	}
 	return e, nil
 }
 
