@@ -704,7 +704,7 @@ func run() error {
 		c.Writer.Flush()
 		var dst flushWriter = c.Writer
 		if holdDelay > 0 {
-			// A held tune's write side gets the instrument; see writestall.go.
+			// A held tune's write side gets the instrument; see playbackdelay.go.
 			dst = watchWriteStalls(dst, "tuner="+tuner+" channel="+channel)
 		}
 		if bytesCopied, err = copyFlush(dst, reader); err != nil {
@@ -1210,7 +1210,7 @@ func run() error {
 	logger("[START] ah4c is ready")
 	// Not r.Run: it builds its own listener and leaves the send buffer to the
 	// kernel, which autotunes it into the megabytes of stale video. See
-	// livesocket.go.
+	// playbackdelay.go.
 	return serveLive(r, ":7654")
 }
 
@@ -2022,16 +2022,11 @@ const (
 	playbackTimeout      = 12 * time.Second
 	keyframeWait         = 8 * time.Second
 	keyframeCeiling      = 2 * keyframeWait
-	// liveEdgeSlack is how far behind the wait's clock a keyframe may be and
-	// still count as live: a quarter second in 27 MHz PCR units. A keyframe
-	// staler than this is one the encoder served from before the live edge, so
-	// a clock hand-off waits for a fresher one rather than starting behind.
-	liveEdgeSlack = uint64(27000000 / 4)
-	riseWindow    = 250 * time.Millisecond
-	riseFactor    = 4
-	riseWait      = time.Second
-	minWindow     = 8 * 188
-	busyWindow    = 46875
+	riseWindow           = 250 * time.Millisecond
+	riseFactor           = 4
+	riseWait             = time.Second
+	minWindow            = 8 * 188
+	busyWindow           = 46875
 )
 
 type gateReader struct {
@@ -2068,15 +2063,6 @@ type gateReader struct {
 	sessSeen   int64
 	sess0      int64
 	expectSwap atomic.Bool
-
-	// bridge, when set, is the wait's clock. The gate releases only on a
-	// keyframe at or past the clock's live edge, so a clock hand-off cannot
-	// start a GOP behind where the wait had the timeline. lastPCR is the
-	// newest PCR the gate has seen, its read of where the encoder is. nil/zero
-	// unless a clock hold set them, so other paths are unchanged.
-	bridge  *holdClock
-	lastPCR uint64
-	stale   int // keyframes skipped for being behind the clock's live edge
 }
 
 // newGateReader gates src until ready closes. timed says the wait was a timer,
@@ -2280,22 +2266,8 @@ func (g *gateReader) scan(b []byte) int {
 				g.armed0 = g.armedAt
 			}
 		}
-		if afc >= 2 && pkt[4] >= 7 && pkt[5]&0x10 != 0 {
-			if pcr, ok := packetPCR(pkt); ok {
-				g.lastPCR = pcr
-			}
-		}
 		if g.vid[pid] && afc >= 2 && pkt[4] > 0 && pkt[5]&0x40 != 0 {
 			if kind := g.releaseKind(); kind != "" {
-				if !g.atLiveEdge() {
-					g.stale++
-					i += 188
-					continue
-				}
-				if g.bridge != nil && g.lastPCR != 0 {
-					behindMs := (float64(g.bridge.pcrNow()) - float64(g.lastPCR)) / 27000.0
-					logger("[HOLD] gate: released a keyframe %.0fms from the clock's live edge, %d stale keyframe(s) skipped first", behindMs, g.stale)
-				}
 				g.keep = append(g.keep[:0], b[i:]...)
 				g.release(kind)
 				return len(b)
@@ -2304,22 +2276,6 @@ func (g *gateReader) scan(b []byte) int {
 		i += 188
 	}
 	return i
-}
-
-// atLiveEdge reports whether the keyframe about to be released is at the wait's
-// live edge. Without a bridging clock it is always true, so gating is off. With
-// one, a keyframe whose PCR is more than liveEdgeSlack behind the clock is stale
-// — a GOP the encoder handed over from before live — and the gate waits for a
-// fresher one, up to its keyframe-wait fallback.
-func (g *gateReader) atLiveEdge() bool {
-	if g.bridge == nil || g.lastPCR == 0 {
-		return true
-	}
-	live := g.bridge.pcrNow()
-	if g.lastPCR+liveEdgeSlack >= live {
-		return true
-	}
-	return false
 }
 
 func (g *gateReader) Read(p []byte) (int, error) {

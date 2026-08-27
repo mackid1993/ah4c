@@ -21,6 +21,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 // holdDelay is the playback delay as parsed at startup; zero when unset.
@@ -271,8 +273,10 @@ type lateEncoder struct {
 	primer []byte
 	// black fills the wait with real frames; pendBlack is what is left of the
 	// last chunk it handed over.
-	black      *prerollPlayer
-	pendBlack  []byte
+	black     *prerollPlayer
+	pendBlack []byte
+	// blackFrom is when black first went out, which is when its clock starts.
+	blackFrom  time.Time
 	gate       *gateReader
 	lastTables time.Time
 	// quietSaid keeps the "no keyframe" note to once a tune.
@@ -419,27 +423,6 @@ func (l *lateEncoder) drainEarly() {
 			l.stall = st
 			l.mu.Unlock()
 			src := maybeWrapCaptions(st, l.tuner, l.name)
-			// Give the player a picture before the filler, not after it.
-			//
-			// A ninety second encoder reboot is covered with NULL packets by
-			// the stall reader and the stream comes back fine — same packets,
-			// same length, no viewer stuck behind them. The difference is the
-			// order. There, video came first: the player had a time base, and
-			// the NULLs were a gap in the middle of a stream it already
-			// understood, so it rode through them. Here the NULLs come first,
-			// before any picture at all, so there is nothing to anchor on and
-			// nothing to carry across, and a playhead cannot get past them.
-			//
-			// So the wait opens with real video off the encoder that is
-			// already draining — tables and a keyframe, primerFor long. Not
-			// synthesised, not a pre-roll: the encoder's own output. After
-			// that the filler is a gap in an established stream, which is the
-			// shape that is known to work.
-			if b := primeFrom(src, l.label); len(b) > 0 {
-				l.mu.Lock()
-				l.primer = b
-				l.mu.Unlock()
-			}
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
 			// No discontinuity marker. Playback detection does not mark — main.go
@@ -537,7 +520,7 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	if closed {
 		return 0, io.EOF
 	}
-	// Black first, and for as long as the wait lasts. Real frames, a real time
+	// Black first. Real frames, a real time
 	// base, and nothing to see — which is what a fragment of the encoder's own
 	// picture could not give: fourteen kilobytes is tables and part of a
 	// keyframe, and a piece big enough to decode would show the box tuning in.
@@ -633,7 +616,7 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	// case the clip dies, and its expiry is a real fault worth the fallback.
 	l.mu.Lock()
 	black := l.black
-	if black != nil && time.Since(l.t0) > blackForHold(holdDelay) {
+	if black != nil && !l.blackFrom.IsZero() && time.Since(l.blackFrom) > blackForHold(holdDelay) {
 		// Long enough. The player has a picture and a time base now, and
 		// everything after this is a gap in a stream it already understands —
 		// which is the shape a ninety second encoder reboot already proves
@@ -663,6 +646,14 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 			return l.emitNulls(p, burst)
 		}
 		l.mu.Lock()
+		if l.blackFrom.IsZero() {
+			// From when black starts flowing, not from the tune. The scripts
+			// run first — three and a half seconds of adb on this box — and
+			// black cannot go out until they are done. Timing it from t0 spent
+			// most of the allowance before there was anything to play: a five
+			// second run came out as one and a half.
+			l.blackFrom = time.Now()
+		}
 		l.pendBlack = append(l.pendBlack, data...)
 		n := copy(p, l.pendBlack)
 		l.pendBlack = l.pendBlack[n:]
@@ -702,7 +693,10 @@ func blackForHold(hold time.Duration) time.Duration {
 // whole hold: at a broadcast bitrate a ninety second wait of black is sixty
 // odd megabytes, to do a job the first few seconds have already done.
 const (
-	blackMost  = 5 * time.Second
+	// One second is two keyframes of the clip plus its tables — everything a
+	// player needs to take a picture and a time base from, and nothing spare.
+	// Five was tried first and is more black than a recording should carry.
+	blackMost  = 1 * time.Second
 	blackLeast = time.Second
 )
 
@@ -1017,6 +1011,17 @@ func (l *lateEncoder) Close() error {
 // behind; one that keeps pace while the TV sits behind puts the lag downstream
 // of this program. The watcher only reads and reports — the bytes pass through
 // as they arrived.
+
+// packetPCR reads the PCR (27 MHz) from a packet's adaptation field.
+func packetPCR(pkt []byte) (uint64, bool) {
+	if pkt[3]&0x20 == 0 || pkt[4] < 7 || pkt[5]&0x10 == 0 {
+		return 0, false
+	}
+	base := uint64(pkt[6])<<25 | uint64(pkt[7])<<17 | uint64(pkt[8])<<9 |
+		uint64(pkt[9])<<1 | uint64(pkt[10])>>7
+	ext := uint64(pkt[10]&0x01)<<8 | uint64(pkt[11])
+	return base*300 + ext, true
+}
 
 // egressDriftEvery is how often the pace is reported once the program starts.
 const egressDriftEvery = 15 * time.Second
@@ -1583,4 +1588,127 @@ func startBlack(label string) *prerollPlayer {
 	}
 	return startPlayer(label, "BLACK", "-re", "-stream_loop", "-1", "-i", blackTS,
 		"-c", "copy", "-f", "mpegts", "pipe:1")
+}
+
+// --- The socket to the DVR ---
+// The socket to the DVR is a reservoir too, and a bigger one than any queue in
+// this program.
+//
+// The stall queue was capped at four chunks because two megabytes of it was
+// holding the viewer seconds behind. But look at what a drop from that queue
+// actually means: the producer could not hand a chunk on, which means the
+// consumer was not taking one, which means the write to the DVR was blocking.
+// A write blocks only when the kernel's send buffer for that socket is already
+// full. So every one of those drop lines is also proof that a second reservoir,
+// downstream of ours and outside this program, was full at the same moment.
+//
+// Linux autotunes a send buffer up into the megabytes on a connection that is
+// written to hard, which is exactly this one. Those bytes are stale video: they
+// were current when they were written and they are handed to the DVR whenever
+// it gets round to reading. Nothing in ah4c can take them back — once a byte is
+// in the send buffer it is committed — so the only way not to be behind by a
+// buffer's worth is for the buffer not to be that big.
+//
+// Capping it does not lose anything. This is a live stream: if the DVR cannot
+// keep up, the choice is to drop or to lag, and dropping is what keeps a viewer
+// at the live edge. A small send buffer simply moves the decision back into
+// this program, where the stall queue already drops what it cannot pass on,
+// instead of leaving it to a kernel buffer that only ever hoards.
+
+// dvrSendBuffer is how many bytes the kernel may hold for the DVR. At a
+// broadcast bitrate this is a couple of hundred milliseconds — enough that a
+// write is not blocking on every packet, and far too little to hide a second
+// of video in. The default is autotuned into the megabytes, which is seconds.
+const dvrSendBuffer = 256 * 1024
+
+// liveListener caps the send buffer on every connection it accepts, so no
+// connection this program serves can bank more than dvrSendBuffer of stream.
+type liveListener struct{ net.Listener }
+
+func (l liveListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return c, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		// Best effort: a kernel that will not take the size still serves the
+		// stream, it just keeps its own idea of how much to hold.
+		_ = tc.SetWriteBuffer(dvrSendBuffer)
+	}
+	return c, nil
+}
+
+// serveLive runs the router on addr with the send buffer capped. It replaces
+// r.Run, which builds its own listener and leaves the buffer to the kernel.
+func serveLive(r *gin.Engine, addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	logger("[START] serving on %s with the DVR's send buffer capped at %s, so the kernel cannot hold a stream back", addr, byteCount(dvrSendBuffer))
+	return r.RunListener(liveListener{ln})
+}
+
+// --- Watching the writes to the DVR ---
+// Every instrument so far rides the read side: the pace watcher proves the
+// bytes leave lateEncoder on the wall's clock, and the stall queue reports how
+// deep it stands. The one stretch nobody has ever measured is the last one —
+// the write into the DVR's socket. The kernel's send buffer can hold megabytes,
+// a megabyte is seconds of video, and bytes standing there are downstream of
+// every flush and drop this program has: nothing inside ah4c can shed them. A
+// write only blocks when that buffer is full, so the time spent blocked in
+// Write is the one number that says whether the DVR is draining ah4c or damming
+// it. Zero means the lag the viewer sees lives past the DVR's ingest, where no
+// byte-stream change here can reach it; whole seconds mean the DVR itself reads
+// slower than the encoder sends, and now there is a log line saying which
+// instead of an argument either way.
+
+// writeStallEvery is how often the blocked time is reported: the pace
+// watcher's cadence, so the two lines land side by side in the log.
+const writeStallEvery = 15 * time.Second
+
+// stallWatchedWriter times every write on its way to the DVR and reports the
+// time spent blocked. It is used from a single copy loop, so plain fields and
+// no lock.
+type stallWatchedWriter struct {
+	dst     flushWriter
+	label   string
+	last    time.Time     // when the last report was made
+	blocked time.Duration // time blocked in Write and Flush since then
+	worst   time.Duration // the single slowest write since then
+	total   time.Duration // time blocked over the whole tune
+}
+
+// watchWriteStalls wraps the DVR-facing writer with the report.
+func watchWriteStalls(dst flushWriter, label string) flushWriter {
+	return &stallWatchedWriter{dst: dst, label: label, last: time.Now()}
+}
+
+func (w *stallWatchedWriter) Write(p []byte) (int, error) {
+	t0 := time.Now()
+	n, err := w.dst.Write(p)
+	w.note(time.Since(t0))
+	if t0.Sub(w.last) >= writeStallEvery {
+		logger("[HOLD] %s writes to the DVR blocked %dms of the last %v (worst single write %dms; %v blocked in all this tune)",
+			w.label, w.blocked.Milliseconds(), t0.Sub(w.last).Round(time.Second),
+			w.worst.Milliseconds(), w.total.Round(time.Millisecond))
+		w.last, w.blocked, w.worst = t0, 0, 0
+	}
+	return n, err
+}
+
+// Flush is timed too: the hint path writes through a bufio whose tail leaves
+// in the flush, so blocking there is the same backpressure by another door.
+func (w *stallWatchedWriter) Flush() {
+	t0 := time.Now()
+	w.dst.Flush()
+	w.note(time.Since(t0))
+}
+
+func (w *stallWatchedWriter) note(d time.Duration) {
+	w.blocked += d
+	w.total += d
+	if d > w.worst {
+		w.worst = d
+	}
 }
