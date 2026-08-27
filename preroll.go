@@ -895,30 +895,59 @@ func (c *clockSplice) rewrite(b []byte) {
 	}
 }
 
-// pick decides where an input timestamp lands on the output clock, and moves
-// the clock forward. A step outside spliceJump is a new source — a clip that
-// has looped, or the program arriving — and picks up from where the last one
-// stopped rather than following the input's own number.
-func (c *clockSplice) pick(in uint64) uint64 {
+// advance decides where the stream's clock has got to, and is driven by PCR
+// alone. PCR is the transmission clock and only ever moves forward, so it is
+// the one honest answer to "is this still the same source".
+//
+// PTS and DTS must not get a vote. DTS is below PTS on every frame that is
+// reordered, and audio interleaves below video, so a shared decision sees a
+// step backwards constantly — and the first version of this compared unsigned
+// distances, where any backwards step wraps to eight and a half billion and
+// reads as a new source. The delta was recomputed on nearly every packet, each
+// time pinning the output a fixed pickup past the last one instead of letting
+// it follow the real rate, and the whole timeline crawled. That is what "super
+// slow after the pre-roll" was.
+//
+// So: one delta, decided by PCR, applied to everything. The offsets between
+// PCR, PTS and DTS are preserved exactly because they all shift by the same
+// amount.
+func (c *clockSplice) advance(pcr uint64) {
 	switch {
 	case !c.started:
-		c.started, c.delta, c.out, c.in = true, 0, in, in
-		return in
-	case (in-c.in)&(ptsMod-1) < spliceJump:
-		// Running on, including a small step backwards for B-frame order.
+		c.started, c.delta, c.out, c.in = true, 0, pcr, pcr
+		return
+	case forward(pcr, c.in):
+		// The stream running on. Forward only: a PCR is the transmission
+		// clock and never steps back within one continuity, so any backward
+		// step at all is a new source however small it looks. A ten second
+		// clip looping is a step back of ten seconds, and a clip shorter than
+		// spliceJump would otherwise be read as the stream running on and
+		// handed to the DVR going backwards.
 	default:
-		c.delta = (c.out + splicePickup - in) & (ptsMod - 1)
+		c.delta = (c.out + splicePickup - pcr) & (ptsMod - 1)
 		if !c.said {
 			c.said = true
 			logger("[HOLD] %s the program's clock was carried on from the pre-roll's rather than left as a jump", c.label)
 		}
 	}
-	c.in = in
-	out := (in + c.delta) & (ptsMod - 1)
-	if (out-c.out)&(ptsMod-1) < spliceJump {
+	c.in = pcr
+	if out := (pcr + c.delta) & (ptsMod - 1); forward(out, c.out) {
 		c.out = out
 	}
-	return out
+}
+
+// at maps a timestamp onto the output clock. No state: the clock is advanced
+// by PCR and everything else simply takes the same offset.
+func (c *clockSplice) at(ts uint64) uint64 {
+	if !c.started {
+		return ts
+	}
+	return (ts + c.delta) & (ptsMod - 1)
+}
+
+// forward is whether a is ahead of b by less than spliceJump.
+func forward(a, b uint64) bool {
+	return (a-b)&(ptsMod-1) < spliceJump
 }
 
 func (c *clockSplice) mapPCR(pkt []byte) {
@@ -927,7 +956,8 @@ func (c *clockSplice) mapPCR(pkt []byte) {
 	}
 	base := uint64(pkt[6])<<25 | uint64(pkt[7])<<17 | uint64(pkt[8])<<9 |
 		uint64(pkt[9])<<1 | uint64(pkt[10])>>7
-	out := c.pick(base)
+	c.advance(base)
+	out := c.at(base)
 	pkt[6] = byte(out >> 25)
 	pkt[7] = byte(out >> 17)
 	pkt[8] = byte(out >> 9)
@@ -971,9 +1001,9 @@ func (c *clockSplice) mapPES(pkt []byte) {
 	if flags < 2 || int(es[8]) < 5 {
 		return // no PTS
 	}
-	writeTS(es[9:14], c.pick(readTS(es[9:14])))
+	writeTS(es[9:14], c.at(readTS(es[9:14])))
 	if flags == 3 && int(es[8]) >= 10 && off+19 <= tsPacketSize {
-		writeTS(es[14:19], c.pick(readTS(es[14:19])))
+		writeTS(es[14:19], c.at(readTS(es[14:19])))
 	}
 }
 
