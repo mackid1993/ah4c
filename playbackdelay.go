@@ -231,6 +231,9 @@ type lateEncoder struct {
 	// hand-off, not at the open: the encoder is now opened at tune start, and
 	// a shed spent during the wait is a shed the viewer never gets.
 	refresh *refreshSource
+	// drain is the gated chain drainEarly is reading, kept so Close can shut
+	// the encoder even when the hand-off has not happened yet.
+	drain io.ReadCloser
 
 	mu     sync.Mutex
 	body   io.ReadCloser
@@ -340,6 +343,21 @@ func (l *lateEncoder) drainEarly() {
 				}
 				st.flush(l.label)
 			}(l.until)
+			// Close has to be able to reach this. Until now it could not: it
+			// only ever closed l.body, which is not set until the hand-off is
+			// claimed, so a tune whose client left during the wait leaked the
+			// encoder connection and the producer goroutine behind it — and
+			// that producer keeps pulling the encoder at full rate for ever,
+			// with nobody reading. Watched happening: a tuner with nothing
+			// playing threw away three thousand chunks and climbing.
+			l.mu.Lock()
+			l.drain = body
+			closed := l.closed
+			l.mu.Unlock()
+			if closed {
+				body.Close()
+				return
+			}
 			logger("[HOLD] %s encoder open and draining for the wait", l.label)
 			break
 		}
@@ -678,12 +696,28 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 
 func (l *lateEncoder) Close() error {
 	l.mu.Lock()
-	body := l.body
+	body, drain := l.body, l.drain
 	l.closed = true
 	l.mu.Unlock()
 	if l.preroll != nil {
 		l.preroll.stop()
 		l.preroll = nil
+	}
+	// A hand-off nobody claimed still holds an open encoder. drainEarly posts
+	// the released body to l.handoff and moves on; if the client has already
+	// gone, Read is never called again, so the body sits in the channel with
+	// its producer goroutine reading the encoder for ever. Take it and close
+	// it. Non-blocking: an empty channel means the hand-off never happened,
+	// and the drain below is what holds the connection in that case.
+	select {
+	case r := <-l.handoff:
+		if r != nil && r.body != nil {
+			r.body.Close()
+		}
+	default:
+	}
+	if drain != nil {
+		drain.Close()
 	}
 	if body != nil {
 		return body.Close()
