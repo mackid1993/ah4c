@@ -1685,6 +1685,9 @@ type stallTolerantReader struct {
 	reconnects    atomic.Int64
 	// dropped counts chunks thrown away to keep the queue from becoming a
 	// place lag lives. lastDropLog is only touched by the producer.
+	// rest is what would not fit in the last caller's buffer, handed over on
+	// the next Read. Only the reading goroutine touches it.
+	rest        []byte
 	dropped     atomic.Int64
 	lastDropLog time.Time
 	// depthHigh is the deepest the queue has stood since queueGauge last read
@@ -1872,12 +1875,27 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		defer t.Stop()
 		stall = t.C
 	}
+	// A chunk left over from a caller whose buffer could not take all of the
+	// last one goes first. Without this, copy silently threw the tail away:
+	// every caller today reads with thirty-two kilobytes or more so nothing
+	// lost a byte, but a caller reading smaller would have quietly dropped
+	// most of every chunk — a hole in the video, with nothing said. That is
+	// the shape of fault this program has been bitten by twice tonight.
+	if len(s.rest) > 0 {
+		n := copy(p, s.rest)
+		s.rest = s.rest[n:]
+		return n, nil
+	}
 	select {
 	case <-s.closed:
 		return 0, io.EOF
 	case data := <-s.chunks:
 		s.hasFirstChunk.Store(true)
-		return copy(p, data), nil
+		n := copy(p, data)
+		if n < len(data) {
+			s.rest = append(s.rest[:0], data[n:]...)
+		}
+		return n, nil
 	case <-stall:
 		if len(p) < 188 {
 			return copy(p, nullTSPacket[:]), nil
