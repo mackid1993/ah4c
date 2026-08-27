@@ -758,12 +758,25 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	switch {
 	case l.preroll == nil:
 		seam = blackPool
+		if len(seam) > 0 {
+			logger("[BLACKFRAMES] %s %s of black went out at the seam in front of the picture", l.label, byteCount(int64(len(seam))))
+		}
 	case wantHEVC():
-		seam = blackHEVCAsset[:len(blackHEVCAsset)/tsPacketSize*tsPacketSize]
+		// An H.264 pre-roll cannot hand straight to the H.265 seam: the player
+		// carries the H.264 decoder it was showing the pre-roll with into the
+		// H.265 black and freezes on it. A short burst of NULL packets first —
+		// carrying no coded video and no time — lets it release that decoder,
+		// exactly as the NULL path's silence does before its own black; then the
+		// H.265 black gives it a clean same-codec frame to acquire on and start
+		// the clock. The viewer only sees the pre-roll's last frame held a
+		// moment, and nothing lands behind the live edge, NULL packets being
+		// timeless.
+		hevcBlack := blackHEVCAsset[:len(blackHEVCAsset)/tsPacketSize*tsPacketSize]
+		seam = append(bytes.Repeat(nullTSPacket[:], seamNullFrames), hevcBlack...)
+		logger("[BLACKFRAMES] %s %d NULL packets then %s of H.265 black went out between the pre-roll and the program", l.label, seamNullFrames, byteCount(int64(len(hevcBlack))))
 	}
 	if len(seam) > 0 {
 		first = append(append([]byte(nil), seam...), first...)
-		logger("[BLACKFRAMES] %s %s of black went out at the seam in front of the picture", l.label, byteCount(int64(len(seam))))
 	}
 	// Whatever pre-roll is still in pend goes out first; it is whole packets
 	// from the pump, so finishFiller has nothing to trim on that path.
@@ -1195,6 +1208,13 @@ const (
 	// wait rather than added to it.
 	blackCosts = blackSeamFor
 )
+
+// seamNullFrames is the short burst of NULL packets placed between an H.264
+// pre-roll and the H.265 seam, so the player releases its H.264 decoder before
+// the H.265 black arrives — the gap that keeps the hand-off from freezing.
+// NULL packets carry no coded video and no time, so this adds no lag; the
+// viewer only sees the pre-roll's last frame held for a moment.
+const seamNullFrames = 200
 
 // blackPool is the half second of black as a transport stream — H.264 by
 // default, or the built-in H.265 clip when ENCODER_CODEC is h265 — or nil if it
