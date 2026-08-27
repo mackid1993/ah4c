@@ -1249,8 +1249,12 @@ func (l *lateEncoder) stallTolerant(body io.ReadCloser) *stallTolerantReader {
 // with the hold, never above refreshMost, the longest point watched working.
 const (
 	refreshBase = 20 * time.Second
-	refreshPer  = 45 * time.Second
-	refreshMost = 30 * time.Second
+	// refreshEvery is how often the break repeats after the first. A drift
+	// that grows needs pulling back more than once; a single shed only ever
+	// fixed the moment it happened.
+	refreshEvery = 30 * time.Second
+	refreshPer   = 45 * time.Second
+	refreshMost  = 30 * time.Second
 )
 
 // refreshAfterHold is how long after the program starts the encoder is
@@ -1296,7 +1300,7 @@ type refreshSource struct {
 	// written by the DVR's goroutine at the hand-off and read by the drain's,
 	// so it is atomic rather than a plain time.
 	at    atomic.Int64
-	done  bool
+	done  int
 	label string
 }
 
@@ -1305,16 +1309,28 @@ type refreshSource struct {
 func (r *refreshSource) arm(at time.Time) { r.at.Store(at.UnixNano()) }
 
 func (r *refreshSource) Read(p []byte) (int, error) {
-	if at := r.at.Load(); !r.done && at != 0 && time.Now().UnixNano() >= at {
-		r.done = true
+	// Once was right when there was something to shed once. Every reservoir in
+	// this program is bounded now — the queue is half a megabyte, the kernel's
+	// send buffer a quarter, no filler goes out after the hand-off — and what
+	// is left is a viewer who starts at the live edge and then drifts back,
+	// continuously, while the stream itself holds the wall to within fifteen
+	// milliseconds. Nothing here is over-delivering. The player is falling
+	// behind on its own, and the break is the only thing this program has that
+	// reaches into it: it makes the DVR discard what it has stored ahead.
+	//
+	// A single break cannot hold a drift. It pulls the viewer forward once and
+	// the drift resumes. So it repeats for as long as the tune runs.
+	if at := r.at.Load(); at != 0 && time.Now().UnixNano() >= at {
+		r.at.Store(time.Now().Add(refreshEvery).UnixNano())
+		r.done++
 		fresh, err := r.open()
 		if err != nil {
-			logger("[HOLD] %s the encoder would not open a second time (%v); leaving the stream as it is", r.label, err)
+			logger("[HOLD] %s the encoder would not open again (%v); leaving the stream as it is, the next one still comes", r.label, err)
 		} else {
 			old := r.ReadCloser
 			r.ReadCloser = fresh
 			old.Close()
-			logger("[HOLD] %s reopened the encoder, dropping what the DVR had stored ahead of the show", r.label)
+			logger("[HOLD] %s reopened the encoder (%d), dropping what the DVR had stored ahead of the show", r.label, r.done)
 		}
 	}
 	return r.ReadCloser.Read(p)
