@@ -465,10 +465,20 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	// four seconds at a time — so a few seconds of nothing at the very end,
 	// with a program arriving at the end of it, is well inside what it takes.
 	if left <= quietBeforeMark {
+		// Measured from the MARK, not from entering the quiet. The first go at
+		// this timed keyframeQuiet from whenever the quiet began, which is
+		// quietBeforeMark early, so it expired a second before the mark and
+		// started filling again — putting NULL packets back exactly where they
+		// were being removed from. The log said so: "no keyframe within 3s of
+		// the mark" printed one second before the mark arrived.
+		quietFor := time.Until(l.until.Add(keyframeQuiet))
+		if quietFor <= 0 {
+			quietFor = time.Millisecond
+		}
 		select {
 		case r := <-l.handoff:
 			return l.takeHandoff(p, r)
-		case <-time.After(keyframeQuiet):
+		case <-time.After(quietFor):
 			if !l.quietSaid.Swap(true) {
 				logger("[HOLD] %s no keyframe within %v of the mark; filling again so the DVR does not give up", l.label, keyframeQuiet)
 			}
