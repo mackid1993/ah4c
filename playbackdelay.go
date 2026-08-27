@@ -59,6 +59,10 @@ const (
 	// this encoder — so three seconds means the hunt has gone wrong, and a
 	// silent stream is worse than an unplayable one at that point.
 	keyframeQuiet = 3 * time.Second
+	// markWindow is how long the discontinuity marker keeps marking the first
+	// packet of each new programme PID after the hand-off. Long enough for the
+	// audio to arrive, short enough to touch nothing mid-programme.
+	markWindow = 2 * time.Second
 	// quietBeforeMark is how long before the mark the filler stops, so the
 	// seconds directly in front of the picture are not NULL packets. Measured
 	// against what is reported in front of the playhead: two to three seconds.
@@ -337,7 +341,7 @@ func (l *lateEncoder) drainEarly() {
 			src := maybeWrapCaptions(st, l.tuner, l.name)
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
-			body = markDiscontinuity(newGateReader(src, nil, true, l.until, nil))
+			body = markDiscontinuityFor(newGateReader(src, nil, true, l.until, nil), l.label)
 			// Empty the queue just before the gate arms. The gate takes the
 			// first keyframe after the delay is up, and a queue that is full at
 			// that moment means it takes one out of two megabytes of stored-up
@@ -908,6 +912,11 @@ func (e *egressDrift) watch(b []byte) {
 // firstDiscontinuity sets the discontinuity indicator on the first packet of
 // each PID that carries an adaptation field, then steps aside.
 type firstDiscontinuity struct {
+	label string
+	// first is when the first PID was marked; marking runs for markWindow
+	// after it so every stream in the programme gets its wall, not just the
+	// video that happens to be in the gate's first release.
+	first time.Time
 	io.ReadCloser
 	seen map[int]bool
 	done bool
@@ -917,12 +926,19 @@ func markDiscontinuity(src io.ReadCloser) io.ReadCloser {
 	return &firstDiscontinuity{ReadCloser: src, seen: map[int]bool{}}
 }
 
+// markDiscontinuityFor is markDiscontinuity with a label, so the wall it puts
+// up can be seen in the log against the tuner it belongs to.
+func markDiscontinuityFor(src io.ReadCloser, label string) io.ReadCloser {
+	return &firstDiscontinuity{ReadCloser: src, seen: map[int]bool{}, label: label}
+}
+
 func (f *firstDiscontinuity) Read(p []byte) (int, error) {
 	n, err := f.ReadCloser.Read(p)
 	if f.done || n <= 0 {
 		return n, err
 	}
 	marked := 0
+	var on []string
 	for i := 0; i+tsPacketSize <= n; i += tsPacketSize {
 		pkt := p[i : i+tsPacketSize]
 		if pkt[0] != 0x47 || pkt[3]>>4&2 == 0 || pkt[4] == 0 {
@@ -935,9 +951,38 @@ func (f *firstDiscontinuity) Read(p []byte) (int, error) {
 		f.seen[pid] = true
 		pkt[5] |= 0x80
 		marked++
+		on = append(on, fmt.Sprintf("0x%X", pid))
+	}
+	if marked > 0 && f.first.IsZero() {
+		f.first = time.Now()
+	}
+	// Do NOT stop at the first read. The gate's first release is tables and a
+	// keyframe — all video — so stopping there marked the video PID and
+	// nothing else, for ever: the log said "discontinuity marked on 0x64" and
+	// that was the whole wall. Audio arrives in the next read, by which point
+	// the marker had switched itself off, so the audio stream was never told
+	// its time base was new. A player handed video that says "flush and
+	// re-anchor" and audio that says nothing cannot reconcile the two, and
+	// will not carry the playhead across the boundary — which leaves packets
+	// in front of it that it cannot play and fast forward cannot land on.
+	//
+	// So keep marking the first packet of every programme PID until markWindow
+	// after the first one, which is long enough for every stream in the PMT to
+	// have shown up and short enough that nothing mid-programme is touched.
+	if !f.first.IsZero() && time.Since(f.first) > markWindow {
+		f.done = true
+		// This is the wall between the tuning filler and the programme, and it
+		// has never said whether it went up. A marker that silently fails to
+		// mark looks exactly like one that worked, and this hold has been
+		// caught by a silent instrument more than once tonight. The filler is
+		// PID 0x1FFF only, which no programme uses, so the two are already
+		// separate by PID; this is what tells the player the time base on the
+		// programme's own PIDs is new and it should not try to carry anything
+		// across.
 	}
 	if marked > 0 {
-		f.done = true
+		logger("[HOLD] %s discontinuity marked on %s — the wait is walled off from the programme",
+			f.label, strings.Join(on, ", "))
 	}
 	return n, err
 }
