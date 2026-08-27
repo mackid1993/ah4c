@@ -911,10 +911,11 @@ type clockSplice struct {
 	// out is the last timestamp written, in 90 kHz. delta is what is added to
 	// an input timestamp to get an output one, and in is the last input seen.
 	out, high, delta, in uint64
-	// psi is how far the tables' version has been stepped: one per source, so a
-	// demuxer re-reads them instead of trusting the copy it already has.
-	// pmtPID is learned from the PAT of whichever source is current.
-	psi           int
+	// psiVer is the version to declare on each table PID, and psiSeen is the
+	// content it was last declared for. pmtPID is learned from the PAT of
+	// whichever source is current.
+	psiVer        map[int]byte
+	psiSeen       map[int]uint32
 	pmtPID        int
 	started, said bool
 	// pend is rewritten and ready to go out; tail is what has been read but
@@ -1071,7 +1072,6 @@ func (c *clockSplice) newSource(ts uint64) {
 	}
 	c.delta = (ref + splicePickup - ts) & (ptsMod - 1)
 	c.in = ts
-	c.psi++
 	if !c.said {
 		c.said = true
 		logger("[HOLD] %s the program's clock was carried on from the pre-roll's rather than left as a jump", c.label)
@@ -1259,12 +1259,26 @@ func crcMPEG(b []byte) uint32 {
 	return crc
 }
 
-// bumpPSI steps the version of a PAT or PMT carried whole in one packet and
-// fixes its checksum. Sections that span packets are left alone: rewriting half
-// a section is worse than an unbumped version, and no encoder seen here splits
-// these.
+// bumpPSI gives a table a version that moves when, and only when, the table's
+// own contents move — then fixes the checksum to match.
+//
+// Content, not sources. The first attempt stepped one counter per source
+// change, and three sources need three versions where that counter managed
+// two: the pre-roll declared programme 1 version 0 on PIDs 256 and 257, the
+// black declared version 1 on PID 256, and the programme declared version 1 on
+// PIDs 100 and 101 — the same version as the black. A demuxer had already
+// cached version 1 and ignored the programme's table, so it went on demuxing
+// 256 for ever. That is the infinite pre-roll, and it was measured: four
+// distinct tables in one capture, two pairs sharing a version.
+//
+// Keyed off the content, miscounting cannot happen. A table that repeats keeps
+// its version, which is exactly what the field promises a demuxer; a table
+// that differs in any way at all gets the next one and is re-read.
+//
+// Sections spanning packets are left alone: rewriting half a section is worse
+// than an unstepped version, and nothing here splits them.
 func (c *clockSplice) bumpPSI(pkt []byte) {
-	if pkt[1]&0x40 == 0 { // no pointer field, so not a section start
+	if pkt[1]&0x40 == 0 {
 		return
 	}
 	pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
@@ -1275,23 +1289,35 @@ func (c *clockSplice) bumpPSI(pkt []byte) {
 	if off >= tsPacketSize {
 		return
 	}
-	off += 1 + int(pkt[off]) // step over the pointer field
+	off += 1 + int(pkt[off])
 	if off+8 > tsPacketSize {
 		return
 	}
 	sec := pkt[off:]
-	if sec[0] != 0x00 && sec[0] != 0x02 { // PAT or PMT only
-		return
-	}
-	if pid != 0 && sec[0] == 0x00 {
+	if sec[0] != 0x00 && sec[0] != 0x02 {
 		return
 	}
 	slen := int(sec[1]&0x0F)<<8 | int(sec[2])
 	end := 3 + slen
 	if slen < 9 || end > len(sec) {
-		return // spans packets, or nonsense
+		return
 	}
-	sec[5] = sec[5]&0xC0 | byte((int(sec[5]>>1&0x1F)+c.psi)&0x1F)<<1 | sec[5]&0x01
+	// What the table says, with the version taken out, so a repeat of the same
+	// table hashes the same however it has been stamped on the way past.
+	was := sec[5]
+	sec[5] = was & 0xC1
+	sum := crcMPEG(sec[:end-4])
+	sec[5] = was
+	if c.psiVer == nil {
+		c.psiVer, c.psiSeen = map[int]byte{}, map[int]uint32{}
+	}
+	if seen, ok := c.psiSeen[pid]; !ok {
+		c.psiSeen[pid], c.psiVer[pid] = sum, was>>1&0x1F
+	} else if seen != sum {
+		c.psiSeen[pid] = sum
+		c.psiVer[pid] = (c.psiVer[pid] + 1) & 0x1F
+	}
+	sec[5] = was&0xC0 | c.psiVer[pid]<<1 | was&0x01
 	crc := crcMPEG(sec[:end-4])
 	sec[end-4] = byte(crc >> 24)
 	sec[end-3] = byte(crc >> 16)
