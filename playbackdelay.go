@@ -25,31 +25,20 @@ var holdDelay time.Duration
 // holdMost is as long as a tune is held, whatever PLAYBACK_DELAY asks for.
 // Forty-five seconds is the longest hold watched land at the live edge; sixty
 // and ninety come in behind the guide and stay there. Why is not yet settled
-// — see holdRate — so this is lifted to ten minutes only to test longer holds,
+// — see serveNulls — so this is lifted to ten minutes only to test longer holds,
 // and is not a claim that they work. It is a guard against a typo, not a
 // measured limit. Put it back to forty-five if a real answer does not arrive.
 const holdMost = 10 * time.Minute
 
 const (
-	// The wait's byte diet: volume through the DVR's detection window, then
-	// a keepalive. Every byte here is one the DVR stores ahead of the show.
-	nullPace  = 100 * time.Millisecond
-	nullBurst = 2 * tsPacketSize
-	// Volume while the DVR decides the body is a stream, a keepalive after:
-	// a trickle from the first byte starves it, and it gives up.
-	nullDetect = 6 * time.Second
-	nullIdle   = 500 * time.Millisecond
-	// A DVR decides the body is a stream, and then keeps deciding. The
-	// keepalive after nullDetect is three kilobits a second, and a DVR will
-	// sit through about twenty seconds of that before concluding the stream
-	// has died — which is why a forty-five second hold worked and a sixty
-	// second one tuned again part way through. So the volume comes back for
-	// nullBeatFor every nullBeat, and the thin stretch never runs longer than
-	// four seconds however long the hold is. Four rather than eleven because
-	// twenty-one seconds is one measurement on one box, and a DVR with less
-	// patience than that one should hold too.
-	nullBeat    = 5 * time.Second
-	nullBeatFor = 1 * time.Second
+	// The wait's byte diet is gone — the filler goes out at detection's rate,
+	// which is a whole buffer per read gap. What the diet was guarding against
+	// is worth keeping in view: a DVR sits through about twenty seconds of a
+	// three kilobit trickle before concluding the stream has died, which is
+	// why a forty-five second hold worked and a sixty second one tuned again
+	// part way through. Serving whole buffers is further from that edge than
+	// the diet ever was, not closer, so the guard is met by having no diet.
+	//
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -255,16 +244,6 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 	return l
 }
 
-// dietFrom is when this tune's body opened, which is when the DVR starts
-// deciding whether it has a stream: after the stretch held on 1xx when that
-// is in play, and at the request itself when it is not.
-func (l *lateEncoder) dietFrom() time.Time {
-	if prerollTS == "" && hintsWork.Load() {
-		return l.t0.Add(hintCeiling)
-	}
-	return l.t0
-}
-
 func (l *lateEncoder) Read(p []byte) (int, error) {
 	l.mu.Lock()
 	body, closed := l.body, l.closed
@@ -430,18 +409,30 @@ func (l *lateEncoder) showPreroll(p []byte, d time.Duration) (int, error) {
 	}
 }
 
-// serveNulls sends NULL packets on the byte diet: volume through the DVR's
-// detection window, a keepalive after. Every byte here is one the DVR stores
-// ahead of the show.
+// serveNulls sends NULL packets the way playback detection sends them: whole
+// buffers, one per read gap, with no diet at all. Detection is the hold that
+// lands at the live edge, and its filler — holdReader.serveNulls in preroll.go
+// — fills the caller's buffer and returns. This hold metered instead: two
+// packets every hundred milliseconds through a six second window, then one
+// packet every half second, which is three kilobits into a socket the DVR is
+// waiting on, for over a minute of a ninety second hold.
+//
+// That diet was the last structural difference between the two holds, and the
+// only thing in what ah4c sends whose shape grew with the hold's length: the
+// count of thin stretches roughly tripled from forty-five seconds to ninety.
+// Everything after the hand-off is now measured live — the encoder hands over
+// at 0.0s ahead and the stream's pace holds the wall to within twenty
+// milliseconds for the whole watch — so what is left to explain the TV is what
+// the DVR was fed before the program started.
+//
+// Say what is assumed: that this is the difference is not proven, and the
+// mechanism is not known. What is known is that detection's shape works, that
+// this hold's shape is the one that does not, and that this is the difference.
 func (l *lateEncoder) serveNulls(p []byte, d time.Duration) (int, error) {
-	pace, burst := holdRate(time.Since(l.dietFrom()))
-	if d > pace || d <= 0 {
-		d = pace
+	if d <= 0 || d > stallReadGap {
+		d = stallReadGap
 	}
 	time.Sleep(d)
-	if len(p) > burst {
-		p = p[:burst]
-	}
 	n := nullPackets(p)
 	l.mu.Lock()
 	l.nulls += int64(n)
@@ -804,19 +795,9 @@ func holdOnHints(w http.ResponseWriter, src io.Reader, tuner, channel string) (*
 	return h, true
 }
 
-// holdRate is how fast filler goes out, given how long the DVR has had a body
-// to look at. Volume while it is deciding it has a stream, a keepalive after,
-// and volume again for a moment every nullBeat so it goes on deciding that.
-// Kept as its own function so the shape can be checked without a DVR.
-func holdRate(since time.Duration) (time.Duration, int) {
-	if since <= nullDetect {
-		return nullPace, nullBurst
-	}
-	if (since-nullDetect)%nullBeat < nullBeatFor {
-		return nullPace, nullBurst
-	}
-	return nullIdle, tsPacketSize
-}
+// holdRate, the wait's byte diet, lived here. It is gone: the filler now goes
+// out at playback detection's rate, which is no rate at all — see serveNulls.
+// `git show 841ff2f:playbackdelay.go` has it if the diet has to come back.
 
 // stallTolerant wraps the encoder in the stall reader whether or not
 // NULL_FRAME_INSERTION is switched on. A held tune is opened on a client that
