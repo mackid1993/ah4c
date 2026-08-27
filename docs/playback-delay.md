@@ -161,8 +161,8 @@ it predicts every result of this investigation:
   timestamps, so the player anchors and then follows video with video.
 - **A pre-roll never had this problem at all**, because a pre-roll is real video
   carrying real timestamps for the entire wait. It is doing the same job as the
-  seam black, continuously, which is why `blackStartup` skips itself when
-  `PREROLL_TS` is set.
+  seam black, continuously, which is why `blackStartup` used to skip itself
+  when a pre-roll was present — it no longer does; see the seam section.
 
 The effect of the half second is measured. That timestamps specifically are the
 mechanism is the best explanation available and it is the one that accounts for

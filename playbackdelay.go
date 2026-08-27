@@ -881,7 +881,7 @@ func (l *lateEncoder) emitNulls(p []byte, burst int) (int, error) {
 //
 // The same rule is in holdReader for playback detection. Both need it, because
 // a pre-roll routes around drainEarly entirely — which is how four separate
-// faults have already reached only the people setting PREROLL_TS.
+// faults have already reached only the people who have a pre-roll file.
 func (l *lateEncoder) finishFiller() {
 	k := (l.sent + int64(len(l.pend))) % tsPacketSize
 	if k == 0 {
@@ -1276,7 +1276,7 @@ var blackPool []byte
 // hands over exactly as it did before black existed.
 func blackStartup() {
 	// Made whatever fills the wait. It used to be skipped when a pre-roll was
-	// set, on the grounds that a pre-roll is already a picture — true, and
+	// present, on the grounds that a pre-roll is already a picture — true, and
 	// beside the point. The seam is still two sources meeting, and half a
 	// second of black between them is what made that meeting work on the
 	// NULL-packet path.
