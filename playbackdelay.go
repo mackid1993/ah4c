@@ -346,25 +346,32 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 		return 0, err
 	}
 	liveEdge(resp.Body, l.label)
-	armed := make(chan struct{})
-	close(armed)
 	// Captions wrap the encoder's stream, not the hold in front of it.
 	// Wrapping the hold hands the caption engine the pre-roll to work on and
 	// lets it rewrite the pre-roll's own video packets on the way past.
-	// Playback detection wraps it this way round, and its hand-off is clean.
-	body := maybeWrapCaptions(
-		newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil),
-		l.tuner, l.name)
-	// A NULL hold carries no PCR, so the jump to the program's clock is a real
-	// discontinuity the player must be told about or it reads it as corruption.
-	// A clock hold carried the encoder's PCR in real time all the way here, so
-	// the program continues that clock — there is no discontinuity, and marking
-	// one tells the player its clock jumped and makes it re-anchor, throwing
-	// away the very continuity the clock was there to give it.
-	if l.clock == nil || !l.clock.ready.Load() {
-		body = markDiscontinuity(body)
+	inner := l.stallTolerant(l.refreshing(resp.Body))
+	var body io.ReadCloser
+	if l.clock != nil && l.clock.ready.Load() {
+		// The clock ran the encoder's PCR through the whole wait, so the player
+		// is already synced and its clock must not stop now. Two things at a
+		// NULL hand-off would stop it, and both are skipped here:
+		//   - the discontinuity marker, which tells the player its clock jumped
+		//     and makes it re-anchor, throwing away the continuity the clock
+		//     gave it; there is no jump, so nothing to mark.
+		//   - the keyframe gate, which holds the whole stream back until the
+		//     encoder's next keyframe — up to a GOP, measured near 800ms — with
+		//     no PCR flowing, so the player's clock stalls exactly that long and
+		//     lands that far behind. The player is synced and decodes the next
+		//     keyframe on its own, so the stream is handed straight over.
+		body = maybeWrapCaptions(inner, l.tuner, l.name)
+		logger("[HOLD] %s hand-off continues the wait's clock; no gate, no discontinuity", l.label)
 	} else {
-		logger("[HOLD] %s hand-off continues the wait's clock; no discontinuity marked", l.label)
+		// A NULL hold carried no PCR, so the jump to the program's clock is a
+		// real discontinuity to declare, and the gate starts it on a keyframe.
+		armed := make(chan struct{})
+		close(armed)
+		body = markDiscontinuity(maybeWrapCaptions(
+			newGateReader(inner, armed, true, time.Now(), nil), l.tuner, l.name))
 	}
 	l.mu.Lock()
 	if l.closed {
