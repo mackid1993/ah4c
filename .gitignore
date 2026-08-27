@@ -11,3 +11,6 @@
 /zz_*_test.go
 /guard_test.go
 _todo/
+
+# Claude Code session scratch: worktrees and task state, never part of a change
+.claude/

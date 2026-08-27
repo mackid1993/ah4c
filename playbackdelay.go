@@ -3,8 +3,8 @@ package main
 // PLAYBACK_DELAY: hold a tune, handing the program over when the delay is up
 // so the DVR gets a session that starts when the viewer does. Everything the
 // feature is lives here: the hold itself, the 1xx window that fronts it, the
-// discontinuity marker that ends it, the black clip that opens the wait, the
-// cap on the DVR socket's send buffer, and the instrument that times the
+// discontinuity marker that ends it, the black frame that goes in at the seam,
+// the cap on the DVR socket's send buffer, and the instrument that times the
 // writes into it.
 
 import (
@@ -185,7 +185,7 @@ func tuneHoldStartup() {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
-		logger("[HOLD] hold %v; the encoder is reopened %s into the program", holdDelay, holdWords(refreshAfterHold(holdDelay)))
+		logger("[HOLD] hold %v; the wait is NULL packets and the picture follows a black frame", holdDelay)
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
 	case prerollTS != "":
@@ -486,7 +486,31 @@ func (l *lateEncoder) drainEarly() {
 	// Read until the gate releases. It returns nothing while it is discarding
 	// and while it hunts the keyframe, so a zero-byte read is not the end.
 	buf := make([]byte, 64*1024)
+	// Two ways out besides the hand-off, because a drain that outlives its
+	// tune does not merely waste work: it holds the encoder connection open,
+	// and an encoder will not hand the same stream to a second reader, so the
+	// next tune on that tuner cannot get video at all. That is a failed tune,
+	// which is the worst thing this program can do. Watched happening: a tuner
+	// with nothing playing threw away six thousand chunks and climbing while
+	// the DVR reported "streaming to the tuner failed".
+	//
+	// So the loop checks whether the tune has been closed, rather than relying
+	// only on Close reaching in and breaking the read — and it gives up on its
+	// own a bounded time past the mark, whatever else has gone wrong.
+	giveUp := l.until.Add(drainGiveUp)
 	for {
+		l.mu.Lock()
+		closed := l.closed
+		l.mu.Unlock()
+		if closed {
+			body.Close()
+			return
+		}
+		if time.Now().After(giveUp) {
+			logger("[HOLD] %s nothing took the hand-off within %v of the mark; letting the encoder go rather than holding it open", l.label, drainGiveUp)
+			body.Close()
+			return
+		}
 		n, err := body.Read(buf)
 		if n > 0 {
 			l.handoff <- &handoffResult{first: append([]byte(nil), buf[:n]...), body: body}
@@ -652,6 +676,12 @@ const (
 // frames before falling back to NULL packets. Long enough that a real-time
 // clip never loses the race — anything less threads NULLs between its frames —
 // and short enough that a clip that has actually died is covered.
+// drainGiveUp is how long past the mark a drain will wait for something to
+// take its hand-off before closing the encoder itself. The keyframe hunt is a
+// second or two, so this is far longer than any healthy tune needs; it exists
+// only so a drain can never run for ever holding a tuner's encoder.
+const drainGiveUp = 30 * time.Second
+
 const blackPatience = 2 * time.Second
 
 // primeFrom reads the draining encoder until it has tables and a keyframe and
