@@ -767,8 +767,16 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// second of black, or five, or the whole wait: one frame is all it takes,
 	// and one frame is all that lands in a recording.
 	first, stripped := stripNulls(r.first)
+	// Say it went out. The startup line only reports that a frame was made;
+	// whether one ever reached a seam has never been in the log, so the one
+	// thing this was built to do could not be confirmed from outside — "I
+	// didn't see any lines about it creating black frames". Once per tune.
 	if len(blackFrame) > 0 {
 		first = append(append([]byte(nil), blackFrame...), first...)
+		logger("[BLACK] %s one black frame, %s, went out at the seam, immediately in front of the picture",
+			l.label, byteCount(int64(len(blackFrame))))
+	} else {
+		logger("[BLACK] %s no black frame was made at startup, so the picture follows the wait directly", l.label)
 	}
 	if stripped > 0 {
 		logger("[HOLD] %s took %s of NULL packets out of the hand-off, so the picture is the first thing after the wait",
