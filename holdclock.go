@@ -128,7 +128,7 @@ func startHoldClock(url, label string, until time.Time) *holdClock {
 			d, ok := c.probe(url)
 			if ok {
 				c.ready.Store(true)
-				logger("[HOLD] %s running the encoder's program through the wait (PCR on PID 0x%X), so the player keeps its clock", label, c.pcrPID)
+				logger("[HOLD] %s running a streamless program through the wait (PCR on its own PID 0x%X, off the video), so the player keeps its clock without buffering the picture", label, clockPCRPID)
 				return
 			}
 			diag = d
@@ -200,10 +200,11 @@ func (c *holdClock) probe(url string) (string, bool) {
 			}
 		}
 		if pat != nil && pmt != nil && haveLatest {
-			// The wait runs a program with the encoder's number and PCR PID but
-			// no streams, so the player holds no A/V buffer; the encoder's real
-			// PMT takes over at the hand-off.
-			min := streamlessPMT(pmt, pcrPID)
+			// The wait runs a program with the encoder's number, its PCR on the
+			// wait's own PID (off the video PID), and no streams, so the player
+			// holds no A/V buffer and nothing lands on the video stream; the
+			// encoder's real PMT takes over at the hand-off.
+			min := streamlessPMT(pmt, clockPCRPID)
 			if min == nil {
 				min = pmt // fall back to the real PMT rather than run silent
 			}
@@ -241,46 +242,51 @@ func (c *holdClock) pcrNow() uint64 {
 	return c.base + uint64(time.Since(c.anchor).Nanoseconds())*27/1000
 }
 
-// clockPCREvery is how often the wait emits a PCR, in wall time. A real
-// encoder clocks PCR tightly — tens of milliseconds — and a decoder given the
-// spec-ceiling ~100ms cadence this used to run at widens its playout buffer by
-// a fixed amount to ride out the jitter, which is the fixed lag a clock hold
-// sat behind however long it ran. Twenty milliseconds is well inside what a
-// receiver expects and close to a real encoder's. serveHoldClock paces the
-// calls to this so one advancing PCR goes out every clockPCREvery.
-const clockPCREvery = 20 * time.Millisecond
+// clockPCRPID is the PID the wait's PCR rides on — its own, NOT the encoder's
+// video PID. The clock used to put PCR on the encoder's PCR PID, which is the
+// video PID, so the whole wait injected packets onto the video stream and the
+// real picture arrived buried behind them. On its own PID the video stream
+// stays empty until the encoder's picture takes over at the hand-off. It is
+// declared as the PCR PID in the wait's PMT and is well clear of an encoder's
+// usual PIDs.
+const clockPCRPID = 0x0100
 
-// serve fills p with the program: the tables at a PSI cadence, one PCR at the
-// current moment, NULL packets for the rest. Returns whole packets only.
+// clockPCREvery is how far apart the wait's PCRs are, in wall time. Every
+// packet the wait injects is one the player then sits behind, so this is as
+// sparse as keeps the receiver's clock locked — the spec ceiling — not the
+// tight cadence a real encoder can afford. serveHoldClock paces to it.
+const clockPCREvery = 100 * time.Millisecond
+
+// serve emits the wait's program as thinly as possible: the tables now and
+// then, and one PCR on its own PID. No NULL fill — every extra packet is a
+// packet the player ends up behind. Returns whole packets only.
 func (c *holdClock) serve(p []byte) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var out []byte
 	now := time.Now()
-	if now.Sub(c.lastPSI) >= 100*time.Millisecond {
+	if now.Sub(c.lastPSI) >= 400*time.Millisecond {
 		c.lastPSI = now
 		out = append(out, c.pat...)
 		out = append(out, c.pmt...)
 	}
 	out = append(out, c.pcrPacket()...)
-	for len(out)+tsPacketSize <= len(p) && len(out) < 6*tsPacketSize {
-		out = append(out, nullTSPacket[:]...)
-	}
 	if len(out) > len(p) {
 		out = out[:len(p)/tsPacketSize*tsPacketSize]
 	}
 	return copy(p, out)
 }
 
-// pcrPacket builds an adaptation-only packet on the PCR PID carrying pcrNow.
+// pcrPacket builds an adaptation-only packet on the wait's own PCR PID —
+// clockPCRPID, not the encoder's video PID — carrying pcrNow.
 func (c *holdClock) pcrPacket() []byte {
 	pcr := c.pcrNow()
 	base := pcr / 300
 	ext := pcr % 300
 	pkt := make([]byte, tsPacketSize)
 	pkt[0] = 0x47
-	pkt[1] = byte((c.pcrPID >> 8) & 0x1F)
-	pkt[2] = byte(c.pcrPID & 0xFF)
+	pkt[1] = byte((clockPCRPID >> 8) & 0x1F)
+	pkt[2] = byte(clockPCRPID & 0xFF)
 	// adaptation field only, no payload; CC does not advance on such packets.
 	pkt[3] = 0x20
 	pkt[4] = 183  // adaptation_field_length: the rest of the packet
@@ -297,15 +303,28 @@ func (c *holdClock) pcrPacket() []byte {
 	return pkt
 }
 
-// serveHoldClock paces the program filler and counts its bytes. It runs at
-// clockPCREvery, tighter than the NULL diet's nullPace, so the PCR track is a
-// real encoder's cadence rather than the spec ceiling. Returns io.EOF once the
-// tune is closed.
-func (l *lateEncoder) serveHoldClock(p []byte, d time.Duration) (int, error) {
-	if d > clockPCREvery || d <= 0 {
-		d = clockPCREvery
+// clockTrickle is how close to the hand-off the wait drops to a trickle, and
+// how sparse that trickle is. The packets emitted right before the real video
+// are the ones that sit next to it in the stream, so in the last few seconds
+// the clock all but stops — just enough PCR to hold the lock — so almost
+// nothing is between the filler and the picture when it arrives.
+const (
+	clockTrickleWithin = 4 * time.Second
+	clockTricklePace   = 500 * time.Millisecond
+)
+
+// serveHoldClock paces the wait's program and counts its bytes. untilHandoff is
+// how long until the real video takes over; as that nears zero the pace drops
+// to a trickle so the filler does not bleed into the feed. Returns io.EOF once
+// the tune is closed.
+func (l *lateEncoder) serveHoldClock(p []byte, untilHandoff time.Duration) (int, error) {
+	pace := clockPCREvery
+	if untilHandoff <= clockTrickleWithin {
+		// The last stretch before the hand-off, and the keyframe wait after it
+		// (untilHandoff <= 0), both trickle.
+		pace = clockTricklePace
 	}
-	time.Sleep(d)
+	time.Sleep(pace)
 	n := l.clock.serve(p)
 	l.mu.Lock()
 	l.nulls += int64(n)
