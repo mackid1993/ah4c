@@ -40,16 +40,77 @@ const holdClockMinDelay = 45 * time.Second
 
 // holdClock probes the encoder and then serves its program during the wait.
 type holdClock struct {
-	ready  atomic.Bool
-	dead   atomic.Bool
-	pat    []byte // one whole PAT packet, verbatim from the encoder
-	pmt    []byte // one whole PMT packet, verbatim from the encoder
+	ready atomic.Bool
+	dead  atomic.Bool
+	pat   []byte // one whole PAT packet, verbatim from the encoder
+	pmt   []byte // the wait's PMT: the encoder's program number and PCR PID,
+	// but NO video/audio streams declared, so the player keeps its clock
+	// without opening an A/V buffer it then waits a whole hold to fill. The
+	// encoder's real PMT (with the streams) takes over at the hand-off, where
+	// the picture is right there, and the player acquires it fresh like it does
+	// on a NULL hold. This is what makes forty-five work, kept while the clock
+	// removes the NULL hold's drift.
 	pcrPID int
 	base   uint64    // encoder PCR (27 MHz units) read at the probe
 	anchor time.Time // wall time the base was read
 
 	mu      sync.Mutex
 	lastPSI time.Time
+}
+
+// crc32Mpeg is the MPEG-2 systems CRC (poly 0x04C11DB7, init all ones, MSB
+// first, no final xor), used to close a PSI section built by hand.
+func crc32Mpeg(b []byte) uint32 {
+	crc := uint32(0xFFFFFFFF)
+	for _, x := range b {
+		crc ^= uint32(x) << 24
+		for i := 0; i < 8; i++ {
+			if crc&0x80000000 != 0 {
+				crc = (crc << 1) ^ 0x04C11DB7
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+}
+
+// streamlessPMT builds a PMT packet on realPMT's PID that names the same
+// program and PCR PID but declares no elementary streams, at a version one
+// behind the encoder's so its real PMT reads as newer at the hand-off.
+func streamlessPMT(realPMT []byte, pcrPID int) []byte {
+	sec := psiPayload(realPMT)
+	if len(sec) < 12 || sec[0] != 0x02 {
+		return nil
+	}
+	prog := binary.BigEndian.Uint16(sec[3:5])
+	ver := (sec[5] >> 1) & 0x1F
+	minVer := (ver + 31) & 0x1F // one behind, so the encoder's PMT is newer
+	// section: table_id..program_info_length, then CRC. section_length counts
+	// from program_number through the CRC = 2+3+2+2+4 = 13.
+	s := []byte{
+		0x02,
+		0xB0 | byte((13>>8)&0x0F), byte(13 & 0xFF),
+		byte(prog >> 8), byte(prog),
+		0xC0 | (minVer << 1) | 0x01,
+		0x00, 0x00,
+		0xE0 | byte((pcrPID>>8)&0x1F), byte(pcrPID),
+		0xF0, 0x00,
+	}
+	crc := crc32Mpeg(s)
+	s = append(s, byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc))
+	pmtPID := int(realPMT[1]&0x1F)<<8 | int(realPMT[2])
+	pkt := make([]byte, tsPacketSize)
+	pkt[0] = 0x47
+	pkt[1] = 0x40 | byte((pmtPID>>8)&0x1F) // payload_unit_start
+	pkt[2] = byte(pmtPID)
+	pkt[3] = 0x10 // payload only, CC 0
+	pkt[4] = 0x00 // pointer_field
+	copy(pkt[5:], s)
+	for i := 5 + len(s); i < tsPacketSize; i++ {
+		pkt[i] = 0xFF
+	}
+	return pkt
 }
 
 // startHoldClock probes url on a goroutine, retrying until the encoder's
@@ -139,7 +200,14 @@ func (c *holdClock) probe(url string) (string, bool) {
 			}
 		}
 		if pat != nil && pmt != nil && haveLatest {
-			c.pat, c.pmt, c.pcrPID = pat, pmt, pcrPID
+			// The wait runs a program with the encoder's number and PCR PID but
+			// no streams, so the player holds no A/V buffer; the encoder's real
+			// PMT takes over at the hand-off.
+			min := streamlessPMT(pmt, pcrPID)
+			if min == nil {
+				min = pmt // fall back to the real PMT rather than run silent
+			}
+			c.pat, c.pmt, c.pcrPID = pat, min, pcrPID
 			c.base, c.anchor = latest, time.Now()
 			return "", true
 		}
