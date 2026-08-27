@@ -706,11 +706,19 @@ func tuneEarlyWith(idx, channel string, tuneFn func(string, string, *earlyTune) 
 	// the pre-roll went out raw on its own PIDs during the scripts window and
 	// renumbered afterward — a PID change mid-pre-roll, which is the one thing
 	// the player will not follow, and it froze on the pre-roll before the
-	// program ever arrived. Wrapping the early reader here means the pre-roll
-	// is renumbered onto the output PIDs from its first packet, unbroken into
-	// the program. The NULL-packet wait carries no timestamps and no program
-	// table to reconcile, so it is left alone.
-	if prerollTS != "" {
+	// program ever arrived. Wrapping the early reader here means the filler is
+	// renumbered onto the output PIDs from its first packet, unbroken into the
+	// program.
+	//
+	// The NULL-packet wait needs it too, and its own regression proved it. The
+	// half second of black at the seam goes out on the filler's PIDs while the
+	// program arrives on the encoder's — two video PIDs, and the player locks
+	// onto the black's and never switches to the program, frozen on black. It
+	// went unseen only because the build before it could not make the black at
+	// all. So every hold is spliced: the black and the program are renumbered
+	// onto the one PID, and the NULL packets, which carry nothing, pass through
+	// untouched. Detection without a pre-roll never reaches here.
+	if prerollTS != "" || holdDelay > 0 {
 		return spliceClock(e, label), nil
 	}
 	return e, nil
