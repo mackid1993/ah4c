@@ -102,7 +102,7 @@ concluding the stream has died.
 | window | rate |
 |---|---|
 | first `nullDetect` (6s) | volume, so the DVR decides the body is a stream |
-| after that | one packet per `nullPace` (200ms) — about 7 kbit/s |
+| after that | one packet per `nullIdle` (500ms) — about 3 kbit/s |
 | every `nullBeat` (5s) | volume returns for `nullBeatFor` (1s) |
 
 **Measured:** a DVR sits through roughly twenty seconds of the thin trickle

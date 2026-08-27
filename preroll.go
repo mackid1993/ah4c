@@ -307,8 +307,14 @@ func startPreroll(label string) *prerollPlayer {
 	if prerollTS == "" {
 		return nil
 	}
+	// -muxdelay 0 -muxpreload 0 so the clip's PTS does not run ahead of its own
+	// PCR. ffmpeg's default mux delay put it 0.733s ahead, where the encoder
+	// that follows sends PTS equal to PCR, and the seam then has to open a gap
+	// the size of that lead to keep the program from landing under frames the
+	// pre-roll has already scheduled. With no lead the gap closes to a single
+	// frame, and the pre-roll can never again be the side with the longer one.
 	return startPlayer(label, "PREROLL", "-re", "-stream_loop", "-1", "-i", prerollTS,
-		"-c", "copy", "-f", "mpegts", "pipe:1")
+		"-c", "copy", "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", "pipe:1")
 }
 
 // startPlayer runs one ffmpeg writing MPEG-TS to a channel, or nil if it will
@@ -570,6 +576,12 @@ func (h *holdReader) Close() error {
 // nullPackets fills p with whole NULL packets, so filler always lands on a
 // packet boundary.
 func nullPackets(p []byte) int {
+	// A caller with less than a packet of room gets a part packet, and that is
+	// the least bad of the options. Returning nothing would be (0, nil) from
+	// every reader above this, which is the shape that has broken two callers
+	// here already and spun a third. Nothing reads this small — copyFlush uses
+	// thirty-two kilobytes — and if anything ever does, the fragment is one
+	// packet of damage where a spin is a dead tune.
 	if len(p) < tsPacketSize {
 		return copy(p, nullTSPacket[:])
 	}
@@ -999,7 +1011,13 @@ func (c *clockSplice) rewrite(b []byte) {
 	for i := 0; i+tsPacketSize <= len(b); i += tsPacketSize {
 		pkt := b[i : i+tsPacketSize]
 		if pkt[0] != 0x47 {
-			return // lost alignment; leave the rest untouched
+			// Skip the one packet, do not abandon the buffer. Giving up here
+			// left the rest of a thirty-two kilobyte read — about a hundred
+			// and seventy packets — carrying the encoder's raw timestamps,
+			// hours away from the clock either side of them. One torn packet
+			// is a frame; a hundred and seventy unmapped ones is the seam
+			// breaking all over again, in the middle of the program.
+			continue
 		}
 		pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
 		if pid == 0x1FFF {
@@ -1112,7 +1130,12 @@ func (c *clockSplice) mapPES(pkt []byte) {
 	if pkt[3]&0x20 != 0 {
 		off += 1 + int(pkt[4])
 	}
-	if off+13 > tsPacketSize {
+	// off+14, not off+13: es[9:14] needs fourteen bytes from off. At off 175
+	// the short slice is still legal Go — the packet's capacity runs past its
+	// length — so writeTS clobbered the next packet's sync byte instead of
+	// failing, measured as 0x97 and 0xf1 where 0x47 belonged. The DTS guard
+	// below has always used the right figure.
+	if off+14 > tsPacketSize {
 		return
 	}
 	es := pkt[off:]
