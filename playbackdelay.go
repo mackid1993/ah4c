@@ -54,6 +54,11 @@ const (
 	// emptied, so the gate hunts its keyframe through fresh bytes rather than
 	// through whatever has been stored up behind it.
 	flushBeforeArm = 300 * time.Millisecond
+	// keyframeQuiet is how long the wait stays silent past the mark while the
+	// gate hunts. A keyframe arrives within a GOP — measured at 0.1s to 2s on
+	// this encoder — so three seconds means the hunt has gone wrong, and a
+	// silent stream is worse than an unplayable one at that point.
+	keyframeQuiet = 3 * time.Second
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -234,6 +239,8 @@ type lateEncoder struct {
 	// drain is the gated chain drainEarly is reading, kept so Close can shut
 	// the encoder even when the hand-off has not happened yet.
 	drain io.ReadCloser
+	// quietSaid keeps the "no keyframe" note to once a tune.
+	quietSaid atomic.Bool
 
 	mu     sync.Mutex
 	body   io.ReadCloser
@@ -427,7 +434,32 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	// else is changed, because nothing else touched it. So wait for the
 	// release and the next burst of filler together, and let the release cut
 	// the wait short.
-	d, burst := l.nullPace(time.Until(l.until))
+	left := time.Until(l.until)
+	// Past the mark, the gate is hunting its keyframe — measured between a
+	// hundred milliseconds and two seconds — and filler sent during that hunt
+	// lands in the recording immediately in front of the program. NULL packets
+	// carry no frames, so a viewer cannot play or seek through them: the
+	// playhead stops at the last picture and the DVR's live edge sits at the
+	// end of the NULLs, which is what "two or three seconds ahead of me that I
+	// cannot fast forward" is made of. So once the mark has passed, nothing
+	// more is sent. The DVR waits in silence for the length of a keyframe hunt
+	// instead of being handed something it will keep and cannot show.
+	//
+	// Bounded, because silence is not free either: after keyframeQuiet the
+	// filler comes back rather than let a DVR conclude the stream has died.
+	// That is a hunt gone wrong, and the log says so.
+	if left <= 0 {
+		select {
+		case r := <-l.handoff:
+			return l.takeHandoff(p, r)
+		case <-time.After(keyframeQuiet):
+			if !l.quietSaid.Swap(true) {
+				logger("[HOLD] %s no keyframe within %v of the mark; filling again so the DVR does not give up", l.label, keyframeQuiet)
+			}
+			return l.emitNulls(p, nullBurst)
+		}
+	}
+	d, burst := l.nullPace(left)
 	wait := time.NewTimer(d)
 	select {
 	case r := <-l.handoff:

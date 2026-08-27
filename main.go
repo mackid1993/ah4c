@@ -1687,8 +1687,12 @@ type stallTolerantReader struct {
 	// place lag lives. lastDropLog is only touched by the producer.
 	// rest is what would not fit in the last caller's buffer, handed over on
 	// the next Read. Only the reading goroutine touches it.
-	rest        []byte
-	dropped     atomic.Int64
+	rest    []byte
+	dropped atomic.Int64
+	// filled counts NULL bytes put into a live program to cover an encoder
+	// stall. lastFillLog is only touched by the reading goroutine.
+	filled      atomic.Int64
+	lastFillLog time.Time
 	lastDropLog time.Time
 	// depthHigh is the deepest the queue has stood since queueGauge last read
 	// it. The queue is the one place inside ah4c that can hold whole seconds
@@ -1711,7 +1715,9 @@ const (
 	reconnectLogEvery   = 10 * time.Second
 	// dropLogEvery is how often a full queue is mentioned. It is a real
 	// symptom — the DVR is not keeping up — so it is said, but not per chunk.
-	dropLogEvery         = 10 * time.Second
+	dropLogEvery = 10 * time.Second
+	// fillLogEvery is how often NULL fill into a live program is mentioned.
+	fillLogEvery         = 10 * time.Second
 	preFirstChunkBudget  = 15 * time.Second // fail over fast on a dead tuner
 	postFirstChunkBudget = 3 * time.Minute  // ride through mid-stream glitches
 	chunkSize            = 32 * 1024
@@ -1897,12 +1903,37 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		}
 		return n, nil
 	case <-stall:
+		// This puts NULL packets into a live program. It exists so a stalled
+		// encoder does not show the DVR a zero-byte gap, and that is worth
+		// having — but the cost has never been said out loud, and it is the
+		// cost that matters here: NULLs carry no frames, so whatever is filled
+		// this way is stream the viewer cannot play or seek through. It sits
+		// between the playhead and the DVR's live edge and does not move.
+		//
+		// So it counts and it speaks. If a tune shows seconds of this, the
+		// encoder is stalling and the filler is turning those stalls into
+		// unplayable time in the recording.
 		if len(p) < 188 {
+			s.filled.Add(188)
+			s.sayFilled()
 			return copy(p, nullTSPacket[:]), nil
 		}
 		n := min(len(p)/188*188, len(nullFill))
+		s.filled.Add(int64(n))
+		s.sayFilled()
 		return copy(p, nullFill[:n]), nil
 	}
+}
+
+// sayFilled reports NULL fill put into a live program, at most once every
+// fillLogEvery. Called only from Read, so lastFillLog needs no lock.
+func (s *stallTolerantReader) sayFilled() {
+	if time.Since(s.lastFillLog) < fillLogEvery {
+		return
+	}
+	s.lastFillLog = time.Now()
+	logger("[%s] the encoder went quiet; %s of NULL packets have gone into the live program this tune, which is stream the viewer cannot play through",
+		s.label, byteCount(s.filled.Load()))
 }
 
 // noteDepth records how deep the queue stands after a send. Only the producer
