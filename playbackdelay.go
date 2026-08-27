@@ -31,6 +31,17 @@ var holdDelay time.Duration
 const holdMost = 10 * time.Minute
 
 const (
+	// nullFeedGap is how often a whole buffer of filler goes out. Detection
+	// serves one per stallReadGap because it is waiting on a pre-roll channel,
+	// not because half a second is the right rate; nothing measured says it is.
+	// Feeding the wait rather than rationing it is what moved the picture, so
+	// this goes further in the direction that moved it: a full 65.8 KB buffer
+	// every hundred milliseconds is about five megabits, the rate a real
+	// program would arrive at, instead of the half megabit detection happens
+	// to send. It is bounded on purpose — with no gap at all the filler would
+	// go out as fast as the DVR would read it, which is a recording of nothing
+	// growing at line rate.
+	nullFeedGap = 100 * time.Millisecond
 	// The wait's byte diet is gone — the filler goes out at detection's rate,
 	// which is a whole buffer per read gap. What the diet was guarding against
 	// is worth keeping in view: a DVR sits through about twenty seconds of a
@@ -429,8 +440,8 @@ func (l *lateEncoder) showPreroll(p []byte, d time.Duration) (int, error) {
 // mechanism is not known. What is known is that detection's shape works, that
 // this hold's shape is the one that does not, and that this is the difference.
 func (l *lateEncoder) serveNulls(p []byte, d time.Duration) (int, error) {
-	if d <= 0 || d > stallReadGap {
-		d = stallReadGap
+	if d <= 0 || d > nullFeedGap {
+		d = nullFeedGap
 	}
 	time.Sleep(d)
 	n := nullPackets(p)
