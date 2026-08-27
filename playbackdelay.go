@@ -66,12 +66,17 @@ const (
 	// quietBeforeMark is how long before the mark the filler stops, so the
 	// seconds directly in front of the picture are not NULL packets. Measured
 	// against what is reported in front of the playhead: two to three seconds.
-	quietBeforeMark = 4 * time.Second
-	// nullKeepEvery is how often a single NULL packet goes out once the DVR
-	// has accepted the stream. It is the least that keeps a DVR from deciding
-	// the stream has died, and everything above it is padding in front of the
-	// picture.
-	nullKeepEvery = 10 * time.Second
+	// quietBeforeMark drains the filler out of the pipe before the programme
+	// goes in behind it. NULL packets already written are still in flight in
+	// the socket when the video follows them, so they arrive ahead of the
+	// picture — which is what "it is ahead of the playhead, it goes in before
+	// the video data does" means. Stopping briefly lets them clear.
+	//
+	// One second, not four: the send buffer is capped at 256 KB and drains in
+	// about a third of a second at this bitrate, and this DVR needs constant
+	// data — a sparse keepalive timed a tune out. Short enough to be nothing
+	// like that starvation, long enough to empty the pipe.
+	quietBeforeMark = time.Second
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -252,6 +257,10 @@ type lateEncoder struct {
 	// drain is the gated chain drainEarly is reading, kept so Close can shut
 	// the encoder even when the hand-off has not happened yet.
 	drain io.ReadCloser
+	// gate is the drained gate, kept so the wait can send the encoder's own
+	// tables with its filler. lastTables is when they last went out.
+	gate       *gateReader
+	lastTables time.Time
 	// quietSaid keeps the "no keyframe" note to once a tune.
 	quietSaid atomic.Bool
 
@@ -404,7 +413,11 @@ func (l *lateEncoder) drainEarly() {
 			// actually mark, on the one path that was working because it was
 			// inert" as one of four fixes that were coherent and wrong; this
 			// is that marker.
-			body = newGateReader(src, nil, true, l.until, nil)
+			g := newGateReader(src, nil, true, l.until, nil)
+			l.mu.Lock()
+			l.gate = g
+			l.mu.Unlock()
+			body = g
 			// Empty the queue just before the gate arms. The gate takes the
 			// first keyframe after the delay is up, and a queue that is full at
 			// that moment means it takes one out of two megabytes of stored-up
@@ -747,17 +760,15 @@ func (l *lateEncoder) serveNulls(p []byte, d time.Duration) (int, error) {
 // wait on the diet's clock and on that other thing at once.
 func (l *lateEncoder) nullPace(d time.Duration) (time.Duration, int) {
 	pace, burst := holdRate(time.Since(l.dietFrom()))
-	// Past the window where the DVR is deciding it has a stream, send the
-	// least that keeps it from giving up and nothing more. Every NULL packet
-	// sent during the wait is padding in front of the picture that no player
-	// can cross — cutting the filler already made that visibly smaller — and
-	// after the detection window their only job is to prove the stream is
-	// alive. One small burst every nullKeepEvery does that, well inside the
-	// twenty seconds of quiet a DVR is known to sit through, and sends a
-	// fraction of what a continuous trickle does.
-	if since := time.Since(l.dietFrom()); since > nullDetect {
-		pace, burst = nullKeepEvery, tsPacketSize
-	}
+	// A sparse keepalive was tried here — one packet every ten seconds after
+	// the detection window — on the theory that fewer NULL packets means less
+	// padding in front of the picture. The tune timed out. The DVR does not
+	// sit through that, whatever the twenty second figure in the notes says,
+	// and a failed tune is the worst thing this program can do. The diet is
+	// what holdRate says it is.
+	//
+	// This had been tried before, and had failed before. Leaving the finding
+	// here so it is not tried a third time.
 	if d > pace || d <= 0 {
 		d = pace
 	}
@@ -765,7 +776,41 @@ func (l *lateEncoder) nullPace(d time.Duration) (time.Duration, int) {
 }
 
 // emitNulls writes one burst of filler into p and counts what it sent.
+// tablesFor returns the encoder's real PAT and PMT to send with the filler, at
+// most once a second. Without them the wait is bytes the DVR cannot identify,
+// so it keeps the whole stretch as stream; with them the NULL packets are
+// padding inside a declared programme, which is what padding is for.
+func (l *lateEncoder) tablesFor() []byte {
+	l.mu.Lock()
+	g := l.gate
+	last := l.lastTables
+	l.mu.Unlock()
+	if g == nil || time.Since(last) < time.Second {
+		return nil
+	}
+	tb := g.realTables()
+	if len(tb) == 0 {
+		return nil
+	}
+	l.mu.Lock()
+	l.lastTables = time.Now()
+	l.mu.Unlock()
+	return tb
+}
+
 func (l *lateEncoder) emitNulls(p []byte, burst int) (int, error) {
+	if tb := l.tablesFor(); len(tb) > 0 && len(p) >= len(tb)+tsPacketSize {
+		n := copy(p, tb)
+		n += nullPackets(p[n:min(len(p), n+burst)])
+		l.mu.Lock()
+		l.nulls += int64(n)
+		closed := l.closed
+		l.mu.Unlock()
+		if closed {
+			return 0, io.EOF
+		}
+		return n, nil
+	}
 	if len(p) > burst {
 		p = p[:burst]
 	}

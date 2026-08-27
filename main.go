@@ -2008,6 +2008,9 @@ const (
 )
 
 type gateReader struct {
+	// tables holds the encoder's real PAT and PMT once seen, for the hold in
+	// front of the gate to send with its filler.
+	tables   atomic.Value
 	src      io.ReadCloser
 	ready    <-chan struct{}
 	open     bool
@@ -2059,6 +2062,30 @@ func newGateReader(src io.ReadCloser, ready <-chan struct{}, timed bool, target 
 		g.sess0 = g.sessSeen
 	}
 	return g
+}
+
+// publishTables snapshots the encoder's real PAT and PMT the moment the gate
+// has both, so the hold in front of it can send them with its filler. They are
+// the encoder's own tables, read off the connection that is draining — not
+// tables invented here, which is the thing that failed before: invented tables
+// name PIDs nothing will ever send on, and a DVR locks onto them and waits for
+// ever. These name exactly what is about to arrive.
+func (g *gateReader) publishTables() {
+	if len(g.pat) == 0 || len(g.pmt) == 0 {
+		return
+	}
+	b := make([]byte, 0, len(g.pat)+len(g.pmt))
+	b = append(b, g.pat...)
+	b = append(b, g.pmt...)
+	g.tables.Store(&b)
+}
+
+// realTables is the encoder's PAT and PMT, or nil until the gate has seen both.
+func (g *gateReader) realTables() []byte {
+	if v, ok := g.tables.Load().(*[]byte); ok && v != nil {
+		return *v
+	}
+	return nil
 }
 
 func (g *gateReader) resync() {
@@ -2183,12 +2210,14 @@ func (g *gateReader) scan(b []byte) int {
 		if pid == 0 {
 			if sec := gatePSI(pkt, pusi, afc); len(sec) > 0 && sec[0] == 0x00 {
 				g.pat = append(g.pat[:0], pkt...)
+				g.publishTables()
 			}
 			i += 188
 			continue
 		}
 		if sec := gatePSI(pkt, pusi, afc); len(sec) > 0 && sec[0] == 0x02 {
 			g.pmt = append(g.pmt[:0], pkt...)
+			g.publishTables()
 			if v := videoPIDs(sec); len(v) > 0 {
 				g.vid = v
 			}
