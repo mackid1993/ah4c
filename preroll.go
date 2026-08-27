@@ -718,7 +718,7 @@ func tuneEarlyWith(idx, channel string, tuneFn func(string, string, *earlyTune) 
 	// all. So every hold is spliced: the black and the program are renumbered
 	// onto the one PID, and the NULL packets, which carry nothing, pass through
 	// untouched. Detection without a pre-roll never reaches here.
-	if prerollTS != "" || holdDelay > 0 {
+	if prerollTS != "" {
 		return spliceClock(e, label), nil
 	}
 	return e, nil

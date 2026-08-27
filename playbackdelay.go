@@ -139,7 +139,10 @@ func tuneHoldStartup() {
 		}
 	}
 	prerollStartup()
-	blackStartup()
+	// No black is built or served any more. The encoder drains from tune start
+	// and the gate hands off a live keyframe, so the program itself lands the
+	// DVR's playhead at the live edge; black in front of it only pushed the
+	// playhead behind. blackStartup and serveBlack are left dead for now.
 	// No subtraction from the delay. The black runway is the last stretch of
 	// the wait, not time added after it, so the program still starts at exactly
 	// PLAYBACK_DELAY: the wait is (delay - runway) of NULL packets and then the
@@ -153,12 +156,7 @@ func tuneHoldStartup() {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
-		nullFor := holdDelay - blackRunway
-		if nullFor < 0 {
-			nullFor = 0
-		}
-		logger("[HOLD] holding %s: %s of NULL packets, then %s of black to establish the clock, then the picture",
-			holdWords(holdAsked), holdWords(nullFor), holdWords(blackRunway))
+		logger("[HOLD] holding %s: NULL packets, then the program at the encoder's live edge", holdWords(holdAsked))
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
 	case prerollTS != "":
@@ -612,19 +610,36 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	// died — the diet's own keepalive leaves it in a three kilobit trickle for
 	// four seconds at a time — so a few seconds of nothing at the very end,
 	// with a program arriving at the end of it, is well inside what it takes.
-	if left <= blackRunway && len(blackPool) > 0 {
-		// Real black, streamed at real time, for the last blackRunway of the
-		// wait and on through the keyframe hunt until the hand-off arrives.
-		// This is the clock: NULL packets carry none, and the black's own
-		// advancing timestamps give the player a live-edge time base before
-		// the program. The select also watches the hand-off, so the program
-		// still cuts in the instant the gate has its keyframe.
+	if left <= quietBeforeMark {
+		// The wait goes quiet just before the mark and stays quiet through the
+		// keyframe hunt, so the program is the first thing in front of the
+		// picture. No black, no runway: the encoder has been draining since the
+		// tune, so the gate hands off a LIVE keyframe with the encoder's own
+		// live timestamps, and the DVR's playhead lands at the live edge on
+		// that keyframe. Anything put in front of it — NULL packets, or the
+		// seconds of black a runway added — is playable-or-not content the
+		// playhead starts behind, which is exactly how the picture ended up
+		// behind the guide. Measured from the MARK, not from entering the
+		// quiet, so the timer does not expire early and start filling again.
+		quietFor := time.Until(l.until.Add(keyframeQuiet))
+		if quietFor <= 0 {
+			quietFor = time.Millisecond
+		}
 		select {
 		case r := <-l.handoff:
 			return l.takeHandoff(p, r)
-		case <-time.After(blackTick):
+		case <-time.After(quietFor):
+			if !l.quietSaid.Swap(true) {
+				logger("[HOLD] %s no keyframe within %v of the mark; filling again so the DVR does not give up", l.label, keyframeQuiet)
+			}
+			d, burst := l.nullPace(left)
+			select {
+			case r := <-l.handoff:
+				return l.takeHandoff(p, r)
+			case <-time.After(d):
+			}
+			return l.emitNulls(p, burst)
 		}
-		return l.serveBlack(p)
 	}
 	d, burst := l.nullPace(left)
 	// No lock held across this select. There was one — a leftover from the
