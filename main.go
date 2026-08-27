@@ -1785,19 +1785,33 @@ func (s *stallTolerantReader) producer() {
 				// is the encoder reopen's trick — discard what is stored ahead
 				// of the show — made continuous and cheap instead of once and
 				// by force.
-				select {
-				case <-s.chunks:
-					s.dropped.Add(1)
-				default:
+				// The whole queue is the lag, not the newest chunk in it.
+				// Freeing one slot and filling it again leaves the queue full
+				// and the viewer exactly as far behind as they were — which
+				// is what a first attempt at this did, and the log said so:
+				// "dropped 1 chunk(s)", over and over, with the other
+				// sixty-three still sitting there. So empty it: everything
+				// waiting is old, and the newest chunk goes in alone.
+				gone := 0
+			drain:
+				for {
+					select {
+					case <-s.chunks:
+						gone++
+					default:
+						break drain
+					}
 				}
+				s.dropped.Add(int64(gone))
 				select {
 				case s.chunks <- data:
 				case <-s.closed:
 					return
 				}
-				if n := s.dropped.Load(); time.Since(s.lastDropLog) > dropLogEvery {
+				if time.Since(s.lastDropLog) > dropLogEvery {
 					s.lastDropLog = time.Now()
-					logger("[%s] the DVR is reading slower than the encoder sends; dropped %d chunk(s) to stay at the live edge", s.label, n)
+					logger("[%s] the DVR is reading slower than the encoder sends; threw away %s of stored-up stream to get back to the live edge (%d chunks in all this tune)",
+						s.label, byteCount(int64(gone)*chunkSize), s.dropped.Load())
 				}
 			}
 			if err == nil {
