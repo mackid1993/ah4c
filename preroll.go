@@ -914,10 +914,16 @@ type clockSplice struct {
 	// psiVer is the version to declare on each table PID, and psiSeen is the
 	// content it was last declared for. pmtPID is learned from the PAT of
 	// whichever source is current.
-	psiVer        map[int]byte
-	psiSeen       map[int]uint32
-	pmtPID        int
-	started, said bool
+	psiVer  map[int]byte
+	psiSeen map[int]uint32
+	pmtPID  int
+	// srcVideo and srcAudio are the current source's elementary PIDs, learned
+	// from its own table. Everything is renumbered onto the fixed PIDs below,
+	// and cc is the continuity counter for each of those, so the streams the
+	// player sees never stop or restart.
+	srcVideo, srcAudio int
+	cc                 map[int]byte
+	started, said      bool
 	// pend is rewritten and ready to go out; tail is what has been read but
 	// does not yet make a whole packet. synced is whether the packet boundary
 	// has been found, and err is kept until pend has drained.
@@ -1036,14 +1042,25 @@ func (c *clockSplice) rewrite(b []byte) {
 		if pid == 0x1FFF {
 			continue // NULL packets carry nothing to map
 		}
-		if pid == 0 {
+		switch {
+		case pid == 0:
 			c.notePMTPID(pkt)
+			c.patchPAT(pkt)
 			c.bumpPSI(pkt)
+			c.stamp(pkt, 0)
 			continue
-		}
-		if pid == c.pmtPID {
+		case pid == c.pmtPID:
+			c.patchPMT(pkt)
 			c.bumpPSI(pkt)
+			c.setPID(pkt, outPMTPID)
+			c.stamp(pkt, outPMTPID)
 			continue
+		case c.srcVideo > 0 && pid == c.srcVideo:
+			c.setPID(pkt, outVideoPID)
+			c.stamp(pkt, outVideoPID)
+		case c.srcAudio > 0 && pid == c.srcAudio:
+			c.setPID(pkt, outAudioPID)
+			c.stamp(pkt, outAudioPID)
 		}
 		c.mapPCR(pkt)
 		c.mapPES(pkt)
@@ -1347,4 +1364,133 @@ func (c *clockSplice) notePMTPID(pkt []byte) {
 	if pid := int(sec[10]&0x1F)<<8 | int(sec[11]); pid > 0 && pid < 0x1FFF {
 		c.pmtPID = pid
 	}
+}
+
+// --- One program, whatever is feeding it ---
+//
+// The pre-roll, the black and the encoder each arrive as their own program on
+// their own PIDs: ffmpeg numbers video 0x100 and audio 0x101, and the encoder
+// here uses 100 and 101. Versioning the tables so a demuxer re-reads them is
+// not enough, because a player picks its video track when the stream opens and
+// does not necessarily change its mind when the table does. What that looks
+// like is the last thing reported: the program decoding away while the
+// pre-roll's final frame sits on the screen, because the track the player
+// chose is the pre-roll's and it has simply stopped.
+//
+// So nothing downstream is ever told the streams changed. Every source is
+// renumbered onto one set of PIDs, its table is rewritten to declare them, and
+// the continuity counters are regenerated so each PID runs unbroken from the
+// first byte to the last. The player sees one program that never stops.
+//
+// These are ffmpeg's own numbers, so the pre-roll and the black pass through
+// untouched and only the encoder is renumbered.
+const (
+	outVideoPID = 0x100
+	outAudioPID = 0x101
+	outPMTPID   = 0x1000
+)
+
+func (c *clockSplice) setPID(pkt []byte, pid int) {
+	pkt[1] = pkt[1]&0xE0 | byte(pid>>8)&0x1F
+	pkt[2] = byte(pid & 0xFF)
+}
+
+// stamp regenerates the continuity counter for a PID this program is
+// synthesising. Two sources merged onto one PID each bring their own counter,
+// and the jump where they meet is a discontinuity to every demuxer that reads
+// it. Only packets carrying payload advance it, which is what the standard
+// says and what the frozen table counter got wrong.
+func (c *clockSplice) stamp(pkt []byte, pid int) {
+	if c.cc == nil {
+		c.cc = map[int]byte{}
+	}
+	if pkt[3]&0x10 == 0 { // no payload, counter stands still
+		pkt[3] = pkt[3]&0xF0 | c.cc[pid]
+		return
+	}
+	c.cc[pid] = (c.cc[pid] + 1) & 0x0F
+	pkt[3] = pkt[3]&0xF0 | c.cc[pid]
+}
+
+// psiBody finds the section inside a PSI packet, or nil when it is not one or
+// does not fit whole.
+func psiBody(pkt []byte) []byte {
+	if pkt[1]&0x40 == 0 {
+		return nil
+	}
+	off := 4
+	if pkt[3]&0x20 != 0 {
+		off += 1 + int(pkt[4])
+	}
+	if off >= tsPacketSize {
+		return nil
+	}
+	off += 1 + int(pkt[off])
+	if off+8 > tsPacketSize {
+		return nil
+	}
+	sec := pkt[off:]
+	slen := int(sec[1]&0x0F)<<8 | int(sec[2])
+	if slen < 9 || 3+slen > len(sec) {
+		return nil
+	}
+	return sec
+}
+
+// patchPAT points the single program at the fixed table PID.
+func (c *clockSplice) patchPAT(pkt []byte) {
+	sec := psiBody(pkt)
+	if sec == nil || sec[0] != 0x00 {
+		return
+	}
+	sec[10] = sec[10]&0xE0 | byte(outPMTPID>>8)&0x1F
+	sec[11] = byte(outPMTPID & 0xFF)
+}
+
+// patchPMT learns the source's elementary PIDs and rewrites the table to
+// declare the fixed ones instead.
+func (c *clockSplice) patchPMT(pkt []byte) {
+	sec := psiBody(pkt)
+	if sec == nil || sec[0] != 0x02 {
+		return
+	}
+	slen := int(sec[1]&0x0F)<<8 | int(sec[2])
+	end := 3 + slen - 4
+	il := int(sec[10]&0x0F)<<8 | int(sec[11])
+	i := 12 + il
+	if i > end {
+		return
+	}
+	video, audio := 0, 0
+	for i+4 < end {
+		st := sec[i]
+		pid := int(sec[i+1]&0x1F)<<8 | int(sec[i+2])
+		esil := int(sec[i+3]&0x0F)<<8 | int(sec[i+4])
+		if i+5+esil > end {
+			return
+		}
+		var to int
+		switch st {
+		case 0x01, 0x02, 0x1B, 0x24: // MPEG-2, H.264, HEVC
+			if video == 0 {
+				video, to = pid, outVideoPID
+			}
+		case 0x03, 0x04, 0x0F, 0x11, 0x81, 0x87: // MPEG audio, AAC, AC-3
+			if audio == 0 {
+				audio, to = pid, outAudioPID
+			}
+		}
+		if to != 0 {
+			sec[i+1] = sec[i+1]&0xE0 | byte(to>>8)&0x1F
+			sec[i+2] = byte(to & 0xFF)
+		}
+		i += 5 + esil
+	}
+	if video == 0 {
+		return // nothing recognisable; leave this source alone
+	}
+	c.srcVideo, c.srcAudio = video, audio
+	// The clock rides the video PID on every encoder seen here.
+	sec[8] = sec[8]&0xE0 | byte(outVideoPID>>8)&0x1F
+	sec[9] = byte(outVideoPID & 0xFF)
 }
