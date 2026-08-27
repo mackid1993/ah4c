@@ -348,7 +348,20 @@ func (l *lateEncoder) drainEarly() {
 			err = fmt.Errorf("status %s", resp.Status)
 		}
 		if err == nil {
-			l.refresh = l.refreshing(resp.Body)
+			// No reopen on this path. The break exists to make the DVR discard
+			// what it has stored ahead (rule 11), and it earned that when a
+			// two megabyte queue and an autotuned kernel buffer were holding
+			// seconds of stale stream. Those are bounded now.
+			//
+			// What is left behaves like a player-side start-up buffer: it
+			// grows for the first few seconds after the hand-off and then
+			// holds, which is a player taking a few seconds of stream before
+			// it begins and then playing at 1x for ever after. A break does
+			// not shed that — it makes the player do it again. Which is why no
+			// break timing ever worked: twenty seconds, thirty, forty, or four
+			// of them. Playback detection, the hold that works, never breaks
+			// the connection at all.
+			l.refresh = nil
 			// Captions wrap the encoder itself, inside the gate, rather than
 			// the gate's output. Outside it they see their first frame at the
 			// hand-off, and the log shows what that costs: Vulkan enumerated,
@@ -362,7 +375,7 @@ func (l *lateEncoder) drainEarly() {
 			// nothing is watching, and is already running at the hand-off.
 			// The wait's own filler is never handed to them — this is the
 			// encoder's stream, not the NULL packets in front of it.
-			st := l.stallTolerant(l.refresh)
+			st := l.stallTolerant(resp.Body)
 			l.mu.Lock()
 			l.stall = st
 			l.mu.Unlock()
