@@ -214,11 +214,23 @@ type lateEncoder struct {
 	// clock keeps a program and PCR alive through a long wait, so the player
 	// does not re-acquire at the hand-off. nil for short waits and pre-rolls.
 	clock *holdClock
+	// opening and handoff drive the clock hand-off: the encoder is opened and
+	// gated to a keyframe on a goroutine while the clock keeps emitting PCR, so
+	// the keyframe wait does not stall the player's clock.
+	opening atomic.Bool
+	handoff chan *handoffResult
 
 	mu     sync.Mutex
 	body   io.ReadCloser
 	closed bool
 	nulls  int64
+}
+
+// handoffResult is the gated encoder, primed past its keyframe wait: first is
+// the bytes the gate released (tables and the keyframe), body the rest.
+type handoffResult struct {
+	first []byte
+	body  io.ReadCloser
 }
 
 // newLateEncoder holds from t0 until the delay is up, then opens url. early is
@@ -273,7 +285,83 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 		}
 		return l.serveNulls(p, d)
 	}
+	if l.clock != nil && l.clock.ready.Load() {
+		return l.clockHandoff(p)
+	}
 	return l.open(p)
+}
+
+// clockHandoff opens and gates the encoder on a goroutine, and keeps the wait's
+// clock running until it is ready, so the keyframe wait bridges on PCR rather
+// than stalling the player's clock. The gate still starts the program on a
+// keyframe, so the picture is clean; the clock is continuous, so there is no
+// discontinuity to mark.
+func (l *lateEncoder) clockHandoff(p []byte) (int, error) {
+	if l.opening.CompareAndSwap(false, true) {
+		l.handoff = make(chan *handoffResult, 1)
+		go l.prepareHandoff()
+	}
+	select {
+	case r := <-l.handoff:
+		if r == nil || r.body == nil {
+			return 0, io.EOF
+		}
+		l.mu.Lock()
+		if l.closed {
+			l.mu.Unlock()
+			r.body.Close()
+			return 0, io.EOF
+		}
+		l.body = r.body
+		l.pend = r.first
+		nulls := l.nulls
+		l.mu.Unlock()
+		logger("[HOLD] %s hold %v, %s sent, program starts on the wait's clock",
+			l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls))
+		if len(l.pend) > 0 {
+			n := copy(p, l.pend)
+			l.pend = l.pend[n:]
+			return n, nil
+		}
+		return r.body.Read(p)
+	default:
+		// Not ready: keep the clock alive so the player does not stall waiting.
+		return l.serveHoldClock(p, 0)
+	}
+}
+
+// prepareHandoff opens the encoder, gates it to a keyframe, and primes past
+// the gate's keyframe wait here on its own goroutine — so that wait costs the
+// player's clock nothing, because the main path keeps emitting PCR until this
+// returns. It reports the gated body and the first bytes the gate released.
+func (l *lateEncoder) prepareHandoff() {
+	resp, err := http.Get(l.url)
+	if err == nil && resp.StatusCode != 200 {
+		resp.Body.Close()
+		err = fmt.Errorf("status %s", resp.Status)
+	}
+	if err != nil {
+		logger("[HOLD] %s encoder would not open after the hold: %v", l.label, err)
+		l.handoff <- nil
+		return
+	}
+	liveEdge(resp.Body, l.label)
+	armed := make(chan struct{})
+	close(armed)
+	// The gate starts on a keyframe so the picture is clean; no discontinuity
+	// is marked, because the wait's clock ran into this hand-off unbroken.
+	body := maybeWrapCaptions(
+		newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil),
+		l.tuner, l.name)
+	buf := make([]byte, 64*1024)
+	n, rerr := body.Read(buf)
+	if n <= 0 {
+		logger("[HOLD] %s encoder produced nothing after the hold: %v", l.label, rerr)
+		body.Close()
+		l.handoff <- nil
+		return
+	}
+	l.handoff <- &handoffResult{first: append([]byte(nil), buf[:n]...), body: body}
 }
 
 // showPreroll passes the pre-roll on for what is left of the delay. The delay
@@ -346,33 +434,17 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 		return 0, err
 	}
 	liveEdge(resp.Body, l.label)
+	armed := make(chan struct{})
+	close(armed)
 	// Captions wrap the encoder's stream, not the hold in front of it.
 	// Wrapping the hold hands the caption engine the pre-roll to work on and
 	// lets it rewrite the pre-roll's own video packets on the way past.
-	inner := l.stallTolerant(l.refreshing(resp.Body))
-	var body io.ReadCloser
-	if l.clock != nil && l.clock.ready.Load() {
-		// The clock ran the encoder's PCR through the whole wait, so the player
-		// is already synced and its clock must not stop now. Two things at a
-		// NULL hand-off would stop it, and both are skipped here:
-		//   - the discontinuity marker, which tells the player its clock jumped
-		//     and makes it re-anchor, throwing away the continuity the clock
-		//     gave it; there is no jump, so nothing to mark.
-		//   - the keyframe gate, which holds the whole stream back until the
-		//     encoder's next keyframe — up to a GOP, measured near 800ms — with
-		//     no PCR flowing, so the player's clock stalls exactly that long and
-		//     lands that far behind. The player is synced and decodes the next
-		//     keyframe on its own, so the stream is handed straight over.
-		body = maybeWrapCaptions(inner, l.tuner, l.name)
-		logger("[HOLD] %s hand-off continues the wait's clock; no gate, no discontinuity", l.label)
-	} else {
-		// A NULL hold carried no PCR, so the jump to the program's clock is a
-		// real discontinuity to declare, and the gate starts it on a keyframe.
-		armed := make(chan struct{})
-		close(armed)
-		body = markDiscontinuity(maybeWrapCaptions(
-			newGateReader(inner, armed, true, time.Now(), nil), l.tuner, l.name))
-	}
+	// A NULL hold carried no PCR, so the jump to the program's clock is a real
+	// discontinuity to declare, and the gate starts it on a keyframe. A clock
+	// hold does not come here — it hands off through clockHandoff.
+	body := markDiscontinuity(maybeWrapCaptions(
+		newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil),
+		l.tuner, l.name))
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
