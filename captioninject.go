@@ -375,13 +375,28 @@ func (ci *captionInjector) packet(p []byte) error {
 		ci.pmtDone = true
 	}
 	if pid == ci.pmtPID && ci.pmtPatch != nil {
+		// The patch is built once and then sent in place of every programme
+		// table after it, so it has to take the live packet's continuity
+		// counter with it. Without that the counter is frozen at whatever it
+		// happened to be when the patch was made — measured on a real capture
+		// as three hundred and twenty-four consecutive tables all reading 4,
+		// while the PAT and the SDT beside them counted normally.
+		//
+		// A table arriving ten times a second whose counter never moves reads
+		// to a demuxer as a duplicate or an error on every repeat, and a
+		// demuxer that responds by re-acquiring the programme tears the video
+		// pipeline down and builds it again. Playback stays perfectly smooth
+		// and the picture flashes, which is exactly what was reported —
+		// alignment, PCR, and the video's own presentation times all measured
+		// clean at the same time.
+		var t tsPacket
+		copy(t.buf[:], ci.pmtPatch)
+		t.buf[3] = t.buf[3]&0xF0 | p[3]&0x0F
 		if ci.inPES {
-			var t tsPacket
-			copy(t.buf[:], ci.pmtPatch)
 			ci.window = append(ci.window, t)
 			return nil
 		}
-		_, err := ci.out.Write(ci.pmtPatch)
+		_, err := ci.out.Write(t.buf[:])
 		return err
 	}
 
