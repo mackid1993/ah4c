@@ -237,9 +237,21 @@ func topPIDs(seen map[int]int) []string {
 	return out
 }
 
-// pcrNow extrapolates the encoder's PCR (27 MHz) at the current wall time.
+// pcrNow extrapolates the encoder's PCR (27 MHz) at the current wall time. The
+// base and anchor are read under the lock as a pair: reanchor writes them as a
+// pair, and a reader that split the two — a new base against the old anchor —
+// would jump the clock by the whole wait and fail the gate's live-edge check
+// on every keyframe.
 func (c *holdClock) pcrNow() uint64 {
-	return c.base + uint64(time.Since(c.anchor).Nanoseconds())*27/1000
+	c.mu.Lock()
+	base, anchor := c.base, c.anchor
+	c.mu.Unlock()
+	return pcrAt(base, anchor)
+}
+
+// pcrAt extrapolates from a base/anchor pair already read under the lock.
+func pcrAt(base uint64, anchor time.Time) uint64 {
+	return base + uint64(time.Since(anchor).Nanoseconds())*27/1000
 }
 
 // reanchor resets the clock's base to a freshly measured encoder PCR (27 MHz),
@@ -269,16 +281,23 @@ const clockPCREvery = 200 * time.Millisecond
 // then, and one PCR on its own PID. No NULL fill — every extra packet is a
 // packet the player ends up behind. Returns whole packets only.
 func (c *holdClock) serve(p []byte) int {
+	// Snapshot under the lock, then build: pcrPacket computes from the snapshot,
+	// so the lock is never held across the extrapolation and never contends with
+	// the re-anchor at the hand-off.
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	var out []byte
 	now := time.Now()
-	if now.Sub(c.lastPSI) >= time.Second {
+	psi := now.Sub(c.lastPSI) >= time.Second
+	if psi {
 		c.lastPSI = now
+	}
+	base, anchor := c.base, c.anchor
+	c.mu.Unlock()
+	var out []byte
+	if psi {
 		out = append(out, c.pat...)
 		out = append(out, c.pmt...)
 	}
-	out = append(out, c.pcrPacket()...)
+	out = append(out, c.pcrPacket(pcrAt(base, anchor))...)
 	if len(out) > len(p) {
 		out = out[:len(p)/tsPacketSize*tsPacketSize]
 	}
@@ -286,9 +305,8 @@ func (c *holdClock) serve(p []byte) int {
 }
 
 // pcrPacket builds an adaptation-only packet on the encoder's PCR PID —
-// the same PID the picture arrives on — carrying pcrNow.
-func (c *holdClock) pcrPacket() []byte {
-	pcr := c.pcrNow()
+// the same PID the picture arrives on — carrying pcr.
+func (c *holdClock) pcrPacket(pcr uint64) []byte {
 	base := pcr / 300
 	ext := pcr % 300
 	pkt := make([]byte, tsPacketSize)
@@ -414,41 +432,49 @@ func packetPCR(pkt []byte) (uint64, bool) {
 }
 
 // firstVideoPTS returns the first video PES presentation timestamp (90 kHz) in
-// b — what the player actually displays. It reassembles the PES header across
-// packets, because a keyframe packet often carries a large adaptation field
-// that pushes the header past the packet's end.
+// b — what the player actually displays. The video PID comes from the PMT
+// carried in b rather than from guessing at stream IDs, and the PES header is
+// reassembled across packets, because a keyframe packet often carries a large
+// adaptation field that leaves it almost no payload of its own.
 func firstVideoPTS(b []byte) (uint64, bool) {
-	vpid := -1
+	vid := map[int]bool{}
 	var pes []byte
+	have := false
 	for i := 0; i+tsPacketSize <= len(b); i += tsPacketSize {
 		pkt := b[i : i+tsPacketSize]
 		if pkt[0] != 0x47 {
 			continue
 		}
 		pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
-		if pid == 0 || pid >= 0x1FFF {
+		afc, pusi := pkt[3]>>4&3, pkt[1]&0x40 != 0
+		if len(vid) == 0 {
+			if sec := gatePSI(pkt, pusi, afc); len(sec) > 0 && sec[0] == 0x02 {
+				if v := videoPIDs(sec); len(v) > 0 {
+					vid = v
+				}
+			}
+			continue
+		}
+		if !vid[pid] || afc&1 == 0 {
 			continue
 		}
 		off := 4
-		if pkt[3]&0x20 != 0 { // adaptation field present
+		if afc >= 2 {
 			off += 1 + int(pkt[4])
 		}
 		if off >= tsPacketSize {
 			continue
 		}
 		pl := pkt[off:]
-		if vpid == -1 {
-			// A video PES starts 00 00 01 with stream_id 0xE0-0xEF.
-			if pkt[1]&0x40 != 0 && len(pl) >= 4 && pl[0] == 0 && pl[1] == 0 && pl[2] == 1 &&
-				pl[3] >= 0xE0 && pl[3] <= 0xEF {
-				vpid = pid
-				pes = append(pes[:0], pl...)
+		if !have {
+			// The header starts at a payload_unit_start: 00 00 01, stream_id.
+			// Anything before that on this PID belongs to the previous PES.
+			if !pusi || len(pl) < 4 || pl[0] != 0 || pl[1] != 0 || pl[2] != 1 {
+				continue
 			}
-			continue
+			have = true
 		}
-		if pid == vpid {
-			pes = append(pes, pl...)
-		}
+		pes = append(pes, pl...)
 		if len(pes) >= 14 {
 			break
 		}

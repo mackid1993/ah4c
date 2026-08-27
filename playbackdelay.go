@@ -327,6 +327,10 @@ func (l *lateEncoder) clockHandoff(p []byte) (int, error) {
 			clockPTS := l.clock.pcrNow() / 300 // 27 MHz -> 90 kHz
 			behindMs := (float64(clockPTS) - float64(pts)) / 90.0
 			logger("[HOLD] %s seam: first picture is %.0fms from the clock's live edge", l.label, behindMs)
+		} else {
+			// The one instrument that compares the picture to a clock must not be
+			// silent: say so, once per hand-off, with the size it had to work with.
+			logger("[HOLD] %s seam: no video PTS found in the gate's first release (%s)", l.label, byteCount(int64(len(r.first))))
 		}
 		logger("[HOLD] %s hold %v, %s sent, program starts on the wait's clock",
 			l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls))
