@@ -3,8 +3,9 @@ package main
 // PLAYBACK_DELAY: hold a tune, handing the program over when the delay is up
 // so the DVR gets a session that starts when the viewer does. Everything the
 // feature is lives here: the hold itself, the 1xx window that fronts it, the
-// discontinuity marker that ends it, the half second of black that goes in at
-// the seam, and the cap on the DVR socket's send buffer.
+// black runway that ends the wait and builds the player a clock, the
+// discontinuity marker at the hand-off, and the cap on the DVR socket's send
+// buffer.
 //
 // docs/playback-delay.md is the long version — how it works, what was measured,
 // and what was tried and thrown away.
@@ -139,16 +140,11 @@ func tuneHoldStartup() {
 	}
 	prerollStartup()
 	blackStartup()
-	// The bookend's black is stream the DVR keeps, so it is part of the wait
-	// rather than something added to it: a ninety second setting stays a
-	// ninety second hold, of which one second is black. Taken off after
-	// blackStartup, because a container that could not make the clip is not
-	// paying for it.
-	// No subtraction. The black runway is the last stretch of the wait, not
-	// something added after it, so the program still starts at exactly
-	// PLAYBACK_DELAY. The wait is (delay - runway) of NULL packets and then
-	// the runway of black; when the delay is shorter than the runway the whole
-	// wait is black, which is fine — a short hold wants a picture the sooner.
+	// No subtraction from the delay. The black runway is the last stretch of
+	// the wait, not time added after it, so the program still starts at exactly
+	// PLAYBACK_DELAY: the wait is (delay - runway) of NULL packets and then the
+	// runway of black. A delay shorter than the runway is all black, which a
+	// short hold wants anyway.
 	detect := strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE")
 	if holdDelay > 0 && detect {
 		logger("[HOLD] PLAYBACK_DELAY is set, so PLAYBACK_DETECTION does not run: the delay decides when the program starts")
@@ -161,7 +157,7 @@ func tuneHoldStartup() {
 		if nullFor < 0 {
 			nullFor = 0
 		}
-		logger("[HOLD] hold %s: %s of NULL packets, then %s of black streamed to the live edge, then the picture",
+		logger("[HOLD] holding %s: %s of NULL packets, then %s of black to establish the clock, then the picture",
 			holdWords(holdAsked), holdWords(nullFor), holdWords(blackRunway))
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
@@ -1228,7 +1224,7 @@ func blackStartup() {
 		return
 	}
 	blackPool = b[:len(b)/tsPacketSize*tsPacketSize]
-	logger("[BLACKFRAMES] made %s of black at %d pictures a second, %s, to stream at the end of the wait; the runway is %s",
+	logger("[BLACKFRAMES] prepared %s of black at %d fps (%s); the last %s of every wait streams it to build a clock before the picture",
 		blackWords(blackClip), rate, byteCount(int64(len(blackPool))), blackWords(blackRunway))
 }
 

@@ -291,7 +291,7 @@ func preparePreroll(src string) {
 	}
 	prerollTS = prerollCache
 	prerollRate = plan.rate
-	logger("[PREROLL] prepared %s in %v: %s at %d pictures a second, %s at %s", src,
+	logger("[PREROLL] prepared %s in %v: %s at %d fps, %s at %s", src,
 		time.Since(t0).Round(time.Millisecond), plan.kind, plan.rate, byteCount(st.Size()), prerollCache)
 }
 
