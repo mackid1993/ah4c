@@ -33,8 +33,15 @@ const holdMost = 10 * time.Minute
 const (
 	// The wait's byte diet: volume through the DVR's detection window, then
 	// a keepalive. Every byte here is one the DVR stores ahead of the show.
-	nullPace  = 100 * time.Millisecond
-	nullBurst = 2 * tsPacketSize
+	// One packet every two hundred milliseconds, not two every hundred. The
+	// old rate put a hundred and sixty-eight kilobytes of NULL packets into a
+	// ninety second hold, and every one of them lands in front of the picture
+	// where a player cannot cross it. This is a quarter of that and still
+	// constant — a packet on the wire five times a second, no gaps — which is
+	// the thing that matters: a sparse keepalive with ten second holes timed a
+	// tune out, and silence is what a DVR gives up on, not thinness.
+	nullPace  = 200 * time.Millisecond
+	nullBurst = 1 * tsPacketSize
 	// Volume while the DVR decides the body is a stream, a keepalive after:
 	// a trickle from the first byte starves it, and it gives up.
 	nullDetect = 6 * time.Second
@@ -291,7 +298,12 @@ var heldRecently sync.Map // name -> time.Time of the last hand-off
 // holdAgainAfter is how long a channel keeps the benefit of a hold it has
 // already served. Inside this, a fresh request is the DVR reconnecting to
 // something already tuned and playing, not a new tune-in to clean up.
-const holdAgainAfter = 10 * time.Minute
+// holdAgainAfter is how long a channel keeps the benefit of a hold it has
+// already served. It covers a DVR reconnecting to a session it just had, and
+// nothing more — at ten minutes it also swallowed a deliberate re-tune, which
+// re-runs the scripts and tunes the box again, so the hold is exactly what
+// that needs. Seconds, not minutes.
+const holdAgainAfter = 20 * time.Second
 
 func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner int, name string) *lateEncoder {
 	until := t0.Add(holdDelay)
@@ -584,6 +596,28 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	return l.emitNulls(p, burst)
 }
 
+// stripNulls removes NULL packets from a buffer of transport stream, and says
+// how many bytes went. They carry no frame, so nothing is lost by dropping
+// them and a player has nothing to stall on.
+func stripNulls(b []byte) ([]byte, int) {
+	out := b[:0:0]
+	gone := 0
+	for i := 0; i+tsPacketSize <= len(b); i += tsPacketSize {
+		pkt := b[i : i+tsPacketSize]
+		if pkt[0] == 0x47 && int(pkt[1]&0x1F)<<8|int(pkt[2]) == 0x1FFF {
+			gone += tsPacketSize
+			continue
+		}
+		out = append(out, pkt...)
+	}
+	// A partial packet at the end is kept as it is; it is the start of
+	// something the next read finishes.
+	if tail := len(b) % tsPacketSize; tail != 0 {
+		out = append(out, b[len(b)-tail:]...)
+	}
+	return out, gone
+}
+
 // takeHandoff swaps the filler for the released program and starts the
 // reopen's clock, which must run from here and not from the encoder's open.
 func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
@@ -602,7 +636,18 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	if l.stall != nil {
 		l.stall.fillStalls()
 	}
-	l.body, l.pend = l.watchEgress(r.body), r.first
+	// The gate's first release goes out ahead of everything and never passed
+	// the watcher, so NULL packets in it were invisible: the count said zero
+	// because it only ever saw what came after. It is tables, a keyframe, and
+	// whatever else was in the gate's buffer behind them — and anything
+	// frameless in there lands directly in front of the picture, which is the
+	// worst place in the stream for it. Strip it and say what was found.
+	first, stripped := stripNulls(r.first)
+	if stripped > 0 {
+		logger("[HOLD] %s took %s of NULL packets out of the hand-off, so the picture is the first thing after the wait",
+			l.label, byteCount(int64(stripped)))
+	}
+	l.body, l.pend = l.watchEgress(r.body), first
 	body, st := l.body, l.stall
 	nulls := l.nulls
 	l.mu.Unlock()
