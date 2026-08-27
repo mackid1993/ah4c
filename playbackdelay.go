@@ -50,6 +50,10 @@ const (
 	// patience than that one should hold too.
 	nullBeat    = 5 * time.Second
 	nullBeatFor = 1 * time.Second
+	// flushBeforeArm is how far ahead of the gate's arming the stall queue is
+	// emptied, so the gate hunts its keyframe through fresh bytes rather than
+	// through whatever has been stored up behind it.
+	flushBeforeArm = 300 * time.Millisecond
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -307,10 +311,27 @@ func (l *lateEncoder) drainEarly() {
 			// nothing is watching, and is already running at the hand-off.
 			// The wait's own filler is never handed to them — this is the
 			// encoder's stream, not the NULL packets in front of it.
-			src := maybeWrapCaptions(l.stallTolerant(l.refresh), l.tuner, l.name)
+			st := l.stallTolerant(l.refresh)
+			src := maybeWrapCaptions(st, l.tuner, l.name)
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
 			body = markDiscontinuity(newGateReader(src, nil, true, l.until, nil))
+			// Empty the queue just before the gate arms. The gate takes the
+			// first keyframe after the delay is up, and a queue that is full at
+			// that moment means it takes one out of two megabytes of stored-up
+			// stream: the program starts seconds behind and stays there,
+			// however carefully everything after the hand-off is arranged. The
+			// log showed exactly that — "start on keyframe, 514ms from the
+			// mark", "threw away 2.0 MB", "program starts", all in the same
+			// second. Emptying it there is too late; the frames the gate chose
+			// have already gone out. So it happens first, and what the gate
+			// arms against is the live edge.
+			go func(until time.Time) {
+				if d := time.Until(until.Add(-flushBeforeArm)); d > 0 {
+					time.Sleep(d)
+				}
+				st.flush(l.label)
+			}(l.until)
 			logger("[HOLD] %s encoder open and draining for the wait", l.label)
 			break
 		}
@@ -940,7 +961,7 @@ func holdRate(since time.Duration) (time.Duration, int) {
 // twenty seconds and the hold has to be what survives it. Without this, a
 // container running the delay with NULL frame insertion off loses the stream
 // twenty seconds after the programme starts, every time.
-func (l *lateEncoder) stallTolerant(body io.ReadCloser) io.ReadCloser {
+func (l *lateEncoder) stallTolerant(body io.ReadCloser) *stallTolerantReader {
 	return newStallTolerantReader(body, func() (io.ReadCloser, error) {
 		r, e := http.Get(l.url)
 		if e != nil {

@@ -1851,6 +1851,28 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 	}
 }
 
+// flush throws away everything waiting in the queue, so what is read next is
+// the live edge. The hold calls this just before its gate arms: a gate that
+// arms against a full queue picks its keyframe out of two megabytes of
+// stored-up stream and hands the DVR video that is already seconds old, and
+// emptying the queue afterwards is too late — the stale frames have gone.
+func (s *stallTolerantReader) flush(label string) {
+	gone := 0
+	for {
+		select {
+		case <-s.chunks:
+			gone++
+		default:
+			if gone > 0 {
+				s.dropped.Add(int64(gone))
+				logger("[%s] dropped %s of stored-up stream before the hand-off, so the program starts live",
+					label, byteCount(int64(gone)*chunkSize))
+			}
+			return
+		}
+	}
+}
+
 func (s *stallTolerantReader) Close() error {
 	s.closeOnce.Do(func() { close(s.closed) })
 	s.bodyMu.Lock()
