@@ -861,7 +861,12 @@ type clockSplice struct {
 	// an input timestamp to get an output one, and in is the last input seen.
 	out, delta, in uint64
 	started, said  bool
-	rest           []byte
+	// pend is rewritten and ready to go out; tail is what has been read but
+	// does not yet make a whole packet. synced is whether the packet boundary
+	// has been found, and err is kept until pend has drained.
+	pend, tail, scratch []byte
+	synced              bool
+	err                 error
 }
 
 // spliceClock gives the DVR one clock whatever filled the wait.
@@ -869,12 +874,79 @@ func spliceClock(src io.ReadCloser, label string) io.ReadCloser {
 	return &clockSplice{ReadCloser: src, label: label}
 }
 
+// Read hands back only whole packets that have been rewritten.
+//
+// The first version rewrote whatever the underlying reader returned, starting
+// at byte zero and assuming that was a packet boundary. It is not: a chunk is
+// thirty-two kilobytes and 32768 is not a multiple of 188, so every chunk ends
+// part way through a packet and the next one starts part way through. The scan
+// then read rubbish as packets, bailed at the first byte that was not 0x47,
+// and left most of the chunk untouched — so the DVR was handed one stream with
+// some timestamps offset and some not. That is what stuttered.
+//
+// So the boundary is held across reads: bytes accumulate in tail, whole
+// packets are rewritten and moved to pend, and the part packet at the end
+// waits for the rest of itself.
 func (c *clockSplice) Read(p []byte) (int, error) {
-	n, err := c.ReadCloser.Read(p)
-	if n > 0 {
-		c.rewrite(p[:n])
+	for len(c.pend) == 0 {
+		if c.err != nil {
+			// Nothing left to align; hand back whatever is stranded so the
+			// stream ends where it ended rather than a packet short.
+			if len(c.tail) > 0 {
+				c.pend, c.tail = c.tail, nil
+				break
+			}
+			return 0, c.err
+		}
+		if c.scratch == nil {
+			c.scratch = make([]byte, 32*1024)
+		}
+		n, err := c.ReadCloser.Read(c.scratch)
+		if n > 0 {
+			c.tail = append(c.tail, c.scratch[:n]...)
+			c.fill()
+		}
+		if err != nil {
+			c.err = err
+		}
 	}
-	return n, err
+	n := copy(p, c.pend)
+	c.pend = c.pend[n:]
+	return n, nil
+}
+
+// fill moves every whole packet in tail through the rewriter and on to pend.
+func (c *clockSplice) fill() {
+	if !c.synced {
+		c.sync()
+		if !c.synced {
+			return
+		}
+	}
+	whole := len(c.tail) / tsPacketSize * tsPacketSize
+	if whole == 0 {
+		return
+	}
+	c.rewrite(c.tail[:whole])
+	c.pend = append(c.pend, c.tail[:whole]...)
+	c.tail = append(c.tail[:0], c.tail[whole:]...)
+}
+
+// sync finds the packet boundary: a sync byte with another one exactly a
+// packet later. One 0x47 on its own is a coincidence often enough to matter in
+// a stream that is mostly video payload.
+func (c *clockSplice) sync() {
+	for i := 0; i+2*tsPacketSize <= len(c.tail); i++ {
+		if c.tail[i] == 0x47 && c.tail[i+tsPacketSize] == 0x47 {
+			c.tail = append(c.tail[:0], c.tail[i:]...)
+			c.synced = true
+			return
+		}
+	}
+	// Keep only what could still be the start of a pair.
+	if drop := len(c.tail) - 2*tsPacketSize; drop > 0 {
+		c.tail = append(c.tail[:0], c.tail[drop:]...)
+	}
 }
 
 // rewrite maps the timestamps in b, in place. Bytes that are not whole packets
