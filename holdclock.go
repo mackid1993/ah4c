@@ -307,13 +307,16 @@ func packetPCR(pkt []byte) (uint64, bool) {
 	return base*300 + ext, true
 }
 
-// firstVideoPTS returns the first PES presentation timestamp (90 kHz) in b, for
-// instrumentation: it is what the player will actually display, so comparing it
-// to the clock at the hand-off shows how far the picture is from live.
+// firstVideoPTS returns the first video PES presentation timestamp (90 kHz) in
+// b — what the player actually displays. It reassembles the PES header across
+// packets, because a keyframe packet often carries a large adaptation field
+// that pushes the header past the packet's end.
 func firstVideoPTS(b []byte) (uint64, bool) {
+	vpid := -1
+	var pes []byte
 	for i := 0; i+tsPacketSize <= len(b); i += tsPacketSize {
 		pkt := b[i : i+tsPacketSize]
-		if pkt[0] != 0x47 || pkt[1]&0x40 == 0 {
+		if pkt[0] != 0x47 {
 			continue
 		}
 		pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
@@ -321,18 +324,32 @@ func firstVideoPTS(b []byte) (uint64, bool) {
 			continue
 		}
 		off := 4
-		if pkt[3]&0x20 != 0 {
+		if pkt[3]&0x20 != 0 { // adaptation field present
 			off += 1 + int(pkt[4])
 		}
-		if off+14 > tsPacketSize {
+		if off >= tsPacketSize {
 			continue
 		}
 		pl := pkt[off:]
-		if pl[0] != 0 || pl[1] != 0 || pl[2] != 1 || pl[7]&0x80 == 0 {
+		if vpid == -1 {
+			// A video PES starts 00 00 01 with stream_id 0xE0-0xEF.
+			if pkt[1]&0x40 != 0 && len(pl) >= 4 && pl[0] == 0 && pl[1] == 0 && pl[2] == 1 &&
+				pl[3] >= 0xE0 && pl[3] <= 0xEF {
+				vpid = pid
+				pes = append(pes[:0], pl...)
+			}
 			continue
 		}
-		pts := uint64(pl[9]&0x0E)<<29 | uint64(pl[10])<<22 | uint64(pl[11]&0xFE)<<14 |
-			uint64(pl[12])<<7 | uint64(pl[13])>>1
+		if pid == vpid {
+			pes = append(pes, pl...)
+		}
+		if len(pes) >= 14 {
+			break
+		}
+	}
+	if len(pes) >= 14 && pes[7]&0x80 != 0 {
+		pts := uint64(pes[9]&0x0E)<<29 | uint64(pes[10])<<22 | uint64(pes[11]&0xFE)<<14 |
+			uint64(pes[12])<<7 | uint64(pes[13])>>1
 		return pts, true
 	}
 	return 0, false
