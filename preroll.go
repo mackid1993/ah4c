@@ -386,6 +386,9 @@ func (p *prerollPlayer) stop() int64 {
 // The playback delay does not come this way — it holds in lateEncoder, which
 // leaves the encoder shut until the delay is up.
 type tuneHold struct {
+	// gate is the reader that measures the encoder's picture rate while it is
+	// still discarding, so the black in front of the programme can match it.
+	gate *gateReader
 	// ready closes when the gate may release.
 	ready <-chan struct{}
 	label string
@@ -502,6 +505,15 @@ func (h *holdReader) Read(p []byte) (int, error) {
 	}
 }
 
+// rate is the encoder's picture rate as its gate measured it during the wait,
+// or zero if too little went past to say.
+func (h *holdReader) rate() int {
+	if h.hold == nil {
+		return 0
+	}
+	return h.hold.gate.pictureRate()
+}
+
 func (h *holdReader) serveNulls(p []byte) int {
 	n := nullPackets(p)
 	h.nulls += int64(n)
@@ -553,9 +565,10 @@ func (h *holdReader) handoff(p []byte, f holdFirst) (int, error) {
 	// Half a second of black between the pre-roll and the program, the same as
 	// the delay's own wait gets. The trim above has just put the stream on a
 	// packet boundary, so this lands whole.
-	if len(blackPool) > 0 {
-		h.pend = append(h.pend, blackPool...)
-		logger("[BLACK] %s %s of black went out between the pre-roll and the picture", h.hold.label, byteCount(int64(len(blackPool))))
+	if blk := blackAt(h.rate()); len(blk) > 0 {
+		h.pend = append(h.pend, blk...)
+		logger("[BLACK] %s %s of black at %d pictures a second went out between the pre-roll and the picture",
+			h.hold.label, byteCount(int64(len(blk))), h.rate())
 	}
 	// The encoder's clock goes out untouched.
 	h.pend = append(h.pend, f.data...)

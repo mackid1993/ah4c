@@ -744,7 +744,7 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// whether one ever reached a seam has never been in the log, so the one
 	// thing this was built to do could not be confirmed from outside — "I
 	// didn't see any lines about it creating black frames". Once per tune.
-	if blk := blackPool; len(blk) > 0 {
+	if blk := blackAt(l.gateRate()); len(blk) > 0 {
 		first = append(append([]byte(nil), blk...), first...)
 		logger("[BLACK] %s %s of black went out at the seam, immediately in front of the picture, against %s of NULL packets in the wait",
 			l.label, byteCount(int64(len(blk))), byteCount(l.nulls))
@@ -882,6 +882,15 @@ func (l *lateEncoder) emitNulls(p []byte, burst int) (int, error) {
 // The same rule is in holdReader for playback detection. Both need it, because
 // a pre-roll routes around drainEarly entirely — which is how four separate
 // faults have already reached only the people who have a pre-roll file.
+// gateRate is the picture rate the drained gate measured while it was
+// discarding, or zero if it never saw enough.
+func (l *lateEncoder) gateRate() int {
+	l.mu.Lock()
+	g := l.gate
+	l.mu.Unlock()
+	return g.pictureRate()
+}
+
 func (l *lateEncoder) finishFiller() {
 	k := (l.sent + int64(len(l.pend))) % tsPacketSize
 	if k == 0 {
@@ -939,9 +948,8 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// line before his connection broke. Every shed timing was tried on the
 	// other path and every one came back behind; playback detection, the hold
 	// that works, never breaks the connection at all.
-	body := maybeWrapCaptions(
-		newGateReader(l.stallTolerant(resp.Body), armed, true, time.Now(), nil),
-		l.tuner, l.name)
+	g := newGateReader(l.stallTolerant(resp.Body), armed, true, time.Now(), nil)
+	body := maybeWrapCaptions(g, l.tuner, l.name)
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
@@ -953,9 +961,10 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// Half a second of black between the filler and the program, the same as
 	// the NULL-packet path gets. finishFiller has just put the stream on a
 	// packet boundary, so this lands whole.
-	if len(blackPool) > 0 {
-		l.pend = append(l.pend, blackPool...)
-		logger("[BLACK] %s %s of black went out between the pre-roll and the picture", l.label, byteCount(int64(len(blackPool))))
+	if blk := blackAt(g.pictureRate()); len(blk) > 0 {
+		l.pend = append(l.pend, blk...)
+		logger("[BLACK] %s %s of black at %d pictures a second went out between the pre-roll and the picture",
+			l.label, byteCount(int64(len(blk))), g.pictureRate())
 	}
 	nulls := l.nulls
 	pend := len(l.pend) > 0
@@ -1267,49 +1276,69 @@ const (
 	blackCosts = blackSeamFor
 )
 
-// blackPool is the black as a transport stream, or nil if it could not be made.
-// It is exactly blackSeamFor long and goes out whole, once, at the seam.
-var blackPool []byte
+// blackPool holds one clip per plausible picture rate, made at startup where
+// nothing can be tuning (rule 10). The rate the encoder actually runs at is not
+// known until a stream is seen, and it must not cost a tune to find out — so
+// every likely answer is prepared in advance and the hand-off picks one. Five
+// half-second clips is a few tens of kilobytes and a couple of seconds of boot.
+//
+// blackRates are the rates worth having ready. Anything else falls back to the
+// nearest, which is closer than not matching at all.
+var blackPool = map[int][]byte{}
 
-// blackStartup makes it once, before the listener binds, where nothing can be
-// tuning yet (rule 10). A container that cannot make it still comes up, and
-// hands over exactly as it did before black existed.
+var blackRates = []int{24, 25, 30, 50, 60}
+
+// blackAt is the clip for a rate, or the nearest prepared one, or nil.
+func blackAt(rate int) []byte {
+	if b, ok := blackPool[rate]; ok {
+		return b
+	}
+	best, gap := 0, 1<<30
+	for r := range blackPool {
+		d := r - rate
+		if d < 0 {
+			d = -d
+		}
+		if d < gap {
+			best, gap = r, d
+		}
+	}
+	return blackPool[best]
+}
+
+// blackStartup makes the clips once, before the listener binds, where nothing
+// can be tuning yet (rule 10). A container that cannot make them hands over
+// exactly as it did before black existed.
 func blackStartup() {
-	// Made whatever fills the wait. It used to be skipped when a pre-roll was
-	// present, on the grounds that a pre-roll is already a picture — true, and
-	// beside the point. The seam is still two sources meeting, and half a
-	// second of black between them is what made that meeting work on the
-	// NULL-packet path.
-	const at = "/tmp/blackframe.ts"
-	// -g 15 puts a keyframe twice a second. Fast forward navigates by
-	// keyframes, so a run with only one at the front is a run a scrubber
-	// cannot move through — which is the complaint this exists to answer.
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-		// Sixty, not thirty. This black is the first video a player decodes at
-		// the seam, and a player that takes its output rate from what it sees
-		// first will then run sixty frame content at thirty — which is what
-		// was reported the moment the seam otherwise started working. Sixty in
-		// front of sixty is seamless, and sixty in front of thirty costs the
-		// player nothing it cannot do.
-		"-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=60",
-		"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds()),
-		"-c:v", "libx264", "-preset", "ultrafast", "-g", "30",
-		"-pix_fmt", "yuv420p", "-f", "mpegts", at)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		logger("[BLACK] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
+	for _, rate := range blackRates {
+		at := fmt.Sprintf("/tmp/black-%d.ts", rate)
+		cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=1920x1080:r=%d", rate),
+			"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds()),
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", fmt.Sprint(rate/2),
+			"-pix_fmt", "yuv420p", "-f", "mpegts", at)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			logger("[BLACK] could not make the %d picture black (%v): %s", rate, err, firstLine(string(out)))
+			continue
+		}
+		b, err := os.ReadFile(at)
+		if err != nil || len(b) < tsPacketSize {
+			continue
+		}
+		blackPool[rate] = b[:len(b)/tsPacketSize*tsPacketSize]
+	}
+	if len(blackPool) == 0 {
+		logger("[BLACK] no black could be made; hand-offs go out as they did before")
 		return
 	}
-	b, err := os.ReadFile(at)
-	if err != nil || len(b) == 0 {
-		logger("[BLACK] the black came out empty; hand-offs go out as they did before")
-		return
+	have := make([]string, 0, len(blackPool))
+	for _, r := range blackRates {
+		if b, ok := blackPool[r]; ok {
+			have = append(have, fmt.Sprintf("%d at %s", r, byteCount(int64(len(b)))))
+		}
 	}
-	// Whole TS packets only. A part packet at the seam is a torn packet
-	// immediately in front of the program, which is the one place in the
-	// stream that cannot afford one.
-	blackPool = b[:len(b)/tsPacketSize*tsPacketSize]
-	logger("[BLACK] made %s of black, %s, to go in front of the picture at the hand-off",
-		blackWords(blackSeamFor), byteCount(int64(len(blackPool))))
+	logger("[BLACK] %s of black ready for %s pictures a second; the hand-off takes whichever matches the encoder",
+		blackWords(blackSeamFor), strings.Join(have, ", "))
 }
 
 // blackWords says a black length. Not holdWords: that rounds to the second, so
