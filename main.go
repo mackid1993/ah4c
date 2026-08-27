@@ -1733,7 +1733,7 @@ const (
 	// how deep this is. So the depth only ever bought latency. Four chunks is
 	// a hundred and twenty-eight kilobytes, enough to cover the scheduling gap
 	// between one producer read and one consumer read and no more.
-	queueDepth = 4
+	queueDepth = 16
 )
 
 func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadCloser, error), label string) *stallTolerantReader {
