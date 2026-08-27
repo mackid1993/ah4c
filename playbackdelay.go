@@ -144,7 +144,7 @@ func tuneHoldStartup() {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
-		logger("[HOLD] hold %v", holdDelay)
+		logger("[HOLD] hold %v; the encoder is reopened %s into the program", holdDelay, holdWords(refreshAfterHold(holdDelay)))
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
 	case prerollTS != "":
@@ -461,7 +461,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	}
 	// http.Get, not a client with a Timeout: that field covers reading the
 	// body, so it breaks the stream by force at a moment nothing chose and
-	// leaves nothing able to decline. The break is wanted — see refreshAfter —
+	// leaves nothing able to decline. The break is wanted — see refreshAfterHold —
 	// but it is made deliberately below, and made so it can fail safely.
 	resp, err := http.Get(l.url)
 	if err == nil && resp.StatusCode != 200 {
@@ -838,13 +838,36 @@ func (l *lateEncoder) stallTolerant(body io.ReadCloser) io.ReadCloser {
 	}, l.label)
 }
 
-// refreshAfter is how long after the program starts the encoder connection is
-// reopened once. The break discards whatever the player has buffered ahead of
-// the show and starts again at the encoder's live output, which is what pulls
-// the viewer back to the live edge; without it the viewer stays wherever the
-// hand-off left them. Twenty seconds is what every hold up to forty-five was
-// watched with. It does not, on its own, fix a hold longer than forty-five.
-const refreshAfter = 20 * time.Second
+// The reopen's timing is measured, not chosen: at a ninety second hold, five
+// seconds into the program left the viewer five seconds behind; fifteen,
+// twenty-seven and thirty all landed at the live edge. What twenty does at
+// ninety was never on that list, and every build that went back to a flat
+// twenty has come back behind — the shed has to fall outside whatever the
+// player is still doing with the program it just acquired. refreshBase is what
+// every hold up to refreshPer was watched with; past that the point scales
+// with the hold, never above refreshMost, the longest point watched working.
+const (
+	refreshBase = 20 * time.Second
+	refreshPer  = 45 * time.Second
+	refreshMost = 30 * time.Second
+)
+
+// refreshAfterHold is how long after the program starts the encoder is
+// reopened, for a hold of the given length. Its own function so the arithmetic
+// can be checked without a DVR: twenty seconds at forty-five or under, thirty
+// at ninety or longer.
+func refreshAfterHold(hold time.Duration) time.Duration {
+	if hold <= refreshPer {
+		return refreshBase
+	}
+	// Through float64: a Duration is nanoseconds, and nanoseconds times
+	// nanoseconds overflows int64 for any hold longer than nine seconds.
+	d := time.Duration(float64(hold) * float64(refreshBase) / float64(refreshPer))
+	if d > refreshMost {
+		d = refreshMost
+	}
+	return d
+}
 
 // refreshing reopens the encoder once, shortly after the programme starts, and
 // only if the encoder will have it. The new connection is opened before the old
@@ -852,7 +875,7 @@ const refreshAfter = 20 * time.Second
 // while a tuner owns the stream — costs nothing at all: the refresh is declined,
 // said so once, and never tried again for this tune.
 func (l *lateEncoder) refreshing(body io.ReadCloser) io.ReadCloser {
-	return &refreshSource{ReadCloser: body, at: time.Now().Add(refreshAfter), label: l.label, open: func() (io.ReadCloser, error) {
+	return &refreshSource{ReadCloser: body, at: time.Now().Add(refreshAfterHold(holdDelay)), label: l.label, open: func() (io.ReadCloser, error) {
 		r, e := http.Get(l.url)
 		if e != nil {
 			return nil, e
