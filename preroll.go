@@ -133,8 +133,13 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	// program — which is the one the NULL-packet path has always had and
 	// which has been watched working.
 	{
-		// -c:v h264 picks whichever H.264 encoder this ffmpeg was built with.
-		// Even dimensions and yuv420p are what every H.264 encoder accepts;
+		// The filler is MPEG-2 video, on its own stream_type. It is the one
+		// codec every decoder here switches away from cleanly at the hand-off,
+		// so the program that follows can be H.264, HEVC, or anything else and
+		// the player re-selects for it rather than trying to carry the filler's
+		// decoder into a stream it cannot decode — which is the freeze an H.264
+		// filler caused in front of an HEVC program.
+		// Even dimensions and yuv420p are what mpeg2video accepts;
 		vf := "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 		if still {
 			// A photograph is whatever size the camera made it. Encoded at
@@ -1552,9 +1557,8 @@ func fillerEncodeArgs(rate int) []string {
 		rate = stillRate
 	}
 	return []string{
-		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-		"-profile:v", "high",
-		"-x264-params", fmt.Sprintf("keyint=%d:min-keyint=%d:scenecut=0:bframes=0:ref=1:aud=1", rate/2, rate/2),
+		"-c:v", "mpeg2video",
+		"-g", fmt.Sprintf("%d", rate/2), "-bf", "0", "-qscale:v", "3",
 		"-pix_fmt", "yuv420p",
 		"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
 	}

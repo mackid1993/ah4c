@@ -1207,7 +1207,7 @@ func blackStartup() {
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
 		"-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30",
 		"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds()),
-		"-c:v", "libx264", "-preset", "ultrafast", "-g", "15",
+		"-c:v", "mpeg2video", "-g", "15",
 		"-pix_fmt", "yuv420p", "-f", "mpegts", at)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		logger("[BLACKFRAMES] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
