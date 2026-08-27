@@ -341,8 +341,10 @@ func startPreroll(label string) *prerollPlayer {
 	// the size of that lead to keep the program from landing under frames the
 	// pre-roll has already scheduled. With no lead the gap closes to a single
 	// frame, and the pre-roll can never again be the side with the longer one.
-	return startPlayer(label, "PREROLL", "-re", "-stream_loop", "-1", "-i", prerollTS,
-		"-c", "copy", "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", "pipe:1")
+	args := []string{"-re", "-stream_loop", "-1", "-i", prerollTS,
+		"-c", "copy", "-muxdelay", "0", "-muxpreload", "0"}
+	args = append(args, fillerPIDArgs()...)
+	return startPlayer(label, "PREROLL", append(args, "-f", "mpegts", "pipe:1")...)
 }
 
 // startPlayer runs one ffmpeg writing MPEG-TS to a channel, or nil if it will
@@ -1444,8 +1446,17 @@ func (c *clockSplice) notePMTPID(pkt []byte) {
 	if sec[0] != 0x00 {
 		return
 	}
-	if pid := int(sec[10]&0x1F)<<8 | int(sec[11]); pid > 0 && pid < 0x1FFF {
-		c.pmtPID = pid
+	// The first entry with a program number. program_number 0 is the NIT and
+	// names no program table; an encoder that lists it first would otherwise
+	// have its real table go unread.
+	slen := int(sec[1]&0x0F)<<8 | int(sec[2])
+	for i := 8; i+4 <= 3+slen-4 && i+4 <= len(sec); i += 4 {
+		prog := int(sec[i])<<8 | int(sec[i+1])
+		pid := int(sec[i+2]&0x1F)<<8 | int(sec[i+3])
+		if prog != 0 && pid > 0 && pid < 0x1FFF {
+			c.pmtPID = pid
+			return
+		}
 	}
 }
 
@@ -1490,6 +1501,18 @@ func parseRate(s string) int {
 		return 0
 	}
 	return r
+}
+
+// fillerPIDArgs puts the filler on PIDs no encoder uses. ffmpeg's defaults are
+// 0x100, 0x101 and a table on 0x1000, and so are the defaults of every
+// libavformat-based encoder — and if the program arrived on the same PIDs as
+// the pre-roll, nothing downstream would see a change: the PIDs would already
+// be known, so no flag; the tables would be byte-identical, so no version
+// step; and one decoder would carry both sources on one PID, which is the
+// arrangement reverted for flicker. 0xF00 is in nobody's defaults. Checked in
+// the container's ffmpeg under -c copy: video 0xF00, audio 0xF01, table 0xF0F.
+func fillerPIDArgs() []string {
+	return []string{"-mpegts_start_pid", "0xF00", "-mpegts_pmt_start_pid", "0xF0F"}
 }
 
 func fillerEncodeArgs(rate int) []string {
