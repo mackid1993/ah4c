@@ -590,8 +590,15 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// A NULL hold carried no PCR, so the jump to the program's clock is a real
 	// discontinuity to declare, and the gate starts it on a keyframe. A clock
 	// hold does not come here — it hands off through clockHandoff.
+	// Armed here and now: this path opens the encoder at the hand-off, so the
+	// hand-off is this moment. refreshing hands back an unarmed source because
+	// the drained path opens at the tune and must not spend its shed during
+	// the wait — but nothing arms it here unless it is said, and an unarmed
+	// source never sheds at all. Silent, and only on the pre-roll's path.
+	rs := l.refreshing(resp.Body)
+	rs.arm(time.Now().Add(refreshAfterHold(holdDelay)))
 	body := markDiscontinuity(maybeWrapCaptions(
-		newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil),
+		newGateReader(l.stallTolerant(rs), armed, true, time.Now(), nil),
 		l.tuner, l.name))
 	l.mu.Lock()
 	if l.closed {
