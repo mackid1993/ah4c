@@ -128,7 +128,7 @@ func startHoldClock(url, label string, until time.Time) *holdClock {
 			d, ok := c.probe(url)
 			if ok {
 				c.ready.Store(true)
-				logger("[HOLD] %s running a streamless program through the wait (PCR on its own PID 0x%X, off the video), so the player keeps its clock without buffering the picture", label, clockPCRPID)
+				logger("[HOLD] %s running a streamless program through the wait (PCR on the encoder's own PID 0x%X, no video stream), so the player keeps its clock without a PCR-PID switch at the hand-off", label, c.pcrPID)
 				return
 			}
 			diag = d
@@ -204,7 +204,7 @@ func (c *holdClock) probe(url string) (string, bool) {
 			// wait's own PID (off the video PID), and no streams, so the player
 			// holds no A/V buffer and nothing lands on the video stream; the
 			// encoder's real PMT takes over at the hand-off.
-			min := streamlessPMT(pmt, clockPCRPID)
+			min := streamlessPMT(pmt, pcrPID)
 			if min == nil {
 				min = pmt // fall back to the real PMT rather than run silent
 			}
@@ -242,14 +242,12 @@ func (c *holdClock) pcrNow() uint64 {
 	return c.base + uint64(time.Since(c.anchor).Nanoseconds())*27/1000
 }
 
-// clockPCRPID is the PID the wait's PCR rides on — its own, NOT the encoder's
-// video PID. The clock used to put PCR on the encoder's PCR PID, which is the
-// video PID, so the whole wait injected packets onto the video stream and the
-// real picture arrived buried behind them. On its own PID the video stream
-// stays empty until the encoder's picture takes over at the hand-off. It is
-// declared as the PCR PID in the wait's PMT and is well clear of an encoder's
-// usual PIDs.
-const clockPCRPID = 0x0100
+// The wait's PCR rides the encoder's own PCR PID, the same one the picture
+// arrives on. It once rode a separate PID to keep the dense synthesized clock
+// off the video stream, but that made the PCR PID switch at the hand-off and
+// the player re-lock its clock — a fixed lag. Now that the wait is a bare
+// trickle, it stays on the encoder's PID and the clock lock is unbroken across
+// the seam, the way the encoder's own stream and PLAYBACK_DETECTION do it.
 
 // clockPCREvery is how far apart the wait's PCRs are, in wall time. Every
 // packet the wait injects is one the player then sits behind, and the measured
@@ -278,16 +276,16 @@ func (c *holdClock) serve(p []byte) int {
 	return copy(p, out)
 }
 
-// pcrPacket builds an adaptation-only packet on the wait's own PCR PID —
-// clockPCRPID, not the encoder's video PID — carrying pcrNow.
+// pcrPacket builds an adaptation-only packet on the encoder's PCR PID —
+// the same PID the picture arrives on — carrying pcrNow.
 func (c *holdClock) pcrPacket() []byte {
 	pcr := c.pcrNow()
 	base := pcr / 300
 	ext := pcr % 300
 	pkt := make([]byte, tsPacketSize)
 	pkt[0] = 0x47
-	pkt[1] = byte((clockPCRPID >> 8) & 0x1F)
-	pkt[2] = byte(clockPCRPID & 0xFF)
+	pkt[1] = byte((c.pcrPID >> 8) & 0x1F)
+	pkt[2] = byte(c.pcrPID & 0xFF)
 	// adaptation field only, no payload; CC does not advance on such packets.
 	pkt[3] = 0x20
 	pkt[4] = 183  // adaptation_field_length: the rest of the packet
