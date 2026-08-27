@@ -356,13 +356,17 @@ func (l *lateEncoder) prepareHandoff() {
 	liveEdge(resp.Body, l.label)
 	armed := make(chan struct{})
 	close(armed)
-	// The gate starts on a keyframe so the picture is clean; no discontinuity
-	// is marked, because the wait's clock ran into this hand-off unbroken. The
-	// gate is given the clock so it releases only on a keyframe at the live
-	// edge, not one the encoder handed over from a GOP before it.
+	// The gate starts on a keyframe so the picture is clean, and is given the
+	// clock so it releases only on a keyframe at the live edge — measured at
+	// three milliseconds from it. The discontinuity indicator is then marked on
+	// that keyframe: it is a clean entry point at the live edge, and the marker
+	// is what tells the player to flush and re-anchor to it rather than stay a
+	// buffer's length behind on the clock it was riding. It landed the player
+	// behind when the keyframe was not yet at the live edge; now that it is,
+	// the flush lands there.
 	gate := newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil)
 	gate.bridge = l.clock
-	body := maybeWrapCaptions(gate, l.tuner, l.name)
+	body := markDiscontinuity(maybeWrapCaptions(gate, l.tuner, l.name))
 	// Read until the gate releases the keyframe. A zero-byte read is not the
 	// end — the gate returns nothing while it is still hunting the keyframe, so
 	// it is retried, not treated as a dead encoder. Only a real error ends it.
