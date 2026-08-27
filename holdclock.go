@@ -173,8 +173,17 @@ func (c *holdClock) pcrNow() uint64 {
 	return c.base + uint64(time.Since(c.anchor).Nanoseconds())*27/1000
 }
 
-// serve fills p with the program: the tables at a PSI cadence, a PCR every
-// call, NULL packets for the rest. Returns whole packets only.
+// clockPCREvery is how often the wait emits a PCR, in wall time. A real
+// encoder clocks PCR tightly — tens of milliseconds — and a decoder given the
+// spec-ceiling ~100ms cadence this used to run at widens its playout buffer by
+// a fixed amount to ride out the jitter, which is the fixed lag a clock hold
+// sat behind however long it ran. Twenty milliseconds is well inside what a
+// receiver expects and close to a real encoder's. serveHoldClock paces the
+// calls to this so one advancing PCR goes out every clockPCREvery.
+const clockPCREvery = 20 * time.Millisecond
+
+// serve fills p with the program: the tables at a PSI cadence, one PCR at the
+// current moment, NULL packets for the rest. Returns whole packets only.
 func (c *holdClock) serve(p []byte) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -220,11 +229,13 @@ func (c *holdClock) pcrPacket() []byte {
 	return pkt
 }
 
-// serveHoldClock paces the program filler and counts its bytes, the way
-// serveNulls does for NULL packets. Returns io.EOF once the tune is closed.
+// serveHoldClock paces the program filler and counts its bytes. It runs at
+// clockPCREvery, tighter than the NULL diet's nullPace, so the PCR track is a
+// real encoder's cadence rather than the spec ceiling. Returns io.EOF once the
+// tune is closed.
 func (l *lateEncoder) serveHoldClock(p []byte, d time.Duration) (int, error) {
-	if d > nullPace || d <= 0 {
-		d = nullPace
+	if d > clockPCREvery || d <= 0 {
+		d = clockPCREvery
 	}
 	time.Sleep(d)
 	n := l.clock.serve(p)
