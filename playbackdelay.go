@@ -294,10 +294,23 @@ func (l *lateEncoder) drainEarly() {
 		}
 		if err == nil {
 			l.refresh = l.refreshing(resp.Body)
+			// Captions wrap the encoder itself, inside the gate, rather than
+			// the gate's output. Outside it they see their first frame at the
+			// hand-off, and the log shows what that costs: Vulkan enumerated,
+			// two backends dlopened and the devices registered, all in the
+			// same second the program starts — the whole engine booting
+			// between the release and the DVR's first frame. That is rule 13's
+			// caption mistake and rule 6's "must be effectively free", and it
+			// happened because until now there was no video to give them any
+			// earlier. There is now: the encoder drains for the whole wait, so
+			// the engine gets its first frame at the tune, warms up while
+			// nothing is watching, and is already running at the hand-off.
+			// The wait's own filler is never handed to them — this is the
+			// encoder's stream, not the NULL packets in front of it.
+			src := maybeWrapCaptions(l.stallTolerant(l.refresh), l.tuner, l.name)
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
-			gate := newGateReader(l.stallTolerant(l.refresh), nil, true, l.until, nil)
-			body = markDiscontinuity(maybeWrapCaptions(gate, l.tuner, l.name))
+			body = markDiscontinuity(newGateReader(src, nil, true, l.until, nil))
 			logger("[HOLD] %s encoder open and draining for the wait", l.label)
 			break
 		}
