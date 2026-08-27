@@ -950,6 +950,13 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	}
 	l.body = body
 	l.finishFiller()
+	// Half a second of black between the filler and the program, the same as
+	// the NULL-packet path gets. finishFiller has just put the stream on a
+	// packet boundary, so this lands whole.
+	if len(blackPool) > 0 {
+		l.pend = append(l.pend, blackPool...)
+		logger("[BLACK] %s %s of black went out between the pre-roll and the picture", l.label, byteCount(int64(len(blackPool))))
+	}
 	nulls := l.nulls
 	pend := len(l.pend) > 0
 	l.mu.Unlock()
@@ -1268,18 +1275,25 @@ var blackPool []byte
 // tuning yet (rule 10). A container that cannot make it still comes up, and
 // hands over exactly as it did before black existed.
 func blackStartup() {
-	if prerollTS != "" {
-		// A pre-roll fills the wait itself; it needs no black from here.
-		return
-	}
+	// Made whatever fills the wait. It used to be skipped when a pre-roll was
+	// set, on the grounds that a pre-roll is already a picture — true, and
+	// beside the point. The seam is still two sources meeting, and half a
+	// second of black between them is what made that meeting work on the
+	// NULL-packet path.
 	const at = "/tmp/blackframe.ts"
 	// -g 15 puts a keyframe twice a second. Fast forward navigates by
 	// keyframes, so a run with only one at the front is a run a scrubber
 	// cannot move through — which is the complaint this exists to answer.
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-		"-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30",
+		// Sixty, not thirty. This black is the first video a player decodes at
+		// the seam, and a player that takes its output rate from what it sees
+		// first will then run sixty frame content at thirty — which is what
+		// was reported the moment the seam otherwise started working. Sixty in
+		// front of sixty is seamless, and sixty in front of thirty costs the
+		// player nothing it cannot do.
+		"-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=60",
 		"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds()),
-		"-c:v", "libx264", "-preset", "ultrafast", "-g", "15",
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", "30",
 		"-pix_fmt", "yuv420p", "-f", "mpegts", at)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		logger("[BLACK] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))

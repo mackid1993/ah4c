@@ -550,6 +550,13 @@ func (h *holdReader) handoff(p []byte, f holdFirst) (int, error) {
 			h.pend = append(h.pend, bytes.Repeat([]byte{0xFF}, int(tsPacketSize-k))...)
 		}
 	}
+	// Half a second of black between the pre-roll and the program, the same as
+	// the delay's own wait gets. The trim above has just put the stream on a
+	// packet boundary, so this lands whole.
+	if len(blackPool) > 0 {
+		h.pend = append(h.pend, blackPool...)
+		logger("[BLACK] %s %s of black went out between the pre-roll and the picture", h.hold.label, byteCount(int64(len(blackPool))))
+	}
 	// The encoder's clock goes out untouched.
 	h.pend = append(h.pend, f.data...)
 	n := copy(p, h.pend)
