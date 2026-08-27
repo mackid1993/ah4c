@@ -352,10 +352,12 @@ func (l *lateEncoder) prepareHandoff() {
 	armed := make(chan struct{})
 	close(armed)
 	// The gate starts on a keyframe so the picture is clean; no discontinuity
-	// is marked, because the wait's clock ran into this hand-off unbroken.
-	body := maybeWrapCaptions(
-		newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil),
-		l.tuner, l.name)
+	// is marked, because the wait's clock ran into this hand-off unbroken. The
+	// gate is given the clock so it releases only on a keyframe at the live
+	// edge, not one the encoder handed over from a GOP before it.
+	gate := newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil)
+	gate.bridge = l.clock
+	body := maybeWrapCaptions(gate, l.tuner, l.name)
 	// Read until the gate releases the keyframe. A zero-byte read is not the
 	// end — the gate returns nothing while it is still hunting the keyframe, so
 	// it is retried, not treated as a dead encoder. Only a real error ends it.
