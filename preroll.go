@@ -4,6 +4,7 @@ package main
 // wherever the DVR would otherwise get NULL packets and looping until the real
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -414,6 +415,9 @@ type holdReader struct {
 	pend    []byte
 	open    bool
 	nulls   int64
+	// sent is every byte handed downstream, so the hand-off can tell whether
+	// the filler stopped on a packet boundary.
+	sent int64
 }
 
 type holdFirst struct {
@@ -464,10 +468,13 @@ func (h *holdReader) Read(p []byte) (int, error) {
 	if len(h.pend) > 0 {
 		n := copy(p, h.pend)
 		h.pend = h.pend[n:]
+		h.sent += int64(n)
 		return n, nil
 	}
 	if h.open {
-		return h.src.Read(p)
+		n, err := h.src.Read(p)
+		h.sent += int64(n)
+		return n, err
 	}
 	select {
 	case f := <-h.first:
@@ -492,6 +499,7 @@ func (h *holdReader) Read(p []byte) (int, error) {
 func (h *holdReader) serveNulls(p []byte) int {
 	n := nullPackets(p)
 	h.nulls += int64(n)
+	h.sent += int64(n)
 	return n
 }
 
@@ -513,6 +521,29 @@ func (h *holdReader) handoff(p []byte, f holdFirst) (int, error) {
 		what = "pre-roll"
 	}
 	logger("[HOLD] %s hand-off at %v; sent %s of %s", h.hold.label, since.Round(time.Millisecond), byteCount(preroll+h.nulls), what)
+	// Start the program on a packet boundary.
+	//
+	// ffmpeg's pre-roll is read from a pipe in whatever sizes the pipe gives,
+	// and stopping it cuts wherever it had got to — measured at 132 bytes into
+	// a packet on a real tune. Appending the program to that fragment glues
+	// half a filler packet to the front of the program's first one, and every
+	// packet after it is 56 bytes out of step for the rest of the stream.
+	//
+	// It has always done this. It became visible when the clock rewriter
+	// arrived downstream, because that carves packets at fixed offsets and so
+	// began writing timestamps into arbitrary payload from the seam onward —
+	// which is what flickered. A demuxer on its own resyncs and loses a frame;
+	// this made it lose all of them.
+	//
+	// So the filler is finished off first: trim the part packet when it is
+	// still in hand, and complete it when it has already gone out.
+	if k := (h.sent + int64(len(h.pend))) % tsPacketSize; k != 0 {
+		if int64(len(h.pend)) >= k {
+			h.pend = h.pend[:int64(len(h.pend))-k]
+		} else {
+			h.pend = append(h.pend, bytes.Repeat([]byte{0xFF}, int(tsPacketSize-k))...)
+		}
+	}
 	// The encoder's clock goes out untouched.
 	h.pend = append(h.pend, f.data...)
 	n := copy(p, h.pend)
@@ -524,6 +555,7 @@ func (h *holdReader) serve(p, data []byte) int {
 	h.pend = append(h.pend, data...)
 	n := copy(p, h.pend)
 	h.pend = h.pend[n:]
+	h.sent += int64(n)
 	return n
 }
 
@@ -918,6 +950,17 @@ func (c *clockSplice) Read(p []byte) (int, error) {
 // fill moves every whole packet in tail through the rewriter and on to pend.
 func (c *clockSplice) fill() {
 	if !c.synced {
+		c.sync()
+		if !c.synced {
+			return
+		}
+	}
+	// Alignment is checked every time, not assumed once. A source that ends
+	// mid-packet shifts everything after it, and carving fixed offsets through
+	// that writes timestamps into payload — which is worse than the misaligned
+	// stream it started from.
+	if c.tail[0] != 0x47 {
+		c.synced = false
 		c.sync()
 		if !c.synced {
 			return
