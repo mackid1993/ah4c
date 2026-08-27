@@ -1457,7 +1457,18 @@ func serveLive(r *gin.Engine, addr string) error {
 	if err != nil {
 		return err
 	}
-	logger("[START] serving on %s with the DVR's send buffer capped at %s, so the kernel cannot hold a stream back", addr, byteCount(dvrSendBuffer))
+	// Say what Run said. gin.RunListener announces itself as "Listening and
+	// serving HTTP on listener what's bind with address@[::]:7654" — gin's own
+	// wording, and it reads like a fault report rather than a service starting.
+	// This line has said "Listening and serving HTTP on :7654" for as long as
+	// the program has existed and capping a socket option is no reason for it
+	// to change, so print that and let gin say nothing.
+	//
+	// Safe to silence: the engine is gin.New, not gin.Default, and the request
+	// log is this program's own. Nothing else writes to DefaultWriter, and
+	// RunListener does not return.
+	fmt.Fprintf(gin.DefaultWriter, "[GIN-debug] Listening and serving HTTP on %s\n", addr)
+	gin.DefaultWriter = io.Discard
 	return r.RunListener(liveListener{ln})
 }
 
