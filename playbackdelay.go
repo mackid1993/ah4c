@@ -13,6 +13,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"fmt"
 	"io"
 	"net"
@@ -746,14 +747,23 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 		preroll = l.preroll.stop()
 	}
 	first, _ := stripNulls(r.first)
-	// Half a second of black in front of the picture, on the NULL path only.
-	// It goes out on ffmpeg's default PID, which the program's tables do not
-	// declare, so the player does not decode it and the program on its own PID
-	// is what the playhead lands on, at the live edge. A pre-roll is its own
-	// picture for the whole wait and needs none.
-	if blk := blackPool; len(blk) > 0 && l.preroll == nil {
-		first = append(append([]byte(nil), blk...), first...)
-		logger("[BLACKFRAMES] %s %s of black went out at the seam in front of the picture", l.label, byteCount(int64(len(blk))))
+	// The black in front of the program must be the program's own codec. On the
+	// NULL path it is blackPool — H.264, or the built-in H.265 when
+	// ENCODER_CODEC=h265. On the pre-roll path it is normally left out, the
+	// pre-roll having filled the wait; the exception is an H.265 encoder, where
+	// the H.264 pre-roll cannot hand straight to the H.265 program. There the
+	// built-in H.265 black is inserted as a seam — a clean H.265 restart for the
+	// player to land the program on.
+	var seam []byte
+	switch {
+	case l.preroll == nil:
+		seam = blackPool
+	case wantHEVC():
+		seam = blackHEVCAsset[:len(blackHEVCAsset)/tsPacketSize*tsPacketSize]
+	}
+	if len(seam) > 0 {
+		first = append(append([]byte(nil), seam...), first...)
+		logger("[BLACKFRAMES] %s %s of black went out at the seam in front of the picture", l.label, byteCount(int64(len(seam))))
 	}
 	// Whatever pre-roll is still in pend goes out first; it is whole packets
 	// from the pump, so finishFiller has nothing to trim on that path.
@@ -1186,10 +1196,30 @@ const (
 	blackCosts = blackSeamFor
 )
 
-// blackPool is the black as a transport stream, made with fillerEncodeArgs so
-// its parameter sets are the pre-roll's byte for byte, or nil if it could not
-// be made.
+// blackPool is the half second of black as a transport stream — H.264 by
+// default, or the built-in H.265 clip when ENCODER_CODEC is h265 — or nil if it
+// could not be made. It goes in front of the program at the hand-off, and it
+// must be the program's own codec: the player will not carry the decoder it
+// locked onto the black into a program of a different codec, and freezes.
 var blackPool []byte
+
+// blackHEVCAsset is a half second of H.265 black, made once offline and shipped
+// in the binary. This image's ffmpeg has no software H.265 encoder, so an H.265
+// black cannot be made at startup; it is embedded instead and used as-is when
+// ENCODER_CODEC says the encoder is H.265.
+//
+//go:embed blackframe_hevc.ts
+var blackHEVCAsset []byte
+
+// wantHEVC reports whether ENCODER_CODEC names an H.265 encoder, so the filler
+// is made to match it. Anything else — unset included — assumes H.264.
+func wantHEVC() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ENCODER_CODEC"))) {
+	case "h265", "hevc", "x265":
+		return true
+	}
+	return false
+}
 
 // blackStartup makes the clip once, before the listener binds, where nothing
 // can be tuning yet (rule 10). With a pre-roll the wait fills itself and needs
@@ -1200,6 +1230,14 @@ var blackPool []byte
 // the playhead starts behind, which is what a decoded or a long black became.
 func blackStartup() {
 	if prerollTS != "" {
+		return
+	}
+	if wantHEVC() {
+		// H.265 encoder: the black has to be H.265 too, and this image cannot
+		// make one, so the clip shipped in the binary is used as-is.
+		blackPool = blackHEVCAsset[:len(blackHEVCAsset)/tsPacketSize*tsPacketSize]
+		logger("[BLACKFRAMES] using the built-in %s of H.265 black (ENCODER_CODEC=h265), %s, to go in front of the picture at the hand-off",
+			blackWords(blackSeamFor), byteCount(int64(len(blackPool))))
 		return
 	}
 	const at = "/tmp/blackframe.ts"
