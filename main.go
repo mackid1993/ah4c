@@ -702,12 +702,7 @@ func run() error {
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
-		var dst flushWriter = c.Writer
-		if holdDelay > 0 {
-			// A held tune's write side gets the instrument; see playbackdelay.go.
-			dst = watchWriteStalls(dst, "tuner="+tuner+" channel="+channel)
-		}
-		if bytesCopied, err = copyFlush(dst, reader); err != nil {
+		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
@@ -1684,24 +1679,16 @@ type stallTolerantReader struct {
 	hasFirstChunk atomic.Bool
 	reconnects    atomic.Int64
 	// dropped counts chunks thrown away to keep the queue from becoming a
-	// place lag lives. lastDropLog is only touched by the producer.
+	// place lag lives. saidDrop keeps that to one line a tune.
 	// rest is what would not fit in the last caller's buffer, handed over on
 	// the next Read. Only the reading goroutine touches it.
 	rest    []byte
 	dropped atomic.Int64
 	// filled counts NULL bytes put into a live program to cover an encoder
-	// stall. lastFillLog is only touched by the reading goroutine.
-	filled      atomic.Int64
-	lastFillLog time.Time
-	lastDropLog time.Time
-	// depthHigh is the deepest the queue has stood since queueGauge last read
-	// it. The queue is the one place inside ah4c that can hold whole seconds
-	// of video, and until now only the full-at-the-brim moment had a voice —
-	// a queue standing at any depth below full said nothing at all. So the
-	// depth is reported, not inferred: a queue that stands deep says the DVR
-	// is the slow side, and one that stands empty says whatever the viewer is
-	// behind lives somewhere else.
-	depthHigh atomic.Int64
+	// stall. saidFill keeps that to one line a tune.
+	filled   atomic.Int64
+	saidFill bool
+	saidDrop bool
 }
 
 type sessionSource interface{ sessions() int64 }
@@ -1713,11 +1700,6 @@ const (
 	srcStallReconnect   = 5 * time.Second
 	srcReconnectBackoff = 2 * time.Second
 	reconnectLogEvery   = 10 * time.Second
-	// dropLogEvery is how often a full queue is mentioned. It is a real
-	// symptom — the DVR is not keeping up — so it is said, but not per chunk.
-	dropLogEvery = 10 * time.Second
-	// fillLogEvery is how often NULL fill into a live program is mentioned.
-	fillLogEvery = 10 * time.Second
 	// stallQuietGap keeps a hold's quiet reader from spinning without making
 	// it block: long enough that a core is not burned, short enough that the
 	// hand-off is not delayed by it.
@@ -1812,7 +1794,6 @@ func (s *stallTolerantReader) producer() {
 			copy(data, chunk[:n])
 			select {
 			case s.chunks <- data:
-				s.noteDepth()
 			case <-s.closed:
 				return
 			default:
@@ -1856,11 +1837,9 @@ func (s *stallTolerantReader) producer() {
 				case <-s.closed:
 					return
 				}
-				s.noteDepth()
-				if time.Since(s.lastDropLog) > dropLogEvery {
-					s.lastDropLog = time.Now()
-					logger("[%s] the DVR is reading slower than the encoder sends; threw away %s of stored-up stream to get back to the live edge (%d chunks in all this tune)",
-						s.label, byteCount(int64(gone)*chunkSize), s.dropped.Load())
+				if !s.saidDrop {
+					s.saidDrop = true
+					logger("[%s] the queue filled and the oldest stream in it was dropped so the stream stays at the live edge", s.label)
 				}
 			}
 			if err == nil {
@@ -1953,31 +1932,16 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 	}
 }
 
-// sayFilled reports NULL fill put into a live program, at most once every
-// fillLogEvery. Called only from Read, so lastFillLog needs no lock.
+// sayFilled says once, per reader, that the encoder stalled and the gap was
+// covered with NULL packets. Once: it used to repeat every ten seconds with a
+// running total, which reads like something getting worse rather than one
+// stall that was handled.
 func (s *stallTolerantReader) sayFilled() {
-	if time.Since(s.lastFillLog) < fillLogEvery {
+	if s.saidFill {
 		return
 	}
-	s.lastFillLog = time.Now()
-	logger("[%s] the encoder went quiet; %s of NULL packets have gone into the live program this tune, which is stream the viewer cannot play through",
-		s.label, byteCount(s.filled.Load()))
-}
-
-// noteDepth records how deep the queue stands after a send. Only the producer
-// calls it, and queueGauge's clear can race a lost update at worst, which
-// costs nothing but a slightly shy high-water mark — it is a gauge, not a
-// ledger.
-func (s *stallTolerantReader) noteDepth() {
-	if d := int64(len(s.chunks)); d > s.depthHigh.Load() {
-		s.depthHigh.Store(d)
-	}
-}
-
-// queueGauge is the queue's depth now and the deepest it has stood since the
-// last call, which it clears so each report covers its own interval.
-func (s *stallTolerantReader) queueGauge() (standing, deepest int) {
-	return len(s.chunks), int(s.depthHigh.Swap(0))
+	s.saidFill = true
+	logger("[%s] the encoder went quiet; the gap is covered with NULL packets, which is stream the viewer cannot play through", s.label)
 }
 
 // flush throws away everything waiting in the queue, so what is read next is

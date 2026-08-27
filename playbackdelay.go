@@ -3,9 +3,11 @@ package main
 // PLAYBACK_DELAY: hold a tune, handing the program over when the delay is up
 // so the DVR gets a session that starts when the viewer does. Everything the
 // feature is lives here: the hold itself, the 1xx window that fronts it, the
-// discontinuity marker that ends it, the black frame that goes in at the seam,
-// the cap on the DVR socket's send buffer, and the instrument that times the
-// writes into it.
+// discontinuity marker that ends it, the half second of black that goes in at
+// the seam, and the cap on the DVR socket's send buffer.
+//
+// docs/playback-delay.md is the long version — how it works, what was measured,
+// and what was tried and thrown away.
 
 import (
 	"bufio"
@@ -27,8 +29,8 @@ import (
 
 // holdDelay is the playback delay as parsed at startup; zero when unset. It is
 // the length of the NULL-packet wait, which is what the user asked for less the
-// black that bookends it — holdAsked is what they actually set, kept for the
-// log so the two can be told apart.
+// black that goes in front of the picture — holdAsked is what they actually
+// set, kept for the log so the two can be told apart.
 var (
 	holdDelay time.Duration
 	holdAsked time.Duration
@@ -660,30 +662,6 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	return l.emitNulls(p, burst)
 }
 
-// primerFor is how long a picture goes out in front of the wait, to give the
-// player a time base before the filler starts.
-const primerFor = 1500 * time.Millisecond
-
-// blackForHold is how long black plays at the start of a wait of the given
-// length. A third of the hold, never more than blackMost and never less than
-// blackLeast — a fixed five seconds would run past the mark on a hold shorter
-// than that, and a hold can be as short as a person likes. The floor is two
-// keyframes of the clip, which is what a player needs to have a picture and a
-// time base at all; below that there is no point sending any.
-func blackForHold(hold time.Duration) time.Duration {
-	d := hold / 3
-	if d > blackMost {
-		d = blackMost
-	}
-	if d < blackLeast {
-		if hold < blackLeast {
-			return 0
-		}
-		d = blackLeast
-	}
-	return d
-}
-
 // blackMost and blackLeast bound it. blackFor is how long black plays at the start of a wait. It is there to give
 // the player a picture and a time base before any filler, not to fill the
 // whole hold: at a broadcast bitrate a ninety second wait of black is sixty
@@ -707,35 +685,6 @@ const (
 const drainGiveUp = 30 * time.Second
 
 const blackPatience = 2 * time.Second
-
-// primeFrom reads the draining encoder until it has tables and a keyframe and
-// then a little beyond, and returns it. That is what the player anchors on.
-// A failure here costs nothing: the wait simply starts with filler, as before.
-func primeFrom(src io.ReadCloser, label string) []byte {
-	armed := make(chan struct{})
-	close(armed)
-	g := newGateReader(src, armed, true, time.Now(), nil)
-	var out []byte
-	buf := make([]byte, 64*1024)
-	deadline := time.Now().Add(primerFor)
-	for time.Now().Before(deadline) {
-		n, err := g.Read(buf)
-		if n > 0 {
-			b, _ := stripNulls(buf[:n])
-			out = append(out, b...)
-		}
-		if err != nil {
-			break
-		}
-		if n == 0 {
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-	if len(out) > 0 {
-		logger("[HOLD] %s opened the wait with %s of picture, so the filler is a gap in a stream the player already has", label, byteCount(int64(len(out))))
-	}
-	return out
-}
 
 // stripNulls removes NULL packets from a buffer of transport stream, and says
 // how many bytes went. They carry no frame, so nothing is lost by dropping
@@ -804,8 +753,8 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 		logger("[HOLD] %s took %s of NULL packets out of the hand-off, so the picture is the first thing after the wait",
 			l.label, byteCount(int64(stripped)))
 	}
-	l.body, l.pend = l.watchEgress(r.body), first
-	body, st := l.body, l.stall
+	l.body, l.pend = r.body, first
+	body := l.body
 	nulls := l.nulls
 	l.mu.Unlock()
 	if l.refresh != nil {
@@ -813,11 +762,6 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	}
 	heldRecently.Store(l.name, time.Now())
 	logger("[HOLD] %s hold %v, %s sent, program starts", l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls))
-	if st != nil {
-		standing, deepest := st.queueGauge()
-		logger("[HOLD] %s stall queue at the hand-off: %d of %d standing, deepest %d during the wait",
-			l.label, standing, queueDepth, deepest)
-	}
 	if len(l.pend) > 0 {
 		n := copy(p, l.pend)
 		l.pend = l.pend[n:]
@@ -952,7 +896,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 		body.Close()
 		return 0, io.EOF
 	}
-	l.body = l.watchEgress(body)
+	l.body = body
 	nulls := l.nulls
 	l.mu.Unlock()
 	logger("[HOLD] %s hold %v, %s sent, program starts", l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls+preroll))
@@ -1011,113 +955,6 @@ func packetPCR(pkt []byte) (uint64, bool) {
 	return base*300 + ext, true
 }
 
-// egressDriftEvery is how often the pace is reported once the program starts.
-const egressDriftEvery = 15 * time.Second
-
-// egressDrift rides the program to the DVR and reports the stream's running
-// gain or loss against the wall since the hand-off.
-type egressDrift struct {
-	io.ReadCloser
-	label string
-	// gauge, when set, is the stall queue's depth report, folded into the
-	// pace line so the two numbers that matter — is the stream on pace, and
-	// is anything standing between the encoder and the DVR — arrive together.
-	gauge func() (int, int)
-
-	mu   sync.Mutex
-	have bool
-	pcr0 uint64    // the first PCR seen, 27 MHz units
-	t0   time.Time // when it was seen
-	last time.Time // last report
-	// nulls and prog count what has gone to the DVR since the hand-off.
-	nulls atomic.Int64
-	prog  atomic.Int64
-}
-
-// watchEgress dresses the program with the pace report. The DVR is handed the
-// wrapper; the program inside it is untouched. Callers hold l.mu, which is
-// what l.stall is read under.
-func (l *lateEncoder) watchEgress(body io.ReadCloser) io.ReadCloser {
-	e := &egressDrift{ReadCloser: body, label: l.label}
-	if l.stall != nil {
-		e.gauge = l.stall.queueGauge
-	}
-	return e
-}
-
-func (e *egressDrift) Read(p []byte) (int, error) {
-	n, err := e.ReadCloser.Read(p)
-	if n > 0 {
-		e.watch(p[:n])
-	}
-	return n, err
-}
-
-// watch folds any PCR in b into the pace report. The newest PCR in the read is
-// the one that counts: it is as close to the live edge as the byte stream gets.
-func (e *egressDrift) watch(b []byte) {
-	var pcr uint64
-	var ok bool
-	var nulls, prog int
-	for i := 0; i+tsPacketSize <= len(b); i += tsPacketSize {
-		pkt := b[i : i+tsPacketSize]
-		if pkt[0] != 0x47 {
-			// Re-sync rather than step blindly over a misaligned buffer. Not
-			// doing this is why this watcher once reported a pace of minus
-			// twenty-one hours: it was reading random bytes as a PCR.
-			for ; i+tsPacketSize <= len(b) && b[i] != 0x47; i++ {
-			}
-			i--
-			continue
-		}
-		// Count what is going out. NULL packets after the hand-off are the
-		// thing being looked for: packets ahead of the playhead that carry no
-		// frame, that no player can cross and fast forward cannot land on. If
-		// this count is zero, ah4c is not putting them there.
-		if int(pkt[1]&0x1F)<<8|int(pkt[2]) == 0x1FFF {
-			nulls++
-		} else {
-			prog++
-		}
-		if v, yes := packetPCR(pkt); yes {
-			pcr, ok = v, true
-		}
-	}
-	e.nulls.Add(int64(nulls))
-	e.prog.Add(int64(prog))
-	if !ok {
-		return
-	}
-	now := time.Now()
-	e.mu.Lock()
-	if !e.have {
-		e.have, e.pcr0, e.t0, e.last = true, pcr, now, now
-		e.mu.Unlock()
-		logger("[HOLD] %s watching the stream's pace against the wall", e.label)
-		return
-	}
-	if now.Sub(e.last) < egressDriftEvery {
-		e.mu.Unlock()
-		return
-	}
-	stream := time.Duration(pcr-e.pcr0) * time.Microsecond / 27
-	wall := now.Sub(e.t0)
-	// The clock free-runs and wraps; a wild step is a new base, not a drift.
-	if d := (stream - wall).Abs(); d > time.Minute {
-		e.pcr0, e.t0 = pcr, now
-	}
-	e.last = now
-	e.mu.Unlock()
-	if e.gauge != nil {
-		standing, deepest := e.gauge()
-		logger("[HOLD] %s since the hand-off: %s NULL packets and %s program packets have gone to the DVR", e.label, byteCount(e.nulls.Load()*tsPacketSize), byteCount(e.prog.Load()*tsPacketSize))
-		logger("[HOLD] %s stream pace %+.0fms against the wall since the hand-off; stall queue %d of %d standing, deepest %d since the last report",
-			e.label, float64((stream - wall).Milliseconds()), standing, queueDepth, deepest)
-		return
-	}
-	logger("[HOLD] %s stream pace %+.0fms against the wall since the hand-off", e.label, float64((stream - wall).Milliseconds()))
-}
-
 // --- The hand-off's discontinuity marker ---
 // Telling the DVR the time base is new, so it does not read the jump from
 // filler to program as corruption. ffmpeg spells this initial_discontinuity;
@@ -1138,12 +975,6 @@ type firstDiscontinuity struct {
 
 func markDiscontinuity(src io.ReadCloser) io.ReadCloser {
 	return &firstDiscontinuity{ReadCloser: src, seen: map[int]bool{}}
-}
-
-// markDiscontinuityFor is markDiscontinuity with a label, so the wall it puts
-// up can be seen in the log against the tuner it belongs to.
-func markDiscontinuityFor(src io.ReadCloser, label string) io.ReadCloser {
-	return &firstDiscontinuity{ReadCloser: src, seen: map[int]bool{}, label: label}
 }
 
 func (f *firstDiscontinuity) Read(p []byte) (int, error) {
@@ -1312,9 +1143,7 @@ func (h *hintHold) stream(src io.Reader) (int64, error) {
 	if err := h.rw.Flush(); err != nil {
 		return 0, err
 	}
-	// The write side gets the instrument here too; see stallWatchedWriter
-	// at the foot of this file.
-	return copyFlush(watchWriteStalls(bufWriter{h.rw}, h.label), src)
+	return copyFlush(bufWriter{h.rw}, src)
 }
 
 func (h *hintHold) Close() error { return h.conn.Close() }
@@ -1649,49 +1478,3 @@ func serveLive(r *gin.Engine, addr string) error {
 // writeStallEvery is how often the blocked time is reported: the pace
 // watcher's cadence, so the two lines land side by side in the log.
 const writeStallEvery = 15 * time.Second
-
-// stallWatchedWriter times every write on its way to the DVR and reports the
-// time spent blocked. It is used from a single copy loop, so plain fields and
-// no lock.
-type stallWatchedWriter struct {
-	dst     flushWriter
-	label   string
-	last    time.Time     // when the last report was made
-	blocked time.Duration // time blocked in Write and Flush since then
-	worst   time.Duration // the single slowest write since then
-	total   time.Duration // time blocked over the whole tune
-}
-
-// watchWriteStalls wraps the DVR-facing writer with the report.
-func watchWriteStalls(dst flushWriter, label string) flushWriter {
-	return &stallWatchedWriter{dst: dst, label: label, last: time.Now()}
-}
-
-func (w *stallWatchedWriter) Write(p []byte) (int, error) {
-	t0 := time.Now()
-	n, err := w.dst.Write(p)
-	w.note(time.Since(t0))
-	if t0.Sub(w.last) >= writeStallEvery {
-		logger("[HOLD] %s writes to the DVR blocked %dms of the last %v (worst single write %dms; %v blocked in all this tune)",
-			w.label, w.blocked.Milliseconds(), t0.Sub(w.last).Round(time.Second),
-			w.worst.Milliseconds(), w.total.Round(time.Millisecond))
-		w.last, w.blocked, w.worst = t0, 0, 0
-	}
-	return n, err
-}
-
-// Flush is timed too: the hint path writes through a bufio whose tail leaves
-// in the flush, so blocking there is the same backpressure by another door.
-func (w *stallWatchedWriter) Flush() {
-	t0 := time.Now()
-	w.dst.Flush()
-	w.note(time.Since(t0))
-}
-
-func (w *stallWatchedWriter) note(d time.Duration) {
-	w.blocked += d
-	w.total += d
-	if d > w.worst {
-		w.worst = d
-	}
-}
