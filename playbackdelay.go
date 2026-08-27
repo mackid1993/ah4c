@@ -610,14 +610,24 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 		}
 	}
 	d, burst := l.nullPace(left)
-	// While black is playing, wait for black — do not fall back to NULL
-	// packets between its frames. The clip runs at real time, so whenever the
-	// DVR reads faster than it produces, a short timer here wins the race and
-	// puts a NULL packet in between two black frames. That is black, null,
-	// black, null: frameless gaps threaded back through the one thing meant to
-	// remove them. So when there is black, the timer is only a long stop in
-	// case the clip dies, and its expiry is a real fault worth the fallback.
-	l.mu.Lock()
+	// No lock held across this select. There was one — a leftover from the
+	// version that played a black clip through the wait and read its state
+	// here — and it had no Unlock on any path out. Both ways out take l.mu
+	// again (takeHandoff and emitNulls do, and emitNulls again through
+	// tablesFor), and a sync.Mutex is not reentrant, so the very first filler
+	// read of every held tune deadlocked against itself and died holding the
+	// lock.
+	//
+	// That one line was the whole night's failure. drainEarly's next l.mu.Lock
+	// is the line after it creates the stall reader, so the reader's producer
+	// ran with nothing ever consuming it: the queue filled, threw itself away
+	// on every push for ever — a hundred thousand chunks on a tune that ended
+	// minutes earlier — and `encoder open and draining for the wait` never
+	// printed. Nothing downstream of that line can happen. No packet reached
+	// the gate, so the caption engine never got a first frame and never
+	// started; no hand-off was ever posted, so the tune failed; and the tuner
+	// was never released, so the next tune found it active and went to the
+	// next box, unconditionally. Every symptom, from one unmatched Lock.
 	wait := time.NewTimer(d)
 	select {
 	case r := <-l.handoff:
@@ -844,41 +854,17 @@ func (l *lateEncoder) nullPace(d time.Duration) (time.Duration, int) {
 }
 
 // emitNulls writes one burst of filler into p and counts what it sent.
-// tablesFor returns the encoder's real PAT and PMT to send with the filler, at
-// most once a second. Without them the wait is bytes the DVR cannot identify,
-// so it keeps the whole stretch as stream; with them the NULL packets are
-// padding inside a declared programme, which is what padding is for.
-func (l *lateEncoder) tablesFor() []byte {
-	l.mu.Lock()
-	g := l.gate
-	last := l.lastTables
-	l.mu.Unlock()
-	if g == nil || time.Since(last) < time.Second {
-		return nil
-	}
-	tb := g.realTables()
-	if len(tb) == 0 {
-		return nil
-	}
-	l.mu.Lock()
-	l.lastTables = time.Now()
-	l.mu.Unlock()
-	return tb
-}
-
+//
+// The filler carries no tables. A version of this sent the encoder's real PAT
+// and PMT alongside the NULL packets, on the theory that a wait inside a
+// declared programme is padding rather than unidentifiable stream. It never
+// once ran: the tables come from l.gate, and l.gate is set by drainEarly one
+// line past the Lock that deadlocked, so l.gate was nil on every tune this
+// code has ever seen. It is removed rather than finally let loose, because
+// CLAUDE.md records what tables in the wait did the last time they reached a
+// DVR — it locked onto them and never played at all — and the first thing a
+// fixed hold should do is not that.
 func (l *lateEncoder) emitNulls(p []byte, burst int) (int, error) {
-	if tb := l.tablesFor(); len(tb) > 0 && len(p) >= len(tb)+tsPacketSize {
-		n := copy(p, tb)
-		n += nullPackets(p[n:min(len(p), n+burst)])
-		l.mu.Lock()
-		l.nulls += int64(n)
-		closed := l.closed
-		l.mu.Unlock()
-		if closed {
-			return 0, io.EOF
-		}
-		return n, nil
-	}
 	if len(p) > burst {
 		p = p[:burst]
 	}
