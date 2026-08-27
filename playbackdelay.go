@@ -747,36 +747,17 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 		preroll = l.preroll.stop()
 	}
 	first, _ := stripNulls(r.first)
-	// The black in front of the program must be the program's own codec. On the
-	// NULL path it is blackPool — H.264, or the built-in H.265 when
-	// ENCODER_CODEC=h265. On the pre-roll path it is normally left out, the
-	// pre-roll having filled the wait; the exception is an H.265 encoder, where
-	// the H.264 pre-roll cannot hand straight to the H.265 program. There the
-	// built-in H.265 black is inserted as a seam — a clean H.265 restart for the
-	// player to land the program on.
-	var seam []byte
-	switch {
-	case l.preroll == nil:
-		seam = blackPool
-		if len(seam) > 0 {
-			logger("[BLACKFRAMES] %s %s of black went out at the seam in front of the picture", l.label, byteCount(int64(len(seam))))
-		}
-	case wantHEVC():
-		// An H.264 pre-roll cannot hand straight to the H.265 seam: the player
-		// carries the H.264 decoder it was showing the pre-roll with into the
-		// H.265 black and freezes on it. A short burst of NULL packets first —
-		// carrying no coded video and no time — lets it release that decoder,
-		// exactly as the NULL path's silence does before its own black; then the
-		// H.265 black gives it a clean same-codec frame to acquire on and start
-		// the clock. The viewer only sees the pre-roll's last frame held a
-		// moment, and nothing lands behind the live edge, NULL packets being
-		// timeless.
-		hevcBlack := blackHEVCAsset[:len(blackHEVCAsset)/tsPacketSize*tsPacketSize]
-		seam = append(bytes.Repeat(nullTSPacket[:], seamNullFrames), hevcBlack...)
-		logger("[BLACKFRAMES] %s %d NULL packets then %s of H.265 black went out between the pre-roll and the program", l.label, seamNullFrames, byteCount(int64(len(hevcBlack))))
-	}
-	if len(seam) > 0 {
-		first = append(append([]byte(nil), seam...), first...)
+	// Half a second of black in front of the program, on the NULL path only.
+	// blackPool is made in the encoder's codec — H.264, or the built-in H.265
+	// clip when ENCODER_CODEC=h265 — and it is the first coded picture the player
+	// sees, so it locks a decoder of that codec and the program, being the same
+	// codec, carries straight on. A pre-roll fills the wait itself and needs no
+	// black; on the pre-roll path the splice relabels the pre-roll's stream type
+	// to the encoder's codec instead, so the player never has to switch decoders
+	// at the hand-off (a NULL-then-black seam there was tried and froze).
+	if blk := blackPool; len(blk) > 0 && l.preroll == nil {
+		first = append(append([]byte(nil), blk...), first...)
+		logger("[BLACKFRAMES] %s %s of black went out at the seam in front of the picture", l.label, byteCount(int64(len(blk))))
 	}
 	// Whatever pre-roll is still in pend goes out first; it is whole packets
 	// from the pump, so finishFiller has nothing to trim on that path.
@@ -1208,13 +1189,6 @@ const (
 	// wait rather than added to it.
 	blackCosts = blackSeamFor
 )
-
-// seamNullFrames is the short burst of NULL packets placed between an H.264
-// pre-roll and the H.265 seam, so the player releases its H.264 decoder before
-// the H.265 black arrives — the gap that keeps the hand-off from freezing.
-// NULL packets carry no coded video and no time, so this adds no lag; the
-// viewer only sees the pre-roll's last frame held for a moment.
-const seamNullFrames = 200
 
 // blackPool is the half second of black as a transport stream — H.264 by
 // default, or the built-in H.265 clip when ENCODER_CODEC is h265 — or nil if it
