@@ -26,6 +26,9 @@ This is live TV. The client is MPV. There is no recording being made in the
 usual sense — but everything the DVR receives it keeps, and the viewer can
 scrub through it, which is why what goes into the wait matters so much.
 
+**The one sentence this whole document is about: NULL packets carry no
+timestamps.** Everything below follows from that.
+
 ## The budget that is not negotiable
 
 **The DVR gives up 30 seconds after the request.** That is the whole budget and
@@ -146,10 +149,24 @@ nothing can be tuning yet), with `-g 15` so there is a keyframe twice a second
 for a scrubber to land on. About 12 KB. A container that cannot make it hands
 over exactly as it did before black existed.
 
-**Why it works** (this part is the best explanation available, not proven): the
-wait is frameless. A player arriving at the end of it has no picture to decode
-and no time base to carry into the program. Half a second of real video with
-real timestamps gives it both, and the program then follows video with video.
+**Why it works.** NULL packets carry no timestamps. That is the whole thing, and
+it predicts every result of this investigation:
+
+- Ninety seconds of NULL packets carry no clock and no frames, so a player
+  arriving at the end of them has no time base and a playhead has nothing to
+  cross. Fast forward finds no keyframe to land on and MPV pauses instead of
+  moving. That is what the user described, accurately, for hours: *"there are
+  null packets ahead of the playhead and I can't fast forward through them."*
+- Half a second of real video immediately before the program carries
+  timestamps, so the player anchors and then follows video with video.
+- **A pre-roll never had this problem at all**, because a pre-roll is real video
+  carrying real timestamps for the entire wait. It is doing the same job as the
+  seam black, continuously, which is why `blackStartup` skips itself when
+  `PREROLL_TS` is set.
+
+The effect of the half second is measured. That timestamps specifically are the
+mechanism is the best explanation available and it is the one that accounts for
+all three cases.
 
 **What the sizes taught us**, all measured on the user's screen:
 
