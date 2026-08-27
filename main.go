@@ -1675,6 +1675,10 @@ type stallTolerantReader struct {
 	label         string
 	hasFirstChunk atomic.Bool
 	reconnects    atomic.Int64
+	// dropped counts chunks thrown away to keep the queue from becoming a
+	// place lag lives. lastDropLog is only touched by the producer.
+	dropped     atomic.Int64
+	lastDropLog time.Time
 }
 
 type sessionSource interface{ sessions() int64 }
@@ -1686,6 +1690,9 @@ const (
 	srcStallReconnect    = 5 * time.Second
 	srcReconnectBackoff  = 2 * time.Second
 	reconnectLogEvery    = 10 * time.Second
+	// dropLogEvery is how often a full queue is mentioned. It is a real
+	// symptom — the DVR is not keeping up — so it is said, but not per chunk.
+	dropLogEvery = 10 * time.Second
 	preFirstChunkBudget  = 15 * time.Second // fail over fast on a dead tuner
 	postFirstChunkBudget = 3 * time.Minute  // ride through mid-stream glitches
 	chunkSize            = 32 * 1024
@@ -1760,6 +1767,38 @@ func (s *stallTolerantReader) producer() {
 			case s.chunks <- data:
 			case <-s.closed:
 				return
+			default:
+				// The queue is full, which means the DVR has been reading
+				// slower than the encoder sends. This send used to block, and
+				// blocking is what made the queue a place lag goes to live:
+				// once queueDepth chunks are in it, every slot the consumer
+				// frees is filled again at once, so the viewer stays a full
+				// queue behind the encoder for the rest of the tune — two
+				// megabytes, which is between one and a half and three and a
+				// half seconds of video depending on the bitrate. Nothing
+				// drained it. That is what "behind, and it stays behind, and
+				// fast forward snaps back" is: the viewer is at the live edge
+				// of a recording that is itself late.
+				//
+				// A live stream would rather lose a moment than carry it for
+				// ever, so the oldest chunk goes and the newest is kept. This
+				// is the encoder reopen's trick — discard what is stored ahead
+				// of the show — made continuous and cheap instead of once and
+				// by force.
+				select {
+				case <-s.chunks:
+					s.dropped.Add(1)
+				default:
+				}
+				select {
+				case s.chunks <- data:
+				case <-s.closed:
+					return
+				}
+				if n := s.dropped.Load(); time.Since(s.lastDropLog) > dropLogEvery {
+					s.lastDropLog = time.Now()
+					logger("[%s] the DVR is reading slower than the encoder sends; dropped %d chunk(s) to stay at the live edge", s.label, n)
+				}
 			}
 			if err == nil {
 				continue
