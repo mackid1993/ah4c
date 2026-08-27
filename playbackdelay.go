@@ -830,35 +830,39 @@ func (l *lateEncoder) stallTolerant(body io.ReadCloser) io.ReadCloser {
 	}, l.label)
 }
 
-// The reopen's timing is measured, not chosen: at a ninety second hold, five
-// seconds into the program left the viewer five seconds behind; fifteen,
-// twenty-seven and thirty all landed at the live edge. What twenty does at
-// ninety was never on that list, and every build that went back to a flat
-// twenty has come back behind — the shed has to fall outside whatever the
-// player is still doing with the program it just acquired. refreshBase is what
-// every hold up to refreshPer was watched with; past that the point scales
-// with the hold, never above refreshMost, the longest point watched working.
+// The reopen is the only thing here that sheds what the player has stored
+// ahead of the show, and the only arithmetic left that a hold's length feeds.
+// A forty-five second hold reopens at twenty seconds and lands at the live
+// edge: a ratio of 0.444. The formula below scales that ratio — and then a cap
+// threw it away exactly where the trouble starts. Ninety's proportional point
+// is forty seconds; the cap made it thirty, a ratio of 0.333, and a hundred
+// and twenty came out at 0.250. So the two lengths that fail have never once
+// run at the ratio the length that works runs at, and forty seconds at ninety
+// has never been tried — not tonight, and not on any earlier build. Every
+// ninety second test ever run used twenty or thirty.
+//
+// The cap was justified as "the longest point watched working", but those
+// numbers came off a different build with a different filler, and are not a
+// like-for-like comparison with anything running now (rule 13: change one
+// thing between comparisons). A cap that holds the failing lengths at a ratio
+// the working length never uses is not a safety rail, it is the bug.
 const (
 	refreshBase = 20 * time.Second
 	refreshPer  = 45 * time.Second
-	refreshMost = 30 * time.Second
 )
 
 // refreshAfterHold is how long after the program starts the encoder is
 // reopened, for a hold of the given length. Its own function so the arithmetic
-// can be checked without a DVR: twenty seconds at forty-five or under, thirty
-// at ninety or longer.
+// can be checked without a DVR: the ratio a forty-five second hold is watched
+// working at, held at every length. Twenty seconds at forty-five, forty at
+// ninety, fifty-three at a hundred and twenty.
 func refreshAfterHold(hold time.Duration) time.Duration {
 	if hold <= refreshPer {
 		return refreshBase
 	}
 	// Through float64: a Duration is nanoseconds, and nanoseconds times
 	// nanoseconds overflows int64 for any hold longer than nine seconds.
-	d := time.Duration(float64(hold) * float64(refreshBase) / float64(refreshPer))
-	if d > refreshMost {
-		d = refreshMost
-	}
-	return d
+	return time.Duration(float64(hold) * float64(refreshBase) / float64(refreshPer))
 }
 
 // refreshing reopens the encoder once, shortly after the programme starts, and
