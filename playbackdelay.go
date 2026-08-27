@@ -266,6 +266,9 @@ type lateEncoder struct {
 	drain io.ReadCloser
 	// gate is the drained gate, kept so the wait can send the encoder's own
 	// tables with its filler. lastTables is when they last went out.
+	// primer is real picture sent before the filler, so the player has a time
+	// base to carry across the wait.
+	primer     []byte
 	gate       *gateReader
 	lastTables time.Time
 	// quietSaid keeps the "no keyframe" note to once a tune.
@@ -414,6 +417,27 @@ func (l *lateEncoder) drainEarly() {
 			l.stall = st
 			l.mu.Unlock()
 			src := maybeWrapCaptions(st, l.tuner, l.name)
+			// Give the player a picture before the filler, not after it.
+			//
+			// A ninety second encoder reboot is covered with NULL packets by
+			// the stall reader and the stream comes back fine — same packets,
+			// same length, no viewer stuck behind them. The difference is the
+			// order. There, video came first: the player had a time base, and
+			// the NULLs were a gap in the middle of a stream it already
+			// understood, so it rode through them. Here the NULLs come first,
+			// before any picture at all, so there is nothing to anchor on and
+			// nothing to carry across, and a playhead cannot get past them.
+			//
+			// So the wait opens with real video off the encoder that is
+			// already draining — tables and a keyframe, primerFor long. Not
+			// synthesised, not a pre-roll: the encoder's own output. After
+			// that the filler is a gap in an established stream, which is the
+			// shape that is known to work.
+			if b := primeFrom(src, l.label); len(b) > 0 {
+				l.mu.Lock()
+				l.primer = b
+				l.mu.Unlock()
+			}
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
 			// No discontinuity marker. Playback detection does not mark — main.go
@@ -511,6 +535,18 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	if closed {
 		return 0, io.EOF
 	}
+	// The primer goes out before anything else: it is the picture the player
+	// anchors its time base on, and every NULL packet after it is then a gap
+	// in a stream it already understands.
+	l.mu.Lock()
+	if len(l.primer) > 0 {
+		n := copy(p, l.primer)
+		l.primer = l.primer[n:]
+		l.nulls += 0
+		l.mu.Unlock()
+		return n, nil
+	}
+	l.mu.Unlock()
 	// Pending bytes first, then the body: the clock hand-off leaves the gate's
 	// first release (tables and the keyframe) in pend and sets body at once, so
 	// draining pend before reading body keeps a large first chunk whole.
@@ -594,6 +630,39 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	case <-wait.C:
 	}
 	return l.emitNulls(p, burst)
+}
+
+// primerFor is how long a picture goes out in front of the wait, to give the
+// player a time base before the filler starts.
+const primerFor = 1500 * time.Millisecond
+
+// primeFrom reads the draining encoder until it has tables and a keyframe and
+// then a little beyond, and returns it. That is what the player anchors on.
+// A failure here costs nothing: the wait simply starts with filler, as before.
+func primeFrom(src io.ReadCloser, label string) []byte {
+	armed := make(chan struct{})
+	close(armed)
+	g := newGateReader(src, armed, true, time.Now(), nil)
+	var out []byte
+	buf := make([]byte, 64*1024)
+	deadline := time.Now().Add(primerFor)
+	for time.Now().Before(deadline) {
+		n, err := g.Read(buf)
+		if n > 0 {
+			b, _ := stripNulls(buf[:n])
+			out = append(out, b...)
+		}
+		if err != nil {
+			break
+		}
+		if n == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if len(out) > 0 {
+		logger("[HOLD] %s opened the wait with %s of picture, so the filler is a gap in a stream the player already has", label, byteCount(int64(len(out))))
+	}
+	return out
 }
 
 // stripNulls removes NULL packets from a buffer of transport stream, and says
