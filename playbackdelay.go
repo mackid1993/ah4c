@@ -25,31 +25,31 @@ var holdDelay time.Duration
 // holdMost is as long as a tune is held, whatever PLAYBACK_DELAY asks for.
 // Forty-five seconds is the longest hold watched land at the live edge; sixty
 // and ninety come in behind the guide and stay there. Why is not yet settled
-// — see serveNulls — so this is lifted to ten minutes only to test longer holds,
+// — see holdRate — so this is lifted to ten minutes only to test longer holds,
 // and is not a claim that they work. It is a guard against a typo, not a
 // measured limit. Put it back to forty-five if a real answer does not arrive.
 const holdMost = 10 * time.Minute
 
 const (
-	// nullFeedGap is how often a whole buffer of filler goes out. Detection
-	// serves one per stallReadGap because it is waiting on a pre-roll channel,
-	// not because half a second is the right rate; nothing measured says it is.
-	// Feeding the wait rather than rationing it is what moved the picture, so
-	// this goes further in the direction that moved it: a full 65.8 KB buffer
-	// every hundred milliseconds is about five megabits, the rate a real
-	// program would arrive at, instead of the half megabit detection happens
-	// to send. It is bounded on purpose — with no gap at all the filler would
-	// go out as fast as the DVR would read it, which is a recording of nothing
-	// growing at line rate.
-	nullFeedGap = 100 * time.Millisecond
-	// The wait's byte diet is gone — the filler goes out at detection's rate,
-	// which is a whole buffer per read gap. What the diet was guarding against
-	// is worth keeping in view: a DVR sits through about twenty seconds of a
-	// three kilobit trickle before concluding the stream has died, which is
-	// why a forty-five second hold worked and a sixty second one tuned again
-	// part way through. Serving whole buffers is further from that edge than
-	// the diet ever was, not closer, so the guard is met by having no diet.
-	//
+	// The wait's byte diet: volume through the DVR's detection window, then
+	// a keepalive. Every byte here is one the DVR stores ahead of the show.
+	nullPace  = 100 * time.Millisecond
+	nullBurst = 2 * tsPacketSize
+	// Volume while the DVR decides the body is a stream, a keepalive after:
+	// a trickle from the first byte starves it, and it gives up.
+	nullDetect = 6 * time.Second
+	nullIdle   = 500 * time.Millisecond
+	// A DVR decides the body is a stream, and then keeps deciding. The
+	// keepalive after nullDetect is three kilobits a second, and a DVR will
+	// sit through about twenty seconds of that before concluding the stream
+	// has died — which is why a forty-five second hold worked and a sixty
+	// second one tuned again part way through. So the volume comes back for
+	// nullBeatFor every nullBeat, and the thin stretch never runs longer than
+	// four seconds however long the hold is. Four rather than eleven because
+	// twenty-one seconds is one measurement on one box, and a DVR with less
+	// patience than that one should hold too.
+	nullBeat    = 5 * time.Second
+	nullBeatFor = 1 * time.Second
 	// How long the encoder's clock must stop outrunning the wall, and the
 	// most that may be spent or thrown away deciding.
 	liveEdgeSettle = 250 * time.Millisecond
@@ -144,7 +144,7 @@ func tuneHoldStartup() {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
-		logger("[HOLD] hold %v; the encoder is reopened %s into the program, %d time(s), %s apart", holdDelay, holdWords(refreshBase), refreshShedsFor(holdDelay), holdWords(refreshEvery))
+		logger("[HOLD] hold %v; the encoder is reopened %s into the program", holdDelay, holdWords(refreshAfterHold(holdDelay)))
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
 	case prerollTS != "":
@@ -223,6 +223,10 @@ type lateEncoder struct {
 	// the keyframe wait does not stall the player's clock.
 	opening atomic.Bool
 	handoff chan *handoffResult
+	// refresh is the encoder's one reopen. Its clock is started at the
+	// hand-off, not at the open: the encoder is now opened at tune start, and
+	// a shed spent during the wait is a shed the viewer never gets.
+	refresh *refreshSource
 
 	mu     sync.Mutex
 	body   io.ReadCloser
@@ -252,7 +256,81 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 	if l.preroll == nil && holdDelay > holdClockMinDelay {
 		l.clock = startHoldClock(url, label, l.until)
 	}
+	// Every part of this program that works keeps the encoder open and reads
+	// it for the whole time the DVR is waiting: the stall-tolerant reader
+	// fills gaps in a stream it is still reading, and playback detection opens
+	// the encoder at tune start and lets the gate drain it until the app is
+	// seen playing. Only this hold left the encoder shut and opened it cold at
+	// the end, and it is the only one with a ceiling. So it opens here now.
+	// A pre-roll hold is left exactly as it was — it is a different feature
+	// and it works.
+	if l.preroll == nil {
+		l.handoff = make(chan *handoffResult, 1)
+		go l.drainEarly()
+	}
 	return l
+}
+
+// drainEarly opens the encoder at tune start and reads it for the whole wait.
+// The gate discards everything it reads until the delay is up, so the DVR is
+// never sent the wait's video — it gets NULL packets, exactly as before — and
+// when the delay passes the gate releases a live keyframe. Nothing is opened
+// cold at the end, and the connection the program arrives on has been up and
+// flowing the entire time, which is the one thing this hold did not share with
+// the features that work.
+func (l *lateEncoder) drainEarly() {
+	var body io.ReadCloser
+	for {
+		l.mu.Lock()
+		closed := l.closed
+		l.mu.Unlock()
+		if closed {
+			return
+		}
+		resp, err := http.Get(l.url)
+		if err == nil && resp.StatusCode != 200 {
+			resp.Body.Close()
+			err = fmt.Errorf("status %s", resp.Status)
+		}
+		if err == nil {
+			l.refresh = l.refreshing(resp.Body)
+			// Timed: the gate arms itself when the delay is up and takes the
+			// first keyframe after it. Until then it reads and throws away.
+			gate := newGateReader(l.stallTolerant(l.refresh), nil, true, l.until, nil)
+			body = markDiscontinuity(maybeWrapCaptions(gate, l.tuner, l.name))
+			logger("[HOLD] %s encoder open and draining for the wait", l.label)
+			break
+		}
+		logger("[HOLD] %s encoder would not open for the wait (%v); trying again", l.label, err)
+		time.Sleep(time.Second)
+	}
+	// Read until the gate releases. It returns nothing while it is discarding
+	// and while it hunts the keyframe, so a zero-byte read is not the end.
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			l.handoff <- &handoffResult{first: append([]byte(nil), buf[:n]...), body: body}
+			return
+		}
+		if err != nil {
+			logger("[HOLD] %s the drained encoder ended before the hand-off: %v", l.label, err)
+			body.Close()
+			l.handoff <- nil
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// dietFrom is when this tune's body opened, which is when the DVR starts
+// deciding whether it has a stream: after the stretch held on 1xx when that
+// is in play, and at the request itself when it is not.
+func (l *lateEncoder) dietFrom() time.Time {
+	if prerollTS == "" && hintsWork.Load() {
+		return l.t0.Add(hintCeiling)
+	}
+	return l.t0
 }
 
 func (l *lateEncoder) Read(p []byte) (int, error) {
@@ -273,19 +351,47 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	if body != nil {
 		return body.Read(p)
 	}
-	if d := time.Until(l.until); d > 0 {
-		if l.preroll != nil {
+	if l.preroll != nil {
+		if d := time.Until(l.until); d > 0 {
 			return l.showPreroll(p, d)
 		}
-		if l.clock != nil && l.clock.ready.Load() {
-			return l.serveHoldClock(p, d)
-		}
-		return l.serveNulls(p, d)
+		return l.open(p)
 	}
-	if l.clock != nil && l.clock.ready.Load() {
-		return l.clockHandoff(p)
+	// The encoder has been open and draining since the tune. Take the release
+	// the moment it comes; NULL packets fill the wait until it does.
+	select {
+	case r := <-l.handoff:
+		return l.takeHandoff(p, r)
+	default:
 	}
-	return l.open(p)
+	return l.serveNulls(p, time.Until(l.until))
+}
+
+// takeHandoff swaps the filler for the released program and starts the
+// reopen's clock, which must run from here and not from the encoder's open.
+func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
+	if r == nil || r.body == nil {
+		return 0, io.EOF
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		r.body.Close()
+		return 0, io.EOF
+	}
+	l.body, l.pend = r.body, r.first
+	nulls := l.nulls
+	l.mu.Unlock()
+	if l.refresh != nil {
+		l.refresh.arm(time.Now().Add(refreshAfterHold(holdDelay)))
+	}
+	logger("[HOLD] %s hold %v, %s sent, program starts", l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls))
+	if len(l.pend) > 0 {
+		n := copy(p, l.pend)
+		l.pend = l.pend[n:]
+		return n, nil
+	}
+	return r.body.Read(p)
 }
 
 // clockHandoff opens and gates the encoder on a goroutine, and keeps the wait's
@@ -420,30 +526,18 @@ func (l *lateEncoder) showPreroll(p []byte, d time.Duration) (int, error) {
 	}
 }
 
-// serveNulls sends NULL packets the way playback detection sends them: whole
-// buffers, one per read gap, with no diet at all. Detection is the hold that
-// lands at the live edge, and its filler — holdReader.serveNulls in preroll.go
-// — fills the caller's buffer and returns. This hold metered instead: two
-// packets every hundred milliseconds through a six second window, then one
-// packet every half second, which is three kilobits into a socket the DVR is
-// waiting on, for over a minute of a ninety second hold.
-//
-// That diet was the last structural difference between the two holds, and the
-// only thing in what ah4c sends whose shape grew with the hold's length: the
-// count of thin stretches roughly tripled from forty-five seconds to ninety.
-// Everything after the hand-off is now measured live — the encoder hands over
-// at 0.0s ahead and the stream's pace holds the wall to within twenty
-// milliseconds for the whole watch — so what is left to explain the TV is what
-// the DVR was fed before the program started.
-//
-// Say what is assumed: that this is the difference is not proven, and the
-// mechanism is not known. What is known is that detection's shape works, that
-// this hold's shape is the one that does not, and that this is the difference.
+// serveNulls sends NULL packets on the byte diet: volume through the DVR's
+// detection window, a keepalive after. Every byte here is one the DVR stores
+// ahead of the show.
 func (l *lateEncoder) serveNulls(p []byte, d time.Duration) (int, error) {
-	if d <= 0 || d > nullFeedGap {
-		d = nullFeedGap
+	pace, burst := holdRate(time.Since(l.dietFrom()))
+	if d > pace || d <= 0 {
+		d = pace
 	}
 	time.Sleep(d)
+	if len(p) > burst {
+		p = p[:burst]
+	}
 	n := nullPackets(p)
 	l.mu.Lock()
 	l.nulls += int64(n)
@@ -463,7 +557,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	}
 	// http.Get, not a client with a Timeout: that field covers reading the
 	// body, so it breaks the stream by force at a moment nothing chose and
-	// leaves nothing able to decline. The break is wanted — see refreshBase —
+	// leaves nothing able to decline. The break is wanted — see refreshAfterHold —
 	// but it is made deliberately below, and made so it can fail safely.
 	resp, err := http.Get(l.url)
 	if err == nil && resp.StatusCode != 200 {
@@ -806,9 +900,19 @@ func holdOnHints(w http.ResponseWriter, src io.Reader, tuner, channel string) (*
 	return h, true
 }
 
-// holdRate, the wait's byte diet, lived here. It is gone: the filler now goes
-// out at playback detection's rate, which is no rate at all — see serveNulls.
-// `git show 841ff2f:playbackdelay.go` has it if the diet has to come back.
+// holdRate is how fast filler goes out, given how long the DVR has had a body
+// to look at. Volume while it is deciding it has a stream, a keepalive after,
+// and volume again for a moment every nullBeat so it goes on deciding that.
+// Kept as its own function so the shape can be checked without a DVR.
+func holdRate(since time.Duration) (time.Duration, int) {
+	if since <= nullDetect {
+		return nullPace, nullBurst
+	}
+	if (since-nullDetect)%nullBeat < nullBeatFor {
+		return nullPace, nullBurst
+	}
+	return nullIdle, tsPacketSize
+}
 
 // stallTolerant wraps the encoder in the stall reader whether or not
 // NULL_FRAME_INSERTION is switched on. A held tune is opened on a client that
@@ -830,32 +934,35 @@ func (l *lateEncoder) stallTolerant(body io.ReadCloser) io.ReadCloser {
 	}, l.label)
 }
 
-// The reopen is the only thing here that sheds what the player has stored
-// ahead of the show. A forty-five second hold sheds once, twenty seconds into
-// the program, and lands at the live edge — so twenty seconds is the one shed
-// point in this program that is actually watched working, and it is used at
-// every length rather than scaled. Scaling it was tried tonight: twenty,
-// thirty and forty at ninety, and all three came back behind.
-//
-// What was never tried is shedding more than once. If one shed is not enough
-// at ninety, the answer is not a different moment for the one — it is another
-// shed, and another. A hold no longer than refreshPer keeps the single shed it
-// is known to work with and is not experimented on; a longer hold gets
-// refreshMore of them, refreshEvery apart.
+// The reopen's timing is measured, not chosen: at a ninety second hold, five
+// seconds into the program left the viewer five seconds behind; fifteen,
+// twenty-seven and thirty all landed at the live edge. What twenty does at
+// ninety was never on that list, and every build that went back to a flat
+// twenty has come back behind — the shed has to fall outside whatever the
+// player is still doing with the program it just acquired. refreshBase is what
+// every hold up to refreshPer was watched with; past that the point scales
+// with the hold, never above refreshMost, the longest point watched working.
 const (
-	refreshBase  = 20 * time.Second
-	refreshPer   = 45 * time.Second
-	refreshEvery = 15 * time.Second
-	refreshMore  = 4
+	refreshBase = 20 * time.Second
+	refreshPer  = 45 * time.Second
+	refreshMost = 30 * time.Second
 )
 
-// refreshShedsFor is how many times the encoder is reopened, for a hold of the
-// given length. Its own function so the schedule can be read without a DVR.
-func refreshShedsFor(hold time.Duration) int {
+// refreshAfterHold is how long after the program starts the encoder is
+// reopened, for a hold of the given length. Its own function so the arithmetic
+// can be checked without a DVR: twenty seconds at forty-five or under, thirty
+// at ninety or longer.
+func refreshAfterHold(hold time.Duration) time.Duration {
 	if hold <= refreshPer {
-		return 1
+		return refreshBase
 	}
-	return refreshMore
+	// Through float64: a Duration is nanoseconds, and nanoseconds times
+	// nanoseconds overflows int64 for any hold longer than nine seconds.
+	d := time.Duration(float64(hold) * float64(refreshBase) / float64(refreshPer))
+	if d > refreshMost {
+		d = refreshMost
+	}
+	return d
 }
 
 // refreshing reopens the encoder once, shortly after the programme starts, and
@@ -863,8 +970,8 @@ func refreshShedsFor(hold time.Duration) int {
 // one is closed, so an encoder that refuses a second reader — and some do,
 // while a tuner owns the stream — costs nothing at all: the refresh is declined,
 // said so once, and never tried again for this tune.
-func (l *lateEncoder) refreshing(body io.ReadCloser) io.ReadCloser {
-	return &refreshSource{ReadCloser: body, at: time.Now().Add(refreshBase), times: refreshShedsFor(holdDelay), label: l.label, open: func() (io.ReadCloser, error) {
+func (l *lateEncoder) refreshing(body io.ReadCloser) *refreshSource {
+	return &refreshSource{ReadCloser: body, label: l.label, open: func() (io.ReadCloser, error) {
 		r, e := http.Get(l.url)
 		if e != nil {
 			return nil, e
@@ -877,31 +984,32 @@ func (l *lateEncoder) refreshing(body io.ReadCloser) io.ReadCloser {
 	}}
 }
 
-// Each shed opens the new connection before closing the old, so an encoder
-// that will not take a second reader costs nothing and the next attempt still
-// comes. A shed that fails no longer ends them: the clock moves to the next.
-//
 type refreshSource struct {
 	io.ReadCloser
-	open  func() (io.ReadCloser, error)
-	at    time.Time
-	done  int
-	times int
+	open func() (io.ReadCloser, error)
+	// at is when the shed is due, as unix nanoseconds; zero until armed. It is
+	// written by the DVR's goroutine at the hand-off and read by the drain's,
+	// so it is atomic rather than a plain time.
+	at    atomic.Int64
+	done  bool
 	label string
 }
 
+// arm starts the shed's clock. Until this is called there is no shed, so a
+// connection opened at tune start does not spend it during the wait.
+func (r *refreshSource) arm(at time.Time) { r.at.Store(at.UnixNano()) }
+
 func (r *refreshSource) Read(p []byte) (int, error) {
-	if r.done < r.times && !time.Now().Before(r.at) {
-		r.done++
-		r.at = time.Now().Add(refreshEvery)
+	if at := r.at.Load(); !r.done && at != 0 && time.Now().UnixNano() >= at {
+		r.done = true
 		fresh, err := r.open()
 		if err != nil {
-			logger("[HOLD] %s the encoder would not open again (%v); the stream is left as it is, and the next shed still comes", r.label, err)
+			logger("[HOLD] %s the encoder would not open a second time (%v); leaving the stream as it is", r.label, err)
 		} else {
 			old := r.ReadCloser
 			r.ReadCloser = fresh
 			old.Close()
-			logger("[HOLD] %s reopened the encoder (%d of %d), dropping what the DVR had stored ahead of the show", r.label, r.done, r.times)
+			logger("[HOLD] %s reopened the encoder, dropping what the DVR had stored ahead of the show", r.label)
 		}
 	}
 	return r.ReadCloser.Read(p)
