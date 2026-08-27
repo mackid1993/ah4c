@@ -1,8 +1,11 @@
 package main
 
-// PLAYBACK_DELAY: hold a tune, opening the encoder when the delay is up so the
-// DVR gets a session that starts when the viewer does. The hold itself, the
-// 1xx window that fronts it, and the discontinuity marker that ends it.
+// PLAYBACK_DELAY: hold a tune, handing the program over when the delay is up
+// so the DVR gets a session that starts when the viewer does. Everything the
+// feature is lives here: the hold itself, the 1xx window that fronts it, the
+// discontinuity marker that ends it, the black clip that fills the wait, the
+// cap on the DVR socket's send buffer, and the instrument that times the
+// writes into it.
 
 import (
 	"bufio"
@@ -251,13 +254,8 @@ type lateEncoder struct {
 	tuner int
 	name  string
 
-	// clock keeps a program and PCR alive through a long wait, so the player
-	// does not re-acquire at the hand-off. nil for short waits and pre-rolls.
-	clock *holdClock
-	// opening and handoff drive the clock hand-off: the encoder is opened and
-	// gated to a keyframe on a goroutine while the clock keeps emitting PCR, so
-	// the keyframe wait does not stall the player's clock.
-	opening atomic.Bool
+	// handoff carries the gated encoder from the goroutine that has been
+	// draining it through the wait to the read that is serving the DVR.
 	handoff chan *handoffResult
 	// refresh is the encoder's one reopen. Its clock is started at the
 	// hand-off, not at the open: the encoder is now opened at tune start, and
@@ -339,12 +337,6 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 		l.preroll.adopted.Store(true)
 	} else {
 		l.preroll = startPreroll(label)
-	}
-	// A long wait runs the encoder's own program so the player keeps its
-	// clock; a short one is already at the live edge on NULL packets, and a
-	// pre-roll fills the wait itself.
-	if l.preroll == nil && holdDelay > holdClockMinDelay {
-		l.clock = startHoldClock(url, label, l.until)
 	}
 	// Every part of this program that works keeps the encoder open and reads
 	// it for the whole time the DVR is waiting: the stall-tolerant reader
@@ -641,7 +633,7 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	// case the clip dies, and its expiry is a real fault worth the fallback.
 	l.mu.Lock()
 	black := l.black
-	if black != nil && time.Since(l.t0) > blackFor {
+	if black != nil && time.Since(l.t0) > blackForHold(holdDelay) {
 		// Long enough. The player has a picture and a time base now, and
 		// everything after this is a gap in a stream it already understands —
 		// which is the shape a ninety second encoder reboot already proves
@@ -650,7 +642,7 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 		// have already done.
 		black.stop()
 		l.black, black = nil, nil
-		logger("[BLACK] %s played %v of black; the rest of the wait is NULL packets", l.label, blackFor)
+		logger("[BLACK] %s played %v of black; the rest of the wait is NULL packets", l.label, blackForHold(holdDelay))
 	}
 	l.mu.Unlock()
 	if black != nil && d < blackPatience {
@@ -685,11 +677,34 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 // player a time base before the filler starts.
 const primerFor = 1500 * time.Millisecond
 
-// blackFor is how long black plays at the start of a wait. It is there to give
+// blackForHold is how long black plays at the start of a wait of the given
+// length. A third of the hold, never more than blackMost and never less than
+// blackLeast — a fixed five seconds would run past the mark on a hold shorter
+// than that, and a hold can be as short as a person likes. The floor is two
+// keyframes of the clip, which is what a player needs to have a picture and a
+// time base at all; below that there is no point sending any.
+func blackForHold(hold time.Duration) time.Duration {
+	d := hold / 3
+	if d > blackMost {
+		d = blackMost
+	}
+	if d < blackLeast {
+		if hold < blackLeast {
+			return 0
+		}
+		d = blackLeast
+	}
+	return d
+}
+
+// blackMost and blackLeast bound it. blackFor is how long black plays at the start of a wait. It is there to give
 // the player a picture and a time base before any filler, not to fill the
 // whole hold: at a broadcast bitrate a ninety second wait of black is sixty
 // odd megabytes, to do a job the first few seconds have already done.
-const blackFor = 5 * time.Second
+const (
+	blackMost  = 5 * time.Second
+	blackLeast = time.Second
+)
 
 // blackPatience is how long the wait will hold out for the black clip's next
 // frames before falling back to NULL packets. Long enough that a real-time
@@ -803,111 +818,6 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 		return n, nil
 	}
 	return body.Read(p)
-}
-
-// clockHandoff opens and gates the encoder on a goroutine, and keeps the wait's
-// clock running until it is ready, so the keyframe wait bridges on PCR rather
-// than stalling the player's clock. The gate still starts the program on a
-// keyframe, so the picture is clean; the clock is continuous, so there is no
-// discontinuity to mark.
-func (l *lateEncoder) clockHandoff(p []byte) (int, error) {
-	if l.opening.CompareAndSwap(false, true) {
-		l.handoff = make(chan *handoffResult, 1)
-		go l.prepareHandoff()
-	}
-	select {
-	case r := <-l.handoff:
-		if r == nil || r.body == nil {
-			return 0, io.EOF
-		}
-		l.mu.Lock()
-		if l.closed {
-			l.mu.Unlock()
-			r.body.Close()
-			return 0, io.EOF
-		}
-		l.body = l.watchEgress(r.body)
-		l.pend = r.first
-		nulls := l.nulls
-		l.mu.Unlock()
-		if pts, ok := firstVideoPTS(r.first); ok {
-			clockPTS := l.clock.pcrNow() / 300 // 27 MHz -> 90 kHz
-			behindMs := (float64(clockPTS) - float64(pts)) / 90.0
-			logger("[HOLD] %s seam: first picture is %.0fms from the clock's live edge", l.label, behindMs)
-		} else {
-			// The one instrument that compares the picture to a clock must not be
-			// silent: say so, once per hand-off, with the size it had to work with.
-			logger("[HOLD] %s seam: no video PTS found in the gate's first release (%s)", l.label, byteCount(int64(len(r.first))))
-		}
-		logger("[HOLD] %s hold %v, %s sent, program starts on the wait's clock",
-			l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls))
-		if len(l.pend) > 0 {
-			n := copy(p, l.pend)
-			l.pend = l.pend[n:]
-			return n, nil
-		}
-		return r.body.Read(p)
-	default:
-		// Not ready: keep the clock alive so the player does not stall waiting.
-		return l.serveHoldClock(p, 0)
-	}
-}
-
-// prepareHandoff opens the encoder, gates it to a keyframe, and primes past
-// the gate's keyframe wait here on its own goroutine — so that wait costs the
-// player's clock nothing, because the main path keeps emitting PCR until this
-// returns. It reports the gated body and the first bytes the gate released.
-func (l *lateEncoder) prepareHandoff() {
-	resp, err := http.Get(l.url)
-	if err == nil && resp.StatusCode != 200 {
-		resp.Body.Close()
-		err = fmt.Errorf("status %s", resp.Status)
-	}
-	if err != nil {
-		logger("[HOLD] %s encoder would not open after the hold: %v", l.label, err)
-		l.handoff <- nil
-		return
-	}
-	// Re-anchor the wait's clock to the encoder's true live PCR here, at the
-	// hand-off, instead of leaving it on a probe taken tens of seconds ago —
-	// liveEdge has just drained this fresh connection to the live edge and read
-	// its PCR (33-bit, 90 kHz; the clock is 27 MHz, so ×300).
-	if live, ok := liveEdge(resp.Body, l.label); ok {
-		l.clock.reanchor(live * 300)
-	}
-	armed := make(chan struct{})
-	close(armed)
-	// The gate starts on a keyframe so the picture is clean, and is given the
-	// clock so it releases only on a keyframe at the live edge — measured at
-	// three milliseconds from it. The discontinuity indicator is then marked on
-	// that keyframe: it is a clean entry point at the live edge, and the marker
-	// is what tells the player to flush and re-anchor to it rather than stay a
-	// buffer's length behind on the clock it was riding. It landed the player
-	// behind when the keyframe was not yet at the live edge; now that it is,
-	// the flush lands there.
-	gate := newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil)
-	gate.bridge = l.clock
-	body := markDiscontinuity(maybeWrapCaptions(gate, l.tuner, l.name))
-	// Read until the gate releases the keyframe. A zero-byte read is not the
-	// end — the gate returns nothing while it is still hunting the keyframe, so
-	// it is retried, not treated as a dead encoder. Only a real error ends it.
-	buf := make([]byte, 64*1024)
-	var n int
-	var rerr error
-	for {
-		n, rerr = body.Read(buf)
-		if n > 0 || rerr != nil {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if n <= 0 {
-		logger("[HOLD] %s encoder produced nothing after the hold: %v", l.label, rerr)
-		body.Close()
-		l.handoff <- nil
-		return
-	}
-	l.handoff <- &handoffResult{first: append([]byte(nil), buf[:n]...), body: body}
 }
 
 // showPreroll passes the pre-roll on for what is left of the delay. The delay
@@ -1043,8 +953,7 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 	// Wrapping the hold hands the caption engine the pre-roll to work on and
 	// lets it rewrite the pre-roll's own video packets on the way past.
 	// A NULL hold carried no PCR, so the jump to the program's clock is a real
-	// discontinuity to declare, and the gate starts it on a keyframe. A clock
-	// hold does not come here — it hands off through clockHandoff.
+	// discontinuity to declare, and the gate starts it on a keyframe.
 	// Armed here and now: this path opens the encoder at the hand-off, so the
 	// hand-off is this moment. refreshing hands back an unarmed source because
 	// the drained path opens at the tune and must not spend its shed during
