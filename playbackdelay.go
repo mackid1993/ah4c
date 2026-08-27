@@ -25,8 +25,14 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// holdDelay is the playback delay as parsed at startup; zero when unset.
-var holdDelay time.Duration
+// holdDelay is the playback delay as parsed at startup; zero when unset. It is
+// the length of the NULL-packet wait, which is what the user asked for less the
+// black that bookends it — holdAsked is what they actually set, kept for the
+// log so the two can be told apart.
+var (
+	holdDelay time.Duration
+	holdAsked time.Duration
+)
 
 // holdMost is as long as a tune is held, whatever PLAYBACK_DELAY asks for.
 // Forty-five seconds is the longest hold watched land at the live edge; sixty
@@ -168,6 +174,7 @@ func tuneHoldStartup() {
 			logger("[HOLD] PLAYBACK_DELAY %q %v; tunes are not being held", s, err)
 		} else {
 			holdDelay = d
+			holdAsked = d
 			if holdDelay > holdMost {
 				logger("[HOLD] PLAYBACK_DELAY %s is longer than %s, which is as long as this build will hold a tune; holding for %s",
 					holdWords(holdDelay), holdWords(holdMost), holdWords(holdMost))
@@ -177,6 +184,20 @@ func tuneHoldStartup() {
 	}
 	prerollStartup()
 	blackStartup()
+	// The bookend's black is stream the DVR keeps, so it is part of the wait
+	// rather than something added to it: a ninety second setting stays a
+	// ninety second hold, of which one second is black. Taken off after
+	// blackStartup, because a container that could not make the clip is not
+	// paying for it.
+	if holdDelay > 0 && len(blackPool) > 0 {
+		if holdDelay > blackCosts {
+			holdDelay -= blackCosts
+		} else {
+			logger("[HOLD] PLAYBACK_DELAY %s is shorter than the %s of black that bookends a wait, so the wait itself is nothing and the tune is only the black",
+				holdWords(holdAsked), blackWords(blackCosts))
+			holdDelay = time.Millisecond
+		}
+	}
 	detect := strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE")
 	if holdDelay > 0 && detect {
 		logger("[HOLD] PLAYBACK_DELAY is set, so PLAYBACK_DETECTION does not run: the delay decides when the program starts")
@@ -185,7 +206,8 @@ func tuneHoldStartup() {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
-		logger("[HOLD] hold %v; the wait is NULL packets and the picture follows %s of black", holdDelay, blackWords(blackSeamFor))
+		logger("[HOLD] hold %s: %s of black, %s of NULL packets, then %s of black and the picture",
+			holdWords(holdAsked), blackWords(blackHeadFor), holdWords(holdDelay), blackWords(blackSeamFor))
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
 	case prerollTS != "":
@@ -286,6 +308,8 @@ type lateEncoder struct {
 	body   io.ReadCloser
 	closed bool
 	nulls  int64
+	// head is the black sent at the front of the wait, before any filler.
+	head int64
 	// stall is the drained path's stall reader, kept so the hand-off and the
 	// pace watcher can say how deep its queue stands instead of leaving the
 	// depth to be inferred from drop events. nil on the pre-roll path, which
@@ -337,6 +361,19 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 		}
 	}
 	l := &lateEncoder{url: url, label: label, t0: t0, until: until, preroll: early, tuner: tuner, name: name}
+	// Black at the head of the wait, before a single NULL packet. Read drains
+	// pend before anything else, so this is literally the first thing the DVR
+	// is sent for this tune.
+	//
+	// The seam's black fixed the picture and the user's next words were "it
+	// left nulls at the beginning". Same fault, other end: NULL packets carry
+	// no frame, and at the head of a recording there is nothing in front of
+	// them either. A pre-roll fills the wait with its own picture and needs
+	// none of this, which is also when blackPool is nil.
+	if until.After(t0) && len(blackPool) > 0 {
+		l.pend = append([]byte(nil), blackPool...)
+		l.head = int64(len(blackPool))
+	}
 	if l.preroll != nil {
 		l.preroll.adopted.Store(true)
 	} else {
@@ -773,8 +810,8 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// didn't see any lines about it creating black frames". Once per tune.
 	if blk := blackPool; len(blk) > 0 {
 		first = append(append([]byte(nil), blk...), first...)
-		logger("[BLACK] %s %s of black went out at the seam, immediately in front of the picture, against %s of NULL packets in the wait",
-			l.label, byteCount(int64(len(blk))), byteCount(l.nulls))
+		logger("[BLACK] %s the wait went out bookended: %s of black at the head, %s of NULL packets, %s of black at the seam and then the picture",
+			l.label, byteCount(l.head), byteCount(l.nulls), byteCount(int64(len(blk))))
 	} else {
 		logger("[BLACK] %s no black went out, so the picture follows the wait directly", l.label)
 	}
@@ -1493,21 +1530,43 @@ func (r *refreshSource) Read(p []byte) (int, error) {
 // two, and it is real video: frames with timestamps, keyframes a scrubber can
 // land on, and a time base the player carries into the programme.
 //
-// blackSeamFor is the magic number and is still being found. Two lengths have
-// been watched and neither moved the picture: one frame, which is thirty-three
-// milliseconds and which the user could not see at all, and one TS packet,
-// which cannot hold a coded picture and so showed nothing. Half a second is
-// about fifteen frames — enough for MPV to decode, anchor a time base and have
-// keyframes to seek to, and short enough that what lands in a recording in
-// front of the show is not worth noticing.
+// blackSeamFor is the magic number and it has been found. Half a second of
+// black immediately in front of the picture put a ninety second hold at the
+// live edge, with the timeline where it belongs and fast forward working —
+// after a night in which nothing else did. Two shorter lengths were watched
+// first and neither moved anything: one frame, thirty-three milliseconds,
+// which the user could not see at all; and one TS packet, which cannot hold a
+// coded picture and so showed nothing. Half a second is about fifteen frames,
+// with a keyframe twice a second for a scrubber to land on.
 //
-// It is a constant, not a setting. This is one number being searched for, and
-// once it is found it is the answer for everyone; an environment variable would
-// ship the search instead of the result.
-const blackSeamFor = 500 * time.Millisecond
+// blackHeadFor is the same again at the other end. The seam fixed the picture
+// and left NULL packets at the head of the recording, where the same argument
+// applies for the same reason: they are the first thing in the file and there
+// is no frame in front of them either. So the wait is bookended.
+//
+// Constants, not settings. These numbers were being searched for and they are
+// the answer for everyone; an environment variable would ship the search.
+const (
+	blackSeamFor = 500 * time.Millisecond
+	blackHeadFor = 500 * time.Millisecond
+	// blackCosts is what the bookend adds to a wait, and is taken back off
+	// PLAYBACK_DELAY so a hold lasts what the user asked it to. Without this a
+	// ninety second setting is a ninety-one second hold, which is a setting
+	// that quietly means something else.
+	blackCosts = blackHeadFor + blackSeamFor
+)
 
 // blackPool is the black as a transport stream, or nil if it could not be made.
-// It is exactly blackSeamFor long, and all of it goes out at the seam.
+// It is exactly blackSeamFor long and goes out whole, at both ends of the wait.
+//
+// One clip, used twice, so its timestamps run 0 to half a second at the head
+// and again at the seam. Between them are ninety seconds of NULL packets, which
+// carry no clock at all, and after them the programme arrives on the encoder's
+// own base — a jump that is already there in the build that works. A second
+// jump of the same kind is very likely tolerated the same way; if it is not,
+// giving the seam copy an -output_ts_offset is the one-line answer. Said rather
+// than assumed: the seam half is byte for byte what was watched working, and
+// this leaves it that way.
 var blackPool []byte
 
 // blackStartup makes it once, before the listener binds, where nothing can be
