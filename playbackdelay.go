@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -306,6 +307,9 @@ type lateEncoder struct {
 	body   io.ReadCloser
 	closed bool
 	nulls  int64
+	// sent is every byte handed to the DVR, so a hand-off can tell whether the
+	// filler stopped on a packet boundary. See finishFiller.
+	sent int64
 	// stall is the drained path's stall reader, kept so the hand-off and the
 	// pace watcher can say how deep its queue stands instead of leaving the
 	// depth to be inferred from drop events. nil on the pre-roll path, which
@@ -560,6 +564,9 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	if len(l.pend) > 0 {
 		n := copy(p, l.pend)
 		l.pend = l.pend[n:]
+		l.mu.Lock()
+		l.sent += int64(n)
+		l.mu.Unlock()
 		return n, nil
 	}
 	if body != nil {
@@ -744,7 +751,10 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	} else {
 		logger("[BLACK] %s no black went out, so the picture follows the wait directly", l.label)
 	}
-	l.body, l.pend = r.body, first
+	l.body = r.body
+	l.pend = nil
+	l.finishFiller()
+	l.pend = append(l.pend, first...)
 	body := l.body
 	nulls := l.nulls
 	l.mu.Unlock()
@@ -776,6 +786,9 @@ func (l *lateEncoder) showPreroll(p []byte, d time.Duration) (int, error) {
 		l.pend = append(l.pend, data...)
 		n := copy(p, l.pend)
 		l.pend = l.pend[n:]
+		l.mu.Lock()
+		l.sent += int64(n)
+		l.mu.Unlock()
 		return n, nil
 	case <-time.After(gap):
 		if time.Until(l.until) <= 0 {
@@ -833,12 +846,38 @@ func (l *lateEncoder) emitNulls(p []byte, burst int) (int, error) {
 	n := nullPackets(p)
 	l.mu.Lock()
 	l.nulls += int64(n)
+	l.sent += int64(n)
 	closed := l.closed
 	l.mu.Unlock()
 	if closed {
 		return 0, io.EOF
 	}
 	return n, nil
+}
+
+// finishFiller completes the wait on a packet boundary before the program is
+// handed over. The caller holds l.mu.
+//
+// A pre-roll is read from ffmpeg's pipe in whatever sizes the pipe gives, and
+// stopping it cuts wherever it had got to — measured at 132 bytes into a packet
+// on a real tune. Appending the program to that fragment leaves everything
+// after it out of step for the rest of the stream. A demuxer on its own
+// resyncs and loses a frame, which is why this went unseen for so long;
+// anything downstream that carves packets at fixed offsets does far worse.
+//
+// The same rule is in holdReader for playback detection. Both need it, because
+// a pre-roll routes around drainEarly entirely — which is how four separate
+// faults have already reached only the people setting PREROLL_TS.
+func (l *lateEncoder) finishFiller() {
+	k := (l.sent + int64(len(l.pend))) % tsPacketSize
+	if k == 0 {
+		return
+	}
+	if int64(len(l.pend)) >= k {
+		l.pend = l.pend[:int64(len(l.pend))-k]
+		return
+	}
+	l.pend = append(l.pend, bytes.Repeat([]byte{0xFF}, int(tsPacketSize-k))...)
 }
 
 func (l *lateEncoder) open(p []byte) (int, error) {
@@ -896,9 +935,16 @@ func (l *lateEncoder) open(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	l.body = body
+	l.finishFiller()
 	nulls := l.nulls
+	pend := len(l.pend) > 0
 	l.mu.Unlock()
 	logger("[HOLD] %s hold %v, %s sent, program starts", l.label, time.Since(l.t0).Round(time.Millisecond), byteCount(nulls+preroll))
+	if pend {
+		// Whatever finishFiller left goes out first; Read drains pend before
+		// it touches body.
+		return l.Read(p)
+	}
 	return body.Read(p)
 }
 
@@ -1250,7 +1296,6 @@ func blackWords(d time.Duration) string {
 	}
 	return holdWords(d)
 }
-
 
 // dvrSendBuffer is how many bytes the kernel may hold for the DVR. At a
 // broadcast bitrate this is a couple of hundred milliseconds — enough that a
