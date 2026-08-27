@@ -144,15 +144,11 @@ func tuneHoldStartup() {
 	// ninety second hold, of which one second is black. Taken off after
 	// blackStartup, because a container that could not make the clip is not
 	// paying for it.
-	if holdDelay > 0 && len(blackPool) > 0 {
-		if holdDelay > blackCosts {
-			holdDelay -= blackCosts
-		} else {
-			logger("[HOLD] PLAYBACK_DELAY %s is shorter than the %s of black in front of the picture, so the wait itself is nothing and the tune is only the black",
-				holdWords(holdAsked), blackWords(blackCosts))
-			holdDelay = time.Millisecond
-		}
-	}
+	// No subtraction. The black runway is the last stretch of the wait, not
+	// something added after it, so the program still starts at exactly
+	// PLAYBACK_DELAY. The wait is (delay - runway) of NULL packets and then
+	// the runway of black; when the delay is shorter than the runway the whole
+	// wait is black, which is fine — a short hold wants a picture the sooner.
 	detect := strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE")
 	if holdDelay > 0 && detect {
 		logger("[HOLD] PLAYBACK_DELAY is set, so PLAYBACK_DETECTION does not run: the delay decides when the program starts")
@@ -161,8 +157,12 @@ func tuneHoldStartup() {
 	case holdDelay > 0 && prerollTS != "":
 		logger("[HOLD] hold %v with the pre-roll", holdDelay)
 	case holdDelay > 0:
-		logger("[HOLD] hold %s: %s of NULL packets, then %s of black and the picture",
-			holdWords(holdAsked), holdWords(holdDelay), blackWords(blackSeamFor))
+		nullFor := holdDelay - blackRunway
+		if nullFor < 0 {
+			nullFor = 0
+		}
+		logger("[HOLD] hold %s: %s of NULL packets, then %s of black streamed to the live edge, then the picture",
+			holdWords(holdAsked), holdWords(nullFor), holdWords(blackRunway))
 	case detect && prerollTS != "":
 		logger("[HOLD] pre-roll shows while playback detection holds a tune")
 	case prerollTS != "":
@@ -242,6 +242,8 @@ type lateEncoder struct {
 	// while the mark is ahead and sleeps at most that long, so the mark could
 	// never have passed inside it.
 	prerollDead bool
+	// blackPos is how far into the runway clip has been served this tune.
+	blackPos int
 	// channel is what heldRecently is keyed by. name is the caption engine's
 	// label and is per tuner, which is not the same thing at all.
 	channel string
@@ -614,38 +616,19 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 	// died — the diet's own keepalive leaves it in a three kilobit trickle for
 	// four seconds at a time — so a few seconds of nothing at the very end,
 	// with a program arriving at the end of it, is well inside what it takes.
-	if left <= quietBeforeMark {
-		// Measured from the MARK, not from entering the quiet. The first go at
-		// this timed keyframeQuiet from whenever the quiet began, which is
-		// quietBeforeMark early, so it expired a second before the mark and
-		// started filling again — putting NULL packets back exactly where they
-		// were being removed from. The log said so: "no keyframe within 3s of
-		// the mark" printed one second before the mark arrived.
-		quietFor := time.Until(l.until.Add(keyframeQuiet))
-		if quietFor <= 0 {
-			quietFor = time.Millisecond
-		}
+	if left <= blackRunway && len(blackPool) > 0 {
+		// Real black, streamed at real time, for the last blackRunway of the
+		// wait and on through the keyframe hunt until the hand-off arrives.
+		// This is the clock: NULL packets carry none, and the black's own
+		// advancing timestamps give the player a live-edge time base before
+		// the program. The select also watches the hand-off, so the program
+		// still cuts in the instant the gate has its keyframe.
 		select {
 		case r := <-l.handoff:
 			return l.takeHandoff(p, r)
-		case <-time.After(quietFor):
-			if !l.quietSaid.Swap(true) {
-				logger("[HOLD] %s no keyframe within %v of the mark; filling again so the DVR does not give up", l.label, keyframeQuiet)
-			}
-			// On the diet, not flat out. quietFor floors at a millisecond and
-			// every read after the quiet expires re-enters this branch, so
-			// returning a burst straight away filled at a megabit and a
-			// quarter — a hundred and sixty-eight times the diet — and every
-			// byte of it lands directly in front of the picture, which is the
-			// one thing the quiet exists to prevent.
-			d, burst := l.nullPace(left)
-			select {
-			case r := <-l.handoff:
-				return l.takeHandoff(p, r)
-			case <-time.After(d):
-			}
-			return l.emitNulls(p, burst)
+		case <-time.After(blackTick):
 		}
+		return l.serveBlack(p)
 	}
 	d, burst := l.nullPace(left)
 	// No lock held across this select. There was one — a leftover from the
@@ -757,13 +740,10 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// Black only when NULL packets filled the wait. A pre-roll has been a time
 	// base for the whole wait and is its own stream; the program starts on its
 	// own decoder and needs nothing in front of it.
-	if blk := blackPool; len(blk) > 0 && l.preroll == nil {
-		first = append(append([]byte(nil), blk...), first...)
-		logger("[BLACK] %s %s of black went out at the seam, immediately in front of the picture, against %s of NULL packets in the wait",
-			l.label, byteCount(int64(len(blk))), byteCount(l.nulls))
-	} else {
-		logger("[BLACK] %s no black went out, so the picture follows the wait directly", l.label)
-	}
+	// No black prepended here. On the NULL path it was streamed as the
+	// runway at the end of the wait; a pre-roll is its own picture and needs
+	// none. What reaches the DVR in front of the program is already a real
+	// clock, not a burst.
 	// Whatever pre-roll is still in pend goes out first; it is whole packets
 	// from the pump, so finishFiller has nothing to trim on that path.
 	l.body = r.body
@@ -1189,11 +1169,23 @@ func (l *lateEncoder) stallTolerant(body io.ReadCloser) *stallTolerantReader {
 // the answer for everyone; an environment variable would ship the search.
 const (
 	blackSeamFor = 500 * time.Millisecond
-	// blackCosts is what the black adds to a wait, and is taken back off
-	// PLAYBACK_DELAY so a hold lasts what the user asked it to. Without this a
-	// ninety second setting is a ninety and a half second hold, which is a
-	// setting that quietly means something else.
-	blackCosts = blackSeamFor
+	// blackRunway is how long real black plays, streamed at real time, at the
+	// END of the wait — the last stretch before the program. NULL packets
+	// carry no timestamps, so a wait of nothing but NULLs gives the player no
+	// clock, and half a second of black delivered as a burst at the hand-off
+	// gave it no runway to lock one either: at ninety seconds it squeaked by,
+	// at five minutes the picture landed behind the guide. Streamed for a few
+	// seconds, the black's own advancing timestamps pull the player's clock to
+	// the live edge before the program arrives. It comes out of the wait, not
+	// on top of it: PLAYBACK_DELAY is still the whole time to the program.
+	blackRunway = 5 * time.Second
+	// blackClip is how long a clip is made and paced against. Longer than the
+	// runway plus the keyframe hunt, so the black never loops back to its own
+	// start — a loop would step its clock and cost a re-anchor at the seam.
+	blackClip = blackRunway + keyframeQuiet + 4*time.Second
+	// blackTick is how often a slice of the runway goes out. The select that
+	// waits it also watches the hand-off, so the program still cuts in at once.
+	blackTick = 40 * time.Millisecond
 )
 
 // blackPool is the black as a transport stream, made with fillerEncodeArgs so
@@ -1222,22 +1214,22 @@ func blackStartup() {
 		// hand-off on that build. Checked in the container with the real
 		// value this time, not a hand-typed one.
 		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%s:r=%d", strings.ReplaceAll(prerollFrame, ":", "x"), rate),
-		"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds())}
+		"-t", fmt.Sprintf("%.3f", blackClip.Seconds())}
 	args = append(args, fillerEncodeArgs(rate)...)
 	args = append(args, fillerPIDArgs()...)
 	args = append(args, "-f", "mpegts", at)
 	if out, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
-		logger("[BLACK] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
+		logger("[BLACKFRAMES] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
 		return
 	}
 	b, err := os.ReadFile(at)
 	if err != nil || len(b) < tsPacketSize {
-		logger("[BLACK] the black came out empty; hand-offs go out as they did before")
+		logger("[BLACKFRAMES] the black came out empty; hand-offs go out as they did before")
 		return
 	}
 	blackPool = b[:len(b)/tsPacketSize*tsPacketSize]
-	logger("[BLACK] made %s of black at %d pictures a second, %s, to go in front of the picture at the hand-off",
-		blackWords(blackSeamFor), rate, byteCount(int64(len(blackPool))))
+	logger("[BLACKFRAMES] made %s of black at %d pictures a second, %s, to stream at the end of the wait; the runway is %s",
+		blackWords(blackClip), rate, byteCount(int64(len(blackPool))), blackWords(blackRunway))
 }
 
 // blackWords says a black length. Not holdWords: that rounds to the second, so
@@ -1312,3 +1304,36 @@ func serveLive(r *gin.Engine, addr string) error {
 // writeStallEvery is how often the blocked time is reported: the pace
 // watcher's cadence, so the two lines land side by side in the log.
 const writeStallEvery = 15 * time.Second
+
+// serveBlack emits the next slice of the runway clip, paced by the blackTick
+// select in Read so the clip plays at one times real time. It does not loop:
+// blackClip is longer than the runway plus the keyframe hunt, so blackPos never
+// reaches the end and the clip's clock never steps back. The splice downstream
+// renumbers these onto the program's PID and carries the program on from here.
+func (l *lateEncoder) serveBlack(p []byte) (int, error) {
+	if len(blackPool) == 0 {
+		return l.serveNulls(p, 0)
+	}
+	per := len(blackPool) * int(blackTick) / int(blackClip)
+	per = per / tsPacketSize * tsPacketSize
+	if per < tsPacketSize {
+		per = tsPacketSize
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return 0, io.EOF
+	}
+	if l.blackPos >= len(blackPool) {
+		l.blackPos = len(blackPool) - len(blackPool)%tsPacketSize - tsPacketSize
+	}
+	end := l.blackPos + per
+	if end > len(blackPool) {
+		end = len(blackPool)
+	}
+	n := copy(p, blackPool[l.blackPos:end])
+	l.blackPos += n
+	l.nulls += int64(n)
+	l.mu.Unlock()
+	return n, nil
+}
