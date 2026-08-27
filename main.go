@@ -1691,9 +1691,6 @@ type stallTolerantReader struct {
 	dropped atomic.Int64
 	// filled counts NULL bytes put into a live program to cover an encoder
 	// stall. lastFillLog is only touched by the reading goroutine.
-	// fill is whether a quiet source may be answered with NULL packets. Off
-	// during a hold, on once the programme starts.
-	fill        atomic.Bool
 	filled      atomic.Int64
 	lastFillLog time.Time
 	lastDropLog time.Time
@@ -1710,14 +1707,6 @@ type stallTolerantReader struct {
 type sessionSource interface{ sessions() int64 }
 
 func (s *stallTolerantReader) sessions() int64 { return s.reconnects.Load() }
-
-// holdStalls turns NULL fill off, for a stream that is being held back on
-// purpose. The reconnect is untouched: an encoder that drops during the wait
-// is still recovered, it simply is not papered over with filler.
-func (s *stallTolerantReader) holdStalls() { s.fill.Store(false) }
-
-// fillStalls turns NULL fill on, once there is a programme to keep flowing.
-func (s *stallTolerantReader) fillStalls() { s.fill.Store(true) }
 
 const (
 	stallReadGap        = 500 * time.Millisecond
@@ -1765,10 +1754,6 @@ func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadClose
 		reconnectFn: reconnectFn,
 		label:       label,
 	}
-	// On by default: every other path wants a quiet encoder covered from the
-	// first byte. The hold turns it off for the wait and back on at the
-	// hand-off.
-	s.fill.Store(true)
 	go s.producer()
 	return s
 }
@@ -1934,17 +1919,18 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		}
 		return n, nil
 	case <-stall:
-		// A hold has the filling switched off: the wait is quiet on purpose,
-		// so there is nothing to cover. Return no bytes rather than NULL
-		// packets — but sleep first, because a reader that returns (0, nil)
-		// in a loop is a spin, and gateReader.Read calls src.Read in a tight
-		// loop until it opens. Blocking here instead was tried and hung the
-		// drain outright, so this is the shape that works: no packets, no
-		// spin, and the read comes straight back when a chunk lands.
-		if !s.fill.Load() {
-			time.Sleep(stallQuietGap)
-			return 0, nil
-		}
+		// This reader once had its filling switched off during a hold, on the
+		// grounds that a stream held back on purpose should not be papered
+		// over. It is not worth what it costs. Returning no bytes here breaks
+		// captionStream.Read, which only starts its pump on a read that
+		// returns bytes — so the caption wrapper never started, the gate never
+		// saw a packet, the drain never logged, and no tune reached its
+		// hand-off at all. Blocking instead hung it just as hard, and
+		// returning (0, nil) in a loop spun a core.
+		//
+		// It never earned the risk either: the counter below, added to prove
+		// the filling was firing during holds, never once fired.
+		//
 		// This puts NULL packets into a live program. It exists so a stalled
 		// encoder does not show the DVR a zero-byte gap, and that is worth
 		// having — but the cost has never been said out loud, and it is the
