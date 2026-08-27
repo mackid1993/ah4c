@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,7 +94,7 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 	var args []string
 	var kind []string
 	if still {
-		args = append(args, "-loop", "1", "-framerate", "30", "-t", fmt.Sprint(prerollStillSeconds))
+		args = append(args, "-loop", "1", "-framerate", fmt.Sprint(seamRate()), "-t", fmt.Sprint(prerollStillSeconds))
 		kind = append(kind, fmt.Sprintf("%s still cropped to %s as a %d second clip", video, prerollFrame, prerollStillSeconds))
 	}
 	args = append(args, "-i", src)
@@ -923,7 +924,10 @@ type clockSplice struct {
 	// player sees never stop or restart.
 	srcVideo, srcAudio int
 	cc                 map[int]byte
-	started, said      bool
+	// lastPTS and gaps measure the encoder's picture rate after the seam.
+	lastPTS       uint64
+	gaps          []uint64
+	started, said bool
 	// pend is rewritten and ready to go out; tail is what has been read but
 	// does not yet make a whole packet. synced is whether the packet boundary
 	// has been found, and err is kept until pend has drained.
@@ -1140,6 +1144,22 @@ func (c *clockSplice) at(ts uint64) uint64 {
 	return o
 }
 
+// noteRate learns the picture rate from the gaps between presentation times,
+// so the filler can be built to match it next time. Only after the seam: it is
+// the encoder's rate that matters, not the filler's own.
+func (c *clockSplice) noteRate(ts uint64) {
+	if c.said && c.lastPTS != 0 {
+		if d := (ts - c.lastPTS) & (ptsMod - 1); d > 0 && d < 90000 {
+			c.gaps = append(c.gaps, d)
+			if len(c.gaps) == 120 {
+				learnSeamRate(c.gaps, c.label)
+				c.gaps = nil
+			}
+		}
+	}
+	c.lastPTS = ts
+}
+
 // near is whether two timestamps are within spliceJump of one another, either
 // way round. forward is whether a is ahead of b by less than that.
 func near(a, b uint64) bool { return forward(a, b) || forward(b, a) }
@@ -1202,7 +1222,11 @@ func (c *clockSplice) mapPES(pkt []byte) {
 	if flags < 2 || int(es[8]) < 5 {
 		return // no PTS
 	}
-	writeTS(es[9:14], c.at(readTS(es[9:14])))
+	pts := readTS(es[9:14])
+	if pid := int(pkt[1]&0x1F)<<8 | int(pkt[2]); pid == outVideoPID {
+		c.noteRate(pts)
+	}
+	writeTS(es[9:14], c.at(pts))
 	if flags == 3 && int(es[8]) >= 10 && off+19 <= tsPacketSize {
 		writeTS(es[14:19], c.at(readTS(es[14:19])))
 	}
@@ -1493,4 +1517,70 @@ func (c *clockSplice) patchPMT(pkt []byte) {
 	// The clock rides the video PID on every encoder seen here.
 	sec[8] = sec[8]&0xE0 | byte(outVideoPID>>8)&0x1F
 	sec[9] = byte(outVideoPID & 0xFF)
+}
+
+// --- Matching the filler to the encoder ---
+//
+// Everything now leaves on one set of PIDs, which is what stopped a player
+// choosing the filler's video track and never letting go of it. The cost is
+// that one decoder has to carry both: the filler was 1080p30 at level 4.0 and
+// the encoder here is 1080p60 at level 4.1, measured off a capture either side
+// of the seam. A decoder handed new parameters mid-stream reconfigures, and
+// what that looks like is frames going missing.
+//
+// The rate cannot be known when the filler is built — it is whatever the
+// encoder happens to be — so it is learned from the programme's own
+// presentation times after a hand-off and remembered for next time. Nothing is
+// probed and no connection is opened to find it out: the packets were going
+// past anyway.
+//
+// It lands on the next start rather than mid-tune. Rebuilding the filler is
+// ffmpeg work and rule 1 says uninterruptible work does not begin without
+// proven quiet; a value in a file costs nothing and the next restart picks it
+// up. The first run against an unfamiliar encoder is a mismatch and every run
+// after it is not.
+
+// seamRateFile remembers the encoder's picture rate between runs. It sits
+// beside the prepared clip, so a container without persistence simply relearns
+// it, which is the same cost as never having known.
+const seamRateFile = "/tmp/ah4c-seam-rate"
+
+// seamRateDefault is used until an encoder has been seen. Sixty because these
+// HDMI encoders overwhelmingly are, and because being wrong costs one tune.
+const seamRateDefault = 60
+
+// seamRate is what the filler is built at.
+func seamRate() int {
+	b, err := os.ReadFile(seamRateFile)
+	if err != nil {
+		return seamRateDefault
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || n < 1 || n > 240 {
+		return seamRateDefault
+	}
+	return n
+}
+
+// learnSeamRate turns a run of presentation gaps into a picture rate and
+// records it if it differs from what the filler was built at. The middle gap
+// rather than the mean: a stream with reordered frames has outliers either
+// side and the middle is not moved by them.
+func learnSeamRate(gaps []uint64, label string) {
+	sorted := append([]uint64(nil), gaps...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	mid := sorted[len(sorted)/2]
+	if mid == 0 {
+		return
+	}
+	rate := int((90000 + mid/2) / mid)
+	was := seamRate()
+	if rate < 1 || rate > 240 || rate == was {
+		return
+	}
+	if err := os.WriteFile(seamRateFile, []byte(strconv.Itoa(rate)), 0o644); err != nil {
+		return
+	}
+	logger("[HOLD] %s this encoder runs at %d pictures a second and the filler was built for %d; it will match from the next start",
+		label, rate, was)
 }

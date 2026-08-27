@@ -1291,9 +1291,9 @@ func blackStartup() {
 		// was reported the moment the seam otherwise started working. Sixty in
 		// front of sixty is seamless, and sixty in front of thirty costs the
 		// player nothing it cannot do.
-		"-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=60",
+		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=1920x1080:r=%d", seamRate()),
 		"-t", fmt.Sprintf("%.3f", blackSeamFor.Seconds()),
-		"-c:v", "libx264", "-preset", "ultrafast", "-g", "30",
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", fmt.Sprint(seamRate()/2),
 		"-pix_fmt", "yuv420p", "-f", "mpegts", at)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		logger("[BLACK] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
