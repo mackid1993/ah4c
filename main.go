@@ -1203,7 +1203,10 @@ func run() error {
 		}()
 	}
 	logger("[START] ah4c is ready")
-	return r.Run(":7654")
+	// Not r.Run: it builds its own listener and leaves the send buffer to the
+	// kernel, which autotunes it into the megabytes of stale video. See
+	// livesocket.go.
+	return serveLive(r, ":7654")
 }
 
 // Helper function to extract attribute from a line
