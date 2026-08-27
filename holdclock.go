@@ -34,9 +34,20 @@ import (
 	"time"
 )
 
-// holdClockMinDelay is the shortest hold that runs a program. At or under it,
-// a pure NULL hold already lands at the live edge, so it is left alone.
-const holdClockMinDelay = 45 * time.Second
+// holdClockMinDelay was the shortest hold that ran a synthesized program. The
+// clock is now disengaged at every length: it is set past the longest hold this
+// build allows, so the engagement condition is never true and nothing reaches
+// startHoldClock. A 1m30s tune convicted it as the residual lag — the encoder
+// handed over live (0.0s ahead), the gate released a keyframe -4ms from the
+// clock, and the reopen dropped the DVR's buffer 19s after the hand-off, yet
+// the picture still sat behind the guide. The only thing that path does that
+// the working sub-45s hold does not is run the player on a streamless clock for
+// the whole wait, so that is what is removed. The pure NULL hold — timeless
+// filler, the encoder's untouched clock at the hand-off, the reopen shedding
+// the buffer — is the detection mirror, and it carries a long hold the same way
+// it carries a short one. holdclock.go stays for reference; set this back to
+// 45 * time.Second to run the clock again.
+const holdClockMinDelay = holdMost
 
 // holdClock probes the encoder and then serves its program during the wait.
 type holdClock struct {
