@@ -632,6 +632,30 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 		}
 	}
 	d, burst := l.nullPace(left)
+	// While black is playing, wait for black — do not fall back to NULL
+	// packets between its frames. The clip runs at real time, so whenever the
+	// DVR reads faster than it produces, a short timer here wins the race and
+	// puts a NULL packet in between two black frames. That is black, null,
+	// black, null: frameless gaps threaded back through the one thing meant to
+	// remove them. So when there is black, the timer is only a long stop in
+	// case the clip dies, and its expiry is a real fault worth the fallback.
+	l.mu.Lock()
+	black := l.black
+	if black != nil && time.Since(l.t0) > blackFor {
+		// Long enough. The player has a picture and a time base now, and
+		// everything after this is a gap in a stream it already understands —
+		// which is the shape a ninety second encoder reboot already proves
+		// works. Running black for the whole wait would put sixty odd
+		// megabytes of it into the stream to do a job the first few seconds
+		// have already done.
+		black.stop()
+		l.black, black = nil, nil
+		logger("[BLACK] %s played %v of black; the rest of the wait is NULL packets", l.label, blackFor)
+	}
+	l.mu.Unlock()
+	if black != nil && d < blackPatience {
+		d = blackPatience
+	}
 	wait := time.NewTimer(d)
 	select {
 	case r := <-l.handoff:
@@ -660,6 +684,18 @@ func (l *lateEncoder) Read(p []byte) (int, error) {
 // primerFor is how long a picture goes out in front of the wait, to give the
 // player a time base before the filler starts.
 const primerFor = 1500 * time.Millisecond
+
+// blackFor is how long black plays at the start of a wait. It is there to give
+// the player a picture and a time base before any filler, not to fill the
+// whole hold: at a broadcast bitrate a ninety second wait of black is sixty
+// odd megabytes, to do a job the first few seconds have already done.
+const blackFor = 5 * time.Second
+
+// blackPatience is how long the wait will hold out for the black clip's next
+// frames before falling back to NULL packets. Long enough that a real-time
+// clip never loses the race — anything less threads NULLs between its frames —
+// and short enough that a clip that has actually died is covered.
+const blackPatience = 2 * time.Second
 
 // primeFrom reads the draining encoder until it has tables and a keyframe and
 // then a little beyond, and returns it. That is what the player anchors on.
