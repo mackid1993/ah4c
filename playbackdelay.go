@@ -771,12 +771,12 @@ func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
 	// whether one ever reached a seam has never been in the log, so the one
 	// thing this was built to do could not be confirmed from outside — "I
 	// didn't see any lines about it creating black frames". Once per tune.
-	if len(blackFrame) > 0 {
-		first = append(append([]byte(nil), blackFrame...), first...)
-		logger("[BLACK] %s one black frame, %s, went out at the seam, immediately in front of the picture",
-			l.label, byteCount(int64(len(blackFrame))))
+	if blk := blackFor(l.nulls); len(blk) > 0 {
+		first = append(append([]byte(nil), blk...), first...)
+		logger("[BLACK] %s %s of black went out at the seam, immediately in front of the picture, against %s of NULL packets in the wait",
+			l.label, byteCount(int64(len(blk))), byteCount(l.nulls))
 	} else {
-		logger("[BLACK] %s no black frame was made at startup, so the picture follows the wait directly", l.label)
+		logger("[BLACK] %s no black went out, so the picture follows the wait directly", l.label)
 	}
 	if stripped > 0 {
 		logger("[HOLD] %s took %s of NULL packets out of the hand-off, so the picture is the first thing after the wait",
@@ -1483,46 +1483,212 @@ func (r *refreshSource) Read(p []byte) (int, error) {
 	return r.ReadCloser.Read(p)
 }
 
-// --- One black frame at the seam ---
+// --- Black at the seam ---
 // The hold's filler is NULL packets, which carry no frame, so a playhead
 // reaching them has nothing to land on and stops. That matters in exactly one
 // place: directly in front of the picture. Everything earlier is behind the
 // viewer.
 //
-// So a single black frame goes out immediately before the programme, with
-// nothing between the two. It is generated at startup — libx264 and the lavfi
-// colour source are both in the image, checked before this was written — and
-// it is one frame: tables and a keyframe, about seven and a half kilobytes,
-// which a decoder can take on its own. A tune that cannot make it hands over
-// exactly as it did before.
+// So black goes out immediately before the programme, with nothing between the
+// two, and it is real video: frames with timestamps, keyframes a scrubber can
+// land on, and a time base the player carries into the programme.
+//
+// It was one frame first, on the reasoning that one frame is all a decoder
+// needs to anchor. That shipped and was not enough — and the user's other
+// remark says why in five words: "I didn't see it". One frame at thirty
+// frames a second is thirty-three milliseconds. Whatever the player has to
+// cross to reach the live edge, thirty-three milliseconds of it is not a
+// crossing, it is a rounding error. So it is a length now, not a frame.
+//
+// PLAYBACK_BLACK sets it, because the right length is not known and finding it
+// must not cost a Docker build each time. Default one second. Zero switches it
+// off. A pre-roll fills the wait itself and needs none of this.
 
-// blackFrame is one black frame as a transport stream, or nil if it could not
-// be made.
-var blackFrame []byte
+// blackPool is a run of black to take the seam's bytes from, or nil if it
+// could not be made or was switched off. blackPoolFor is how long it plays,
+// which is only ever a ceiling on what one hand-off can use.
+var (
+	blackPool    []byte
+	blackPoolFor time.Duration
+)
 
-// blackStartup makes the frame once, before the listener binds, where nothing
+// blackPoolMost is how much black is kept ready. It is a byte budget, not a
+// running time: what a hand-off takes from it is measured against the NULL
+// packets that tune actually sent, and the longest hold this program allows
+// sends a few hundred kilobytes of them. A megabyte covers that with room over.
+const blackPoolMost = 1 << 20
+
+// blackStartup makes the pool once, before the listener binds, where nothing
 // can be tuning yet (rule 10). A container that cannot make it still comes up.
 func blackStartup() {
 	if prerollTS != "" {
-		// A pre-roll fills the wait itself; it needs no frame from here.
+		// A pre-roll fills the wait itself; it needs no black from here.
+		return
+	}
+	blackPoolFor = 60 * time.Second
+	if !parseBlackSeam(strings.TrimSpace(os.Getenv("PLAYBACK_BLACK"))) {
 		return
 	}
 	const at = "/tmp/blackframe.ts"
+	// -g 15 puts a keyframe twice a second. Fast forward navigates by
+	// keyframes, so a run with only one at the front is a run a scrubber
+	// cannot move through — which is the complaint this whole thing exists to
+	// answer.
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
 		"-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30",
-		"-frames:v", "1", "-c:v", "libx264", "-preset", "ultrafast",
+		"-t", fmt.Sprintf("%.3f", blackPoolFor.Seconds()),
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", "15",
 		"-pix_fmt", "yuv420p", "-f", "mpegts", at)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		logger("[BLACK] could not make the black frame (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
+		logger("[BLACK] could not make the black (%v): %s; hand-offs go out as they did before", err, firstLine(string(out)))
 		return
 	}
 	b, err := os.ReadFile(at)
 	if err != nil || len(b) == 0 {
-		logger("[BLACK] the black frame came out empty; hand-offs go out as they did before")
+		logger("[BLACK] the black came out empty; hand-offs go out as they did before")
 		return
 	}
-	blackFrame = b
-	logger("[BLACK] made a black frame, %s, to go in front of the picture at the hand-off", byteCount(int64(len(b))))
+	if len(b) > blackPoolMost {
+		b = b[:blackPoolMost/tsPacketSize*tsPacketSize]
+	}
+	blackPool = b
+	logger("[BLACK] %s of black ready, %s; the seam takes %s of it (PLAYBACK_BLACK)",
+		holdWords(blackPoolFor), byteCount(int64(len(b))), blackSeamWords())
+}
+
+// --- How much of the pool a hand-off sends ---
+//
+// PLAYBACK_BLACK, so the length can be found by restarting the container
+// rather than by building an image. It takes:
+//
+//	a size     "188", "8KB", "64k"  — that many bytes, whole TS packets
+//	a time     "1s", "500ms"        — that much of the clip
+//	"nulls"                         — as many bytes as that tune's filler sent
+//	"0"                             — none; the picture follows the wait directly
+//
+// The default is one TS packet. That is the user's call and it is recorded as
+// theirs: a hundred and eighty-eight bytes cannot hold a coded picture, so what
+// goes out is a marker in front of the programme rather than a frame MPV can
+// decode. One whole frame shipped before this and was not enough — "I didn't
+// see it", which is what thirty-three milliseconds looks like — so the dial is
+// here to be turned, and turning it costs a restart.
+var (
+	blackSeamBytes  = tsPacketSize
+	blackSeamFor    time.Duration
+	blackMatchNulls bool
+)
+
+// parseBlackSeam reads PLAYBACK_BLACK. It returns false when black is switched
+// off entirely, so startup can skip making the pool at all.
+func parseBlackSeam(s string) bool {
+	if s == "" {
+		return true
+	}
+	if strings.EqualFold(s, "nulls") {
+		blackMatchNulls, blackSeamBytes = true, 0
+		return true
+	}
+	// A time unit makes it a length; anything else is a size. Order matters:
+	// parseHoldDuration takes a bare number as seconds, so "188" — which is a
+	// TS packet, and the default this dial was built around — would have been
+	// read as three minutes of black. Caught by the test, not by reading it.
+	if hasTimeUnit(s) {
+		d, err := parseHoldDuration(s)
+		switch {
+		case err != nil:
+			logger("[BLACK] PLAYBACK_BLACK %q %v; the seam sends one TS packet", s, err)
+			return true
+		case d <= 0:
+			logger("[BLACK] PLAYBACK_BLACK is %s, so no black goes out and the picture follows the wait directly", s)
+			return false
+		}
+		blackSeamFor, blackSeamBytes = d, 0
+		if d > blackPoolFor {
+			blackPoolFor = d
+		}
+		return true
+	}
+	n, err := parseByteSize(s)
+	switch {
+	case err != nil:
+		logger("[BLACK] PLAYBACK_BLACK %q %v; the seam sends one TS packet", s, err)
+	case n <= 0:
+		logger("[BLACK] PLAYBACK_BLACK is %s, so no black goes out and the picture follows the wait directly", s)
+		return false
+	default:
+		blackSeamBytes = n
+	}
+	return true
+}
+
+// hasTimeUnit says whether PLAYBACK_BLACK is asking for a length rather than a
+// size. "1s", "500ms", "2m" are lengths; "188", "8KB", "64k" are sizes.
+func hasTimeUnit(s string) bool {
+	t := strings.ToLower(strings.TrimSpace(s))
+	for _, u := range []string{"ms", "s", "m", "h", "sec", "min"} {
+		if strings.HasSuffix(t, u) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseByteSize reads "188", "8KB", "64k", "1MB".
+func parseByteSize(s string) (int, error) {
+	t := strings.TrimSpace(strings.ToUpper(s))
+	t = strings.TrimSuffix(t, "B")
+	mult := 1
+	switch {
+	case strings.HasSuffix(t, "K"):
+		mult, t = 1<<10, strings.TrimSuffix(t, "K")
+	case strings.HasSuffix(t, "M"):
+		mult, t = 1<<20, strings.TrimSuffix(t, "M")
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(t))
+	if err != nil {
+		return 0, fmt.Errorf("is not a size or a length")
+	}
+	return n * mult, nil
+}
+
+func blackSeamWords() string {
+	switch {
+	case blackMatchNulls:
+		return "as many bytes as the wait's own NULL packets"
+	case blackSeamFor > 0:
+		return holdWords(blackSeamFor)
+	case blackSeamBytes == tsPacketSize:
+		return "one TS packet"
+	default:
+		return byteCount(int64(blackSeamBytes))
+	}
+}
+
+// blackFor is the black to put in front of the picture, taken off the front of
+// the pool so it begins with the clip's own tables and keyframe. Always whole
+// TS packets: a part packet at the seam is a torn packet immediately in front
+// of the programme, which is the one place in the stream that cannot afford it.
+func blackFor(nulls int64) []byte {
+	if len(blackPool) == 0 {
+		return nil
+	}
+	var n int64
+	switch {
+	case blackMatchNulls:
+		n = nulls
+	case blackSeamFor > 0:
+		n = int64(float64(len(blackPool)) * blackSeamFor.Seconds() / blackPoolFor.Seconds())
+	default:
+		n = int64(blackSeamBytes)
+	}
+	n = n / tsPacketSize * tsPacketSize
+	if max := int64(len(blackPool)) / tsPacketSize * tsPacketSize; n > max {
+		n = max
+	}
+	if n <= 0 {
+		return nil
+	}
+	return blackPool[:n]
 }
 
 // dvrSendBuffer is how many bytes the kernel may hold for the DVR. At a
