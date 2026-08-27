@@ -353,8 +353,19 @@ func (l *lateEncoder) prepareHandoff() {
 	body := maybeWrapCaptions(
 		newGateReader(l.stallTolerant(l.refreshing(resp.Body)), armed, true, time.Now(), nil),
 		l.tuner, l.name)
+	// Read until the gate releases the keyframe. A zero-byte read is not the
+	// end — the gate returns nothing while it is still hunting the keyframe, so
+	// it is retried, not treated as a dead encoder. Only a real error ends it.
 	buf := make([]byte, 64*1024)
-	n, rerr := body.Read(buf)
+	var n int
+	var rerr error
+	for {
+		n, rerr = body.Read(buf)
+		if n > 0 || rerr != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if n <= 0 {
 		logger("[HOLD] %s encoder produced nothing after the hold: %v", l.label, rerr)
 		body.Close()
