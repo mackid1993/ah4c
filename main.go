@@ -66,37 +66,90 @@ type sourceRollover struct {
 	io.ReadCloser
 	reopen   func() (io.ReadCloser, error)
 	label    string
-	reopened bool
-	bytes    int64
+	mu       sync.Mutex
+	once     sync.Once
+	switched bool
+	closed   bool
+	bytes    atomic.Int64
 }
 
 func (s *sourceRollover) sessions() int64 {
-	if s.reopened {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.switched {
 		return 1
 	}
 	return 0
 }
 
 func (s *sourceRollover) Read(p []byte) (int, error) {
-	n, err := s.ReadCloser.Read(p)
-	s.bytes += int64(n)
-	if err != io.EOF || s.reopened {
+	s.mu.Lock()
+	body, switched := s.ReadCloser, s.switched
+	s.mu.Unlock()
+	n, err := body.Read(p)
+	s.bytes.Add(int64(n))
+	if err == nil {
+		return n, err
+	}
+	s.mu.Lock()
+	changed := s.ReadCloser != body
+	s.mu.Unlock()
+	if changed {
+		if n > 0 {
+			return n, nil
+		}
+		return s.Read(p)
+	}
+	if switched || err != io.EOF {
 		return n, err
 	}
 	if n > 0 {
 		return n, nil
 	}
-	s.reopened = true
-	s.ReadCloser.Close()
-	started := time.Now()
-	next, err := s.reopen()
-	if err != nil {
-		logger("[TUNE TRACE] %s source rollover failed duration=%s err=%v", s.label, time.Since(started).Round(time.Microsecond), err)
-		return 0, err
+	if !s.refresh() {
+		return n, err
 	}
-	s.ReadCloser = next
-	logger("[TUNE TRACE] %s source rolled over after %d bytes duration=%s", s.label, s.bytes, time.Since(started).Round(time.Microsecond))
 	return s.Read(p)
+}
+
+func (s *sourceRollover) refresh() bool {
+	s.once.Do(func() {
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		if closed {
+			return
+		}
+		started := time.Now()
+		next, err := s.reopen()
+		if err != nil {
+			logger("[TUNE TRACE] %s source handoff failed duration=%s err=%v", s.label, time.Since(started).Round(time.Microsecond), err)
+			return
+		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			next.Close()
+			return
+		}
+		old := s.ReadCloser
+		s.ReadCloser = next
+		s.switched = true
+		s.mu.Unlock()
+		old.Close()
+		logger("[TUNE TRACE] %s source handed off after %d bytes duration=%s", s.label, s.bytes.Load(), time.Since(started).Round(time.Microsecond))
+	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.switched
+}
+
+func (s *sourceRollover) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	body := s.ReadCloser
+	s.mu.Unlock()
+	return body.Close()
 }
 
 var encoderPreviews = struct {
@@ -145,6 +198,7 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	rolloverReady chan<- error
+	rollover      *sourceRollover
 	closed        atomic.Bool
 	startedAt     time.Time
 	traceStart    time.Time
@@ -295,6 +349,9 @@ func (r *reader) Read(p []byte) (int, error) {
 			err := execute(r.t.start, r.channel, r.t.tunerip)
 			if r.rolloverReady != nil {
 				r.rolloverReady <- err
+				if err == nil {
+					r.rollover.refresh()
+				}
 			}
 			if err != nil {
 				if r.rolloverReady != nil {
@@ -561,6 +618,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			var body io.ReadCloser
 			var gate *gateReader
 			var gateDone chan struct{}
+			var rolloverSource *sourceRollover
 			if holdDelay > 0 {
 				// A tune held by the delay does not open the encoder yet: the
 				// wait is the pre-roll or NULL packets, and the encoder is
@@ -589,7 +647,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						return r.Body, nil
 					}, label)
 				} else {
-					body = &sourceRollover{ReadCloser: resp.Body, label: label, reopen: func() (io.ReadCloser, error) {
+					source := &sourceRollover{ReadCloser: resp.Body, label: label, reopen: func() (io.ReadCloser, error) {
 						if rolloverReady != nil {
 							if err := <-rolloverReady; err != nil {
 								return nil, err
@@ -605,6 +663,10 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						}
 						return r.Body, nil
 					}}
+					body = source
+					if passthrough {
+						rolloverSource = source
+					}
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
@@ -639,6 +701,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				gateSig:       sig,
 				gate:          gate,
 				rolloverReady: rolloverReady,
+				rollover:      rolloverSource,
 				traceStart:    tuneStart,
 			}
 			return r, nil
