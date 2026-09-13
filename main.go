@@ -452,9 +452,6 @@ func (r *reader) Read(p []byte) (int, error) {
 					return
 				}
 				r.rolloverReady <- err
-				if err == nil {
-					r.rollover.refresh()
-				}
 			}
 			if err != nil {
 				if r.rolloverReady != nil {
@@ -692,7 +689,9 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			captionsEnabled := currentCaptionConfig().Enabled
 			passthrough := holdDelay == 0 && early == nil && ready == nil && !nullsEnabled
 			var rolloverReady chan error
-			if err := execute(t.pre, t.tunerip, channel); err != nil {
+			if passthrough {
+				rolloverReady = make(chan error, 1)
+			} else if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
 				continue
@@ -747,7 +746,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						}
 						return r.Body, nil
 					}, label)
-				} else if !passthrough {
+				} else {
 					var readyOnce sync.Once
 					var readyErr error
 					source := &sourceRollover{ReadCloser: resp.Body, label: label, recover: passthrough, reopen: func() (io.ReadCloser, error) {
