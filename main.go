@@ -672,7 +672,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				t.active = true
 				t.index = i
 				return &reader{
-					ReadCloser: maybeWrapCaptions(pipeReader, i, fmt.Sprintf("tuner%d", i)),
+					ReadCloser: maybeWrapCaptions(pipeReader, i, fmt.Sprintf("tuner%d", i), false),
 					channel:    channel,
 					t:          t,
 					cmd:        cmd,
@@ -778,7 +778,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
 					body = gate
 				}
-				body = maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i))
+				body = maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i), gate != nil)
 				if hold != nil {
 					body = hold.wrap(body)
 				}

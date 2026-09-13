@@ -414,7 +414,7 @@ func (l *lateEncoder) drainEarly() {
 			// to touch. That path is left as it was.
 			var src io.ReadCloser = st
 			if l.preroll == nil {
-				src = maybeWrapCaptions(st, l.tuner, l.name)
+				src = maybeWrapCaptions(st, l.tuner, l.name, false)
 			}
 			// Timed: the gate arms itself when the delay is up and takes the
 			// first keyframe after it. Until then it reads and throws away.
@@ -444,7 +444,7 @@ func (l *lateEncoder) drainEarly() {
 			// it is called, which is here, at tune start — so the engine is
 			// ready by the hand-off even though it injects nothing until then.
 			if l.preroll != nil {
-				body = maybeWrapCaptions(g, l.tuner, l.name)
+				body = maybeWrapCaptions(g, l.tuner, l.name, true)
 			} else {
 				body = g
 			}

@@ -644,9 +644,10 @@ type captionStream struct {
 	// pump starts the reading loop, and not before the gate has let a byte
 	// through. first holds that byte's chunk until the loop can take it. See
 	// Read.
-	pump    sync.Once
-	started bool
-	first   []byte
+	pump           sync.Once
+	deferUntilByte bool
+	started        bool
+	first          []byte
 }
 
 // maybeWrapCaptions returns src unchanged unless captions are switched on and
@@ -701,12 +702,11 @@ func refreshCaptionReady() {
 	captionReadyVal.Store(st)
 }
 
-func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadCloser {
+func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string, deferUntilByte bool) io.ReadCloser {
 	captionTuneStarting()
-	src = newTuneSettleReader(src)
 	cfg := currentCaptionConfig()
 	if !cfg.Enabled {
-		return src
+		return newTuneSettleReader(src)
 	}
 	if len(cfg.Tuners) > 0 {
 		found := false
@@ -717,7 +717,7 @@ func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadC
 			}
 		}
 		if !found {
-			return src
+			return newTuneSettleReader(src)
 		}
 	}
 	// Everything about whether captions can run has been worked out already,
@@ -733,18 +733,18 @@ func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadC
 	r := captionReadiness()
 	if !r.ok {
 		logger("[CC] %s %s, captions disabled for this tune", label, r.why)
-		return src
+		return newTuneSettleReader(src)
 	}
 	m := r.model
 	engine, err := newCaptionEngine(cfg, m, label)
 	if err != nil {
 		logger("[CC] %s could not start captions: %v", label, err)
-		return src
+		return newTuneSettleReader(src)
 	}
 
-	cs := &captionStream{src: src, engine: engine}
+	cs := &captionStream{src: src, engine: engine, deferUntilByte: deferUntilByte}
 	cs.pr, cs.pw = io.Pipe()
-	return cs
+	return newTuneSettleReader(cs)
 }
 
 func (cs *captionStream) run() {
@@ -840,6 +840,10 @@ func (cs *captionStream) inject() {
 // Nothing is lost by the delay: the gate emits the program tables at release,
 // so the first chunk carries what the injector needs to identify the stream.
 func (cs *captionStream) Read(p []byte) (int, error) {
+	if !cs.deferUntilByte {
+		cs.pump.Do(func() { go cs.run() })
+		return cs.pr.Read(p)
+	}
 	if !cs.started {
 		n, err := cs.src.Read(p)
 		if n > 0 {
