@@ -199,6 +199,12 @@ func (s *sourceRollover) reopenAfterEnd() bool {
 		return false
 	}
 	s.fallback.Do(func() {
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		if closed {
+			return
+		}
 		started := time.Now()
 		raw, err := s.reopen()
 		if err != nil {
