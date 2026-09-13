@@ -64,13 +64,14 @@ type encoderPreview struct {
 
 type sourceRollover struct {
 	io.ReadCloser
-	reopen   func() (io.ReadCloser, error)
-	label    string
-	mu       sync.Mutex
-	once     sync.Once
-	switched bool
-	closed   bool
-	bytes    atomic.Int64
+	reopen    func() (io.ReadCloser, error)
+	label     string
+	mu        sync.Mutex
+	once      sync.Once
+	switched  bool
+	closed    bool
+	candidate io.ReadCloser
+	bytes     atomic.Int64
 }
 
 func (s *sourceRollover) sessions() int64 {
@@ -106,6 +107,7 @@ func (s *sourceRollover) Read(p []byte) (int, error) {
 	if n > 0 {
 		return n, nil
 	}
+	body.Close()
 	if !s.refresh() {
 		return n, err
 	}
@@ -132,12 +134,42 @@ func (s *sourceRollover) refresh() bool {
 			next.Close()
 			return
 		}
+		s.candidate = next
+		s.mu.Unlock()
+		first := make([]byte, 188)
+		var n int
+		for n == 0 && err == nil {
+			n, err = readWithDeadline(next, first, srcStallReconnect)
+		}
+		if n == 0 || err != nil {
+			s.mu.Lock()
+			s.candidate = nil
+			closed := s.closed
+			s.mu.Unlock()
+			next.Close()
+			if !closed {
+				logger("[TUNE TRACE] %s source handoff not usable bytes=%d duration=%s err=%v", s.label, n, time.Since(started).Round(time.Microsecond), err)
+			}
+			return
+		}
+		primed := struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(first[:n]), next), next}
+		s.mu.Lock()
+		if s.closed {
+			s.candidate = nil
+			s.mu.Unlock()
+			next.Close()
+			return
+		}
 		old := s.ReadCloser
-		s.ReadCloser = next
+		s.ReadCloser = primed
+		s.candidate = nil
 		s.switched = true
 		s.mu.Unlock()
 		old.Close()
-		logger("[TUNE TRACE] %s source handed off after %d bytes duration=%s", s.label, s.bytes.Load(), time.Since(started).Round(time.Microsecond))
+		logger("[TUNE TRACE] %s source handed off after %d bytes with %d bytes ready duration=%s", s.label, s.bytes.Load(), n, time.Since(started).Round(time.Microsecond))
 	})
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,7 +180,11 @@ func (s *sourceRollover) Close() error {
 	s.mu.Lock()
 	s.closed = true
 	body := s.ReadCloser
+	candidate := s.candidate
 	s.mu.Unlock()
+	if candidate != nil {
+		candidate.Close()
+	}
 	return body.Close()
 }
 
@@ -348,6 +384,10 @@ func (r *reader) Read(p []byte) (int, error) {
 			}
 			err := execute(r.t.start, r.channel, r.t.tunerip)
 			if r.rolloverReady != nil {
+				if r.closed.Load() {
+					r.rolloverReady <- io.ErrClosedPipe
+					return
+				}
 				r.rolloverReady <- err
 				if err == nil {
 					r.rollover.refresh()
