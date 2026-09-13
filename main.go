@@ -152,7 +152,7 @@ func (s *sourceRollover) prime(next io.ReadCloser) (io.ReadCloser, int, error) {
 	for n == 0 && err == nil {
 		n, err = readWithDeadline(next, first, srcStallReconnect)
 	}
-	if n == 0 || err != nil {
+	if n == 0 {
 		s.mu.Lock()
 		s.candidate = nil
 		closed := s.closed
