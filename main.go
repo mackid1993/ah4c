@@ -774,9 +774,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
 					body = gate
 				}
-				if captionsEnabled {
-					body = maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i))
-				}
+				body = maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i))
 				if hold != nil {
 					body = hold.wrap(body)
 				}
