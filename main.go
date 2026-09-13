@@ -118,6 +118,38 @@ func (s *sourceRollover) Read(p []byte) (int, error) {
 	return s.Read(p)
 }
 
+func (s *sourceRollover) prime(next io.ReadCloser) (io.ReadCloser, int, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		next.Close()
+		return nil, 0, io.ErrClosedPipe
+	}
+	s.candidate = next
+	s.mu.Unlock()
+	first := make([]byte, 188)
+	var n int
+	var err error
+	for n == 0 && err == nil {
+		n, err = readWithDeadline(next, first, srcStallReconnect)
+	}
+	if n == 0 || err != nil {
+		s.mu.Lock()
+		s.candidate = nil
+		closed := s.closed
+		s.mu.Unlock()
+		next.Close()
+		if closed {
+			return nil, n, io.ErrClosedPipe
+		}
+		return nil, n, err
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(first[:n]), next), next}, n, nil
+}
+
 func (s *sourceRollover) refresh() bool {
 	s.once.Do(func() {
 		s.mu.Lock()
@@ -127,39 +159,21 @@ func (s *sourceRollover) refresh() bool {
 			return
 		}
 		started := time.Now()
-		next, err := s.reopen()
+		raw, err := s.reopen()
 		if err != nil {
 			logger("[TUNE TRACE] %s source handoff failed duration=%s err=%v", s.label, time.Since(started).Round(time.Microsecond), err)
 			return
 		}
-		s.mu.Lock()
-		if s.closed {
-			s.mu.Unlock()
-			next.Close()
-			return
-		}
-		s.candidate = next
-		s.mu.Unlock()
-		first := make([]byte, 188)
-		var n int
-		for n == 0 && err == nil {
-			n, err = readWithDeadline(next, first, srcStallReconnect)
-		}
-		if n == 0 || err != nil {
+		next, n, err := s.prime(raw)
+		if err != nil {
 			s.mu.Lock()
-			s.candidate = nil
 			closed := s.closed
 			s.mu.Unlock()
-			next.Close()
 			if !closed {
 				logger("[TUNE TRACE] %s source handoff not usable bytes=%d duration=%s err=%v", s.label, n, time.Since(started).Round(time.Microsecond), err)
 			}
 			return
 		}
-		primed := struct {
-			io.Reader
-			io.Closer
-		}{io.MultiReader(bytes.NewReader(first[:n]), next), next}
 		s.mu.Lock()
 		if s.closed {
 			s.candidate = nil
@@ -168,7 +182,7 @@ func (s *sourceRollover) refresh() bool {
 			return
 		}
 		old := s.ReadCloser
-		s.ReadCloser = primed
+		s.ReadCloser = next
 		s.candidate = nil
 		s.switched = true
 		s.mu.Unlock()
@@ -186,21 +200,33 @@ func (s *sourceRollover) reopenAfterEnd() bool {
 	}
 	s.fallback.Do(func() {
 		started := time.Now()
-		next, err := s.reopen()
+		raw, err := s.reopen()
 		if err != nil {
 			logger("[TUNE TRACE] %s source recovery failed duration=%s err=%v", s.label, time.Since(started).Round(time.Microsecond), err)
 			return
 		}
+		next, n, err := s.prime(raw)
+		if err != nil {
+			s.mu.Lock()
+			closed := s.closed
+			s.mu.Unlock()
+			if !closed {
+				logger("[TUNE TRACE] %s source recovery not usable bytes=%d duration=%s err=%v", s.label, n, time.Since(started).Round(time.Microsecond), err)
+			}
+			return
+		}
 		s.mu.Lock()
 		if s.closed {
+			s.candidate = nil
 			s.mu.Unlock()
 			next.Close()
 			return
 		}
 		s.ReadCloser = next
+		s.candidate = nil
 		s.switched = true
 		s.mu.Unlock()
-		logger("[TUNE TRACE] %s source reopened after encoder reset duration=%s", s.label, time.Since(started).Round(time.Microsecond))
+		logger("[TUNE TRACE] %s source reopened after encoder reset with %d bytes ready duration=%s", s.label, n, time.Since(started).Round(time.Microsecond))
 	})
 	s.mu.Lock()
 	defer s.mu.Unlock()
