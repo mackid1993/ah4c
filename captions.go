@@ -863,12 +863,12 @@ func (cs *captionStream) Close() error {
 	// the recognizer winds down costs up to ten seconds of the new tune's
 	// window — the engine teardown even waits on work that the new tune's
 	// own quiet gate is holding, a circle only this ordering breaks.
-	// The engine cleans itself up in the background; nothing about it can
-	// touch the stream that no longer exists.
+	// The engine finishes before this caption stream releases its lifecycle;
+	// otherwise a quick retune can overlap the old native worker's teardown.
 	err := cs.src.Close()
 	cs.once.Do(func() {
 		cs.pr.Close()
-		go cs.engine.Close()
+		cs.engine.Close()
 	})
 	return err
 }
