@@ -249,8 +249,7 @@ type captionInjector struct {
 	inPES    bool
 	videoCC  byte
 	ccSeeded bool // whether videoCC has picked up the source's count
-	seenPES  bool
-	firstPES bool
+	active   bool
 
 	carry []byte // bytes of a packet split across two Write calls
 	// pmtPatch is the program table rewritten to announce the caption
@@ -366,6 +365,14 @@ func (ci *captionInjector) packet(p []byte) error {
 		ci.parsePMT(p)
 	}
 
+	if !ci.active {
+		if pid != ci.videoPID || !pusi || ci.enc.backlog() == 0 {
+			_, err := ci.out.Write(p)
+			return err
+		}
+		ci.active = true
+	}
+
 	// Announce the caption service in the program table, so a player that
 	// does not decode the video to look for caption messages still knows they
 	// are there.
@@ -413,21 +420,6 @@ func (ci *captionInjector) packet(p []byte) error {
 		}
 		_, err := ci.out.Write(p)
 		return err
-	}
-
-	if !ci.seenPES || ci.firstPES {
-		if pusi {
-			if !ci.seenPES {
-				ci.seenPES = true
-				ci.firstPES = true
-			} else {
-				ci.firstPES = false
-			}
-		}
-		if ci.firstPES || !ci.seenPES {
-			_, err := ci.out.Write(p)
-			return err
-		}
 	}
 
 	// Video packets that arrived before the PMT identified the video PID went
@@ -767,9 +759,6 @@ func (ci *captionInjector) flush() error {
 	// queued, playback after five seconds leaves five seconds of it.
 	//
 	// The viewer's timeline starts here, so this is where the encoder starts.
-	if ci.injected == 0 {
-		ci.enc.reset()
-	}
 	send := ci.onPicture(ptsVal)
 	pair := [2]byte{}
 	if send {
