@@ -144,6 +144,8 @@ type reader struct {
 	gateBase      map[string]bool
 	gateSig       string
 	gate          *gateReader
+	rolloverReady chan<- error
+	closed        atomic.Bool
 	startedAt     time.Time
 	traceStart    time.Time
 	traceLast     time.Time
@@ -277,7 +279,27 @@ func (r *reader) Read(p []byte) (int, error) {
 		addReader(r)
 		go func() {
 			base := r.gateBase
-			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+			if r.rolloverReady != nil {
+				err := execute(r.t.pre, r.t.tunerip, r.channel)
+				if err != nil {
+					r.rolloverReady <- err
+					r.ReadCloser.Close()
+					logger("[ERR] Failed to run pre script: %v %s", err, r.t.tunerip)
+					return
+				}
+				if r.closed.Load() {
+					r.rolloverReady <- io.ErrClosedPipe
+					return
+				}
+			}
+			err := execute(r.t.start, r.channel, r.t.tunerip)
+			if r.rolloverReady != nil {
+				r.rolloverReady <- err
+			}
+			if err != nil {
+				if r.rolloverReady != nil {
+					r.ReadCloser.Close()
+				}
 				logger("[ERR] Failed to run start script: %v", err)
 				if r.gateReady != nil {
 					close(r.gateReady)
@@ -368,6 +390,7 @@ func (r *reader) Read(p []byte) (int, error) {
 
 // Called from io.Copy when closing socket
 func (r *reader) Close() error {
+	r.closed.Store(true)
 	logger("[TUNE TRACE] tuner=%s channel=%s close reads=%d bytes=%d elapsed=%s reader=%T", r.t.tunerip, r.channel, r.traceReads, r.traceBytes, time.Since(r.traceStart).Round(time.Microsecond), r.ReadCloser)
 	logger("Performing Close() for %s", r.t.tunerip)
 	if r.gateDone != nil {
@@ -507,7 +530,11 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			nullsEnabled := strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE")
 			captionsEnabled := currentCaptionConfig().Enabled
-			if err := execute(t.pre, t.tunerip, channel); err != nil {
+			passthrough := holdDelay == 0 && early == nil && ready == nil && !nullsEnabled
+			var rolloverReady chan error
+			if passthrough {
+				rolloverReady = make(chan error, 1)
+			} else if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
 				continue
@@ -563,6 +590,11 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					}, label)
 				} else {
 					body = &sourceRollover{ReadCloser: resp.Body, label: label, reopen: func() (io.ReadCloser, error) {
+						if rolloverReady != nil {
+							if err := <-rolloverReady; err != nil {
+								return nil, err
+							}
+						}
 						r, e := http.Get(t.url)
 						if e != nil {
 							return nil, e
@@ -598,15 +630,16 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			t.active = true
 			t.index = i
 			r := &reader{
-				ReadCloser: body,
-				channel:    channel,
-				t:          t,
-				gateReady:  ready,
-				gateDone:   gateDone,
-				gateBase:   base,
-				gateSig:    sig,
-				gate:       gate,
-				traceStart: tuneStart,
+				ReadCloser:    body,
+				channel:       channel,
+				t:             t,
+				gateReady:     ready,
+				gateDone:      gateDone,
+				gateBase:      base,
+				gateSig:       sig,
+				gate:          gate,
+				rolloverReady: rolloverReady,
+				traceStart:    tuneStart,
 			}
 			return r, nil
 		}
