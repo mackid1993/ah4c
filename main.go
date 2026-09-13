@@ -470,8 +470,30 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			nullsEnabled := strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE")
 			captionsEnabled := currentCaptionConfig().Enabled
+			var resp *http.Response
+			if holdDelay == 0 {
+				requestStart := time.Now()
+				logger("[TUNE TRACE] %s encoder request begin elapsed=%s url=%s", label, time.Since(tuneStart).Round(time.Microsecond), t.url)
+				var err error
+				resp, err = http.Get(t.url)
+				if err != nil {
+					logger("[TUNE TRACE] %s encoder request failed elapsed=%s duration=%s err=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), err)
+					logger("[ERR] Failed to fetch source: %v", err)
+					t.active = false
+					continue
+				} else if resp.StatusCode != 200 {
+					logger("[ERR] Failed to fetch source: %v", resp.Status)
+					resp.Body.Close()
+					t.active = false
+					continue
+				}
+				logger("[TUNE TRACE] %s encoder response elapsed=%s duration=%s status=%s contentLength=%d transferEncoding=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), resp.Status, resp.ContentLength, resp.TransferEncoding)
+			}
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
+				if resp != nil {
+					resp.Body.Close()
+				}
 				t.active = false
 				continue
 			}
@@ -491,21 +513,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// which is the whole thing the feature is for.
 				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i), channel)
 			} else {
-				requestStart := time.Now()
-				logger("[TUNE TRACE] %s encoder request begin elapsed=%s url=%s", label, time.Since(tuneStart).Round(time.Microsecond), t.url)
-				resp, err := http.Get(t.url)
-				if err != nil {
-					logger("[TUNE TRACE] %s encoder request failed elapsed=%s duration=%s err=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), err)
-					logger("[ERR] Failed to fetch source: %v", err)
-					t.active = false
-					continue
-				} else if resp.StatusCode != 200 {
-					logger("[ERR] Failed to fetch source: %v", resp.Status)
-					resp.Body.Close()
-					t.active = false
-					continue
-				}
-				logger("[TUNE TRACE] %s encoder response elapsed=%s duration=%s status=%s contentLength=%d transferEncoding=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), resp.Status, resp.ContentLength, resp.TransferEncoding)
 				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
 				body = resp.Body
 				if nullsEnabled {
