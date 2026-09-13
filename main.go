@@ -694,6 +694,9 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			captionsEnabled := currentCaptionConfig().Enabled
 			passthrough := holdDelay == 0 && early == nil && ready == nil && !nullsEnabled
 			var rolloverReady chan error
+			if passthrough {
+				rolloverReady = make(chan error, 1)
+			}
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
@@ -748,7 +751,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						}
 						return r.Body, nil
 					}, label)
-				} else if !passthrough {
+				} else {
 					source := &sourceRollover{ReadCloser: resp.Body, label: label, recover: passthrough, ready: rolloverReady, reopen: func() (io.ReadCloser, error) {
 						r, e := http.Get(t.url)
 						if e != nil {
