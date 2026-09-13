@@ -55,8 +55,73 @@ var (
 // Misc
 var (
 	envdebug     bool = true
-	allowPreview bool = false
+	allowPreview bool = true
 )
+
+type encoderPreview struct {
+	cancel context.CancelFunc
+}
+
+type sourceContinuityReader struct {
+	io.ReadCloser
+	reopen   func() (io.ReadCloser, error)
+	label    string
+	reopened bool
+	rollover bool
+	waiting  bool
+	reopenAt time.Time
+	started  time.Time
+	bytes    int64
+}
+
+func (r *sourceContinuityReader) Read(p []byte) (int, error) {
+	for {
+		if r.rollover {
+			r.rollover = false
+			if err := r.reopenSource(); err != nil {
+				return 0, err
+			}
+		}
+		n, err := r.ReadCloser.Read(p)
+		if n > 0 && r.waiting {
+			r.waiting = false
+			logger("[TUNE TRACE] %s source reopen=1 first bytes=%d wait=%s elapsed=%s", r.label, n, time.Since(r.reopenAt).Round(time.Microsecond), time.Since(r.started).Round(time.Microsecond))
+		}
+		r.bytes += int64(n)
+		if err != io.EOF || r.reopened {
+			return n, err
+		}
+		if n > 0 {
+			r.rollover = true
+			return n, nil
+		}
+		if err := r.reopenSource(); err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (r *sourceContinuityReader) reopenSource() error {
+	r.reopened = true
+	r.ReadCloser.Close()
+	started := time.Now()
+	logger("[TUNE TRACE] %s initial encoder body ended bytes=%d; source reopen=1", r.label, r.bytes)
+	next, err := r.reopen()
+	if err != nil {
+		logger("[TUNE TRACE] %s source reopen=1 failed duration=%s err=%v", r.label, time.Since(started).Round(time.Microsecond), err)
+		return err
+	}
+	r.ReadCloser = next
+	r.reopenAt = time.Now()
+	r.waiting = true
+	logger("[TUNE TRACE] %s source reopen=1 connected duration=%s", r.label, time.Since(started).Round(time.Microsecond))
+	return nil
+}
+
+var encoderPreviews = struct {
+	sync.Mutex
+	m map[int]*encoderPreview
+}{m: make(map[int]*encoderPreview)}
 
 // /status page reader handling
 var (
@@ -99,6 +164,10 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	startedAt     time.Time
+	traceStart    time.Time
+	traceLast     time.Time
+	traceReads    int64
+	traceBytes    int64
 }
 
 // Create a global file object to write logs to
@@ -278,8 +347,20 @@ func (r *reader) Read(p []byte) (int, error) {
 			return 0, fmt.Errorf("[ERR] Failed to start TEECMD: %v", err)
 		}
 	}
-	// Read from the source
+	readStart := time.Now()
+	if r.traceStart.IsZero() {
+		r.traceStart = readStart
+	}
+	if r.traceReads == 0 {
+		logger("[TUNE TRACE] tuner=%s channel=%s first read begin elapsed=%s reader=%T buffer=%d", r.t.tunerip, r.channel, time.Since(r.traceStart).Round(time.Microsecond), r.ReadCloser, len(p))
+	}
 	n, err := r.ReadCloser.Read(p)
+	r.traceReads++
+	r.traceBytes += int64(n)
+	if r.traceReads == 1 || n == 0 || err != nil || time.Since(r.traceLast) >= 5*time.Second {
+		logger("[TUNE TRACE] tuner=%s channel=%s read=%d n=%d err=%v blocked=%s elapsed=%s total=%d", r.t.tunerip, r.channel, r.traceReads, n, err, time.Since(readStart).Round(time.Microsecond), time.Since(r.traceStart).Round(time.Microsecond), r.traceBytes)
+		r.traceLast = time.Now()
+	}
 	// Write out to preview file if enabled
 	if allowPreview || r.t.teecmd != "" {
 		data := make([]byte, n)
@@ -306,6 +387,7 @@ func (r *reader) Read(p []byte) (int, error) {
 
 // Called from io.Copy when closing socket
 func (r *reader) Close() error {
+	logger("[TUNE TRACE] tuner=%s channel=%s close reads=%d bytes=%d elapsed=%s reader=%T", r.t.tunerip, r.channel, r.traceReads, r.traceBytes, time.Since(r.traceStart).Round(time.Microsecond), r.ReadCloser)
 	logger("Performing Close() for %s", r.t.tunerip)
 	if r.gateDone != nil {
 		r.gateStop.Do(func() { close(r.gateDone) })
@@ -392,6 +474,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				logger("Tuner %d is active - skipping", i)
 				continue
 			}
+			stopEncoderPreview(i)
 			t = &tuners[i]
 			// Handle application encoder
 			if t.cmd != "" {
@@ -423,6 +506,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					channel:    channel,
 					t:          t,
 					cmd:        cmd,
+					traceStart: time.Now(),
 				}, nil
 			}
 			// Network encoder
@@ -439,14 +523,39 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				base = audioBaseline(t.tunerip)
 				sig = mediaSignature(t.tunerip)
 			}
+			label := fmt.Sprintf("tuner=%s", t.tunerip)
+			nullsEnabled := strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE")
+			captionsEnabled := currentCaptionConfig().Enabled
+			var resp *http.Response
+			if holdDelay == 0 {
+				requestStart := time.Now()
+				logger("[TUNE TRACE] %s encoder request begin elapsed=%s url=%s", label, time.Since(tuneStart).Round(time.Microsecond), t.url)
+				var err error
+				resp, err = http.Get(t.url)
+				if err != nil {
+					logger("[TUNE TRACE] %s encoder request failed elapsed=%s duration=%s err=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), err)
+					logger("[ERR] Failed to fetch source: %v", err)
+					t.active = false
+					continue
+				} else if resp.StatusCode != 200 {
+					logger("[ERR] Failed to fetch source: %v", resp.Status)
+					resp.Body.Close()
+					t.active = false
+					continue
+				}
+				logger("[TUNE TRACE] %s encoder response elapsed=%s duration=%s status=%s contentLength=%d transferEncoding=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), resp.Status, resp.ContentLength, resp.TransferEncoding)
+			}
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
+				if resp != nil {
+					resp.Body.Close()
+				}
 				t.active = false
 				continue
 			}
-			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
 			var gate *gateReader
+			var gateDone chan struct{}
 			if holdDelay > 0 {
 				// A tune held by the delay does not open the encoder yet: the
 				// wait is the pre-roll or NULL packets, and the encoder is
@@ -460,20 +569,9 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// which is the whole thing the feature is for.
 				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i), channel)
 			} else {
-				resp, err := http.Get(t.url)
-				if err != nil {
-					logger("[ERR] Failed to fetch source: %v", err)
-					t.active = false
-					continue
-				} else if resp.StatusCode != 200 {
-					logger("[ERR] Failed to fetch source: %v", resp.Status)
-					resp.Body.Close()
-					t.active = false
-					continue
-				}
 				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
 				body = resp.Body
-				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
+				if nullsEnabled {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
 						r, e := http.Get(t.url)
 						if e != nil {
@@ -485,16 +583,36 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						}
 						return r.Body, nil
 					}, label)
+				} else {
+					body = &sourceContinuityReader{ReadCloser: resp.Body, label: label, started: tuneStart, reopen: func() (io.ReadCloser, error) {
+						r, e := http.Get(t.url)
+						if e != nil {
+							return nil, e
+						}
+						if r.StatusCode != 200 {
+							r.Body.Close()
+							return nil, fmt.Errorf("status %s", r.Status)
+						}
+						return r.Body, nil
+					}}
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
-				hold := newTuneHold(tuneStart, ready, label, early.player())
-				if hold != nil {
+				var hold *tuneHold
+				if ready != nil {
+					hold = newTuneHold(tuneStart, ready, label, early.player())
+					gateDone = make(chan struct{})
 					gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
 					body = gate
 				}
-				body = hold.wrap(maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i)))
+				if captionsEnabled {
+					body = maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i))
+				}
+				if hold != nil {
+					body = hold.wrap(body)
+				}
 			}
+			logger("[TUNE TRACE] %s channel=%s chain=%T null=%t playbackGate=%t captions=%t holdDelay=%s preRoll=%t", label, channel, body, nullsEnabled, gate != nil, captionsEnabled, holdDelay, early.player() != nil)
 			// The clock splice wraps the whole response in tuneEarlyWith, not
 			// here — the pre-roll has to be renumbered from its very first
 			// packet in the scripts window, not only after the tune result
@@ -506,10 +624,11 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				channel:    channel,
 				t:          t,
 				gateReady:  ready,
-				gateDone:   make(chan struct{}),
+				gateDone:   gateDone,
 				gateBase:   base,
 				gateSig:    sig,
 				gate:       gate,
+				traceStart: tuneStart,
 			}
 			return r, nil
 		}
@@ -688,6 +807,8 @@ func run() error {
 	r.GET("/play/tuner:tuner/:channel", func(c *gin.Context) {
 		tuner := c.Param("tuner")
 		channel := c.Param("channel")
+		requestStart := time.Now()
+		logger("[TUNE TRACE] request begin tuner=%s channel=%s client=%s", tuner, channel, c.ClientIP())
 		reader, err := tuneEarly(tuner, channel)
 		if err != nil {
 			logger("[ERR] Failed to tune %s", err)
@@ -695,6 +816,7 @@ func run() error {
 			c.Data(500, "text/html; charset=utf-8", []byte(errorMessage))
 			return
 		}
+		logger("[TUNE TRACE] request reader ready tuner=%s channel=%s elapsed=%s reader=%T", tuner, channel, time.Since(requestStart).Round(time.Microsecond), reader)
 		// Closing the reader is what releases the tuner, runs the stop script
 		// and closes the encoder's connection, so every path must reach it.
 		defer reader.Close()
@@ -718,9 +840,11 @@ func run() error {
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
+		logger("[TUNE TRACE] response headers flushed tuner=%s channel=%s elapsed=%s", tuner, channel, time.Since(requestStart).Round(time.Microsecond))
 		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
+		logger("[TUNE TRACE] response copy ended tuner=%s channel=%s elapsed=%s bytes=%d err=%v", tuner, channel, time.Since(requestStart).Round(time.Microsecond), bytesCopied, err)
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
 		elapsedtime := time.Since(starttime)
 		speed := float64(bytesCopied) * 8 / elapsedtime.Seconds() / 1000000 // Convert from bytes/second to Mbits/second
@@ -941,6 +1065,7 @@ func run() error {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	r.GET("/api/tuner/:index/preview", func(c *gin.Context) {
+		previewStart := time.Now()
 		index, err := strconv.Atoi(c.Param("index"))
 		if err != nil || index < 0 || index >= len(tuners) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tuner index"})
@@ -950,24 +1075,57 @@ func run() error {
 			c.JSON(http.StatusNotFound, gin.H{"error": "no encoder url for this tuner"})
 			return
 		}
-		req, err := http.NewRequestWithContext(c.Request.Context(), "GET", tuners[index].url, nil)
+		tunerLock.Lock()
+		if tuners[index].active {
+			tunerLock.Unlock()
+			logger("[PREVIEW TRACE] tuner=%d mode=tune-copy client=%s file=/tmp/video_%d.ts", index, c.ClientIP(), index)
+			c.Header("Content-Type", "video/MP2T")
+			c.File(fmt.Sprintf("/tmp/video_%d.ts", index))
+			return
+		}
+		ctx, cancel := context.WithCancel(c.Request.Context())
+		preview := &encoderPreview{cancel: cancel}
+		encoderPreviews.Lock()
+		previous := encoderPreviews.m[index]
+		encoderPreviews.m[index] = preview
+		encoderPreviews.Unlock()
+		tunerLock.Unlock()
+		logger("[PREVIEW TRACE] tuner=%d mode=direct request begin client=%s url=%s", index, c.ClientIP(), tuners[index].url)
+		if previous != nil {
+			logger("[PREVIEW TRACE] tuner=%d replacing prior direct preview", index)
+			previous.cancel()
+		}
+		defer func() {
+			cancel()
+			encoderPreviews.Lock()
+			if encoderPreviews.m[index] == preview {
+				delete(encoderPreviews.m, index)
+			}
+			encoderPreviews.Unlock()
+		}()
+		req, err := http.NewRequestWithContext(ctx, "GET", tuners[index].url, nil)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			logger("[PREVIEW TRACE] tuner=%d direct request ended elapsed=%s canceled=%t err=%v", index, time.Since(previewStart).Round(time.Microsecond), ctx.Err() != nil, err)
+			if ctx.Err() == nil {
+				c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			}
 			return
 		}
 		defer resp.Body.Close()
+		logger("[PREVIEW TRACE] tuner=%d direct response elapsed=%s status=%s contentLength=%d transferEncoding=%v", index, time.Since(previewStart).Round(time.Microsecond), resp.Status, resp.ContentLength, resp.TransferEncoding)
 		if resp.StatusCode != http.StatusOK {
 			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("encoder returned %s", resp.Status)})
 			return
 		}
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
-		io.Copy(c.Writer, resp.Body)
+		bytesCopied, copyErr := io.Copy(c.Writer, resp.Body)
+		logger("[PREVIEW TRACE] tuner=%d direct copy ended elapsed=%s bytes=%d err=%v canceled=%t", index, time.Since(previewStart).Round(time.Microsecond), bytesCopied, copyErr, ctx.Err() != nil)
 	})
 	r.POST("/api/tuner/:index/release", func(c *gin.Context) {
 		index, err := strconv.Atoi(c.Param("index"))
@@ -1273,8 +1431,8 @@ func loadenv() {
 	}
 	// Get the proxy IP address used to rewrite m3u ip addresses
 	IPADDRESS := os.Getenv("IPADDRESS")
-	if os.Getenv("ALLOW_DEBUG_VIDEO_PREVIEW") == "TRUE" {
-		allowPreview = true
+	if os.Getenv("ALLOW_DEBUG_VIDEO_PREVIEW") == "FALSE" {
+		allowPreview = false
 	}
 	logger("[ENV] IPADDRESS                  %s", IPADDRESS)
 	logger("[ENV] ALERT_SMTP_SERVER          %s", os.Getenv("ALERT_SMTP_SERVER"))
@@ -2547,6 +2705,19 @@ func adbControl(tunerip string, action string) error {
 	}
 	logger("[CONTROL] %s -> %s", action, tunerip)
 	return exec.CommandContext(ctx, "adb", "-s", tunerip, "shell", "input", "keyevent", keycode).Run()
+}
+
+func stopEncoderPreview(index int) {
+	encoderPreviews.Lock()
+	preview := encoderPreviews.m[index]
+	delete(encoderPreviews.m, index)
+	encoderPreviews.Unlock()
+	if preview != nil {
+		logger("[PREVIEW TRACE] tuner=%d direct preview canceled for tune", index)
+		preview.cancel()
+	} else {
+		logger("[PREVIEW TRACE] tuner=%d no direct preview active at tune start", index)
+	}
 }
 
 func samePiids(a, b map[string]bool) bool {
