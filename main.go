@@ -67,7 +67,6 @@ type sourceRollover struct {
 	reopen    func() (io.ReadCloser, error)
 	label     string
 	ready     <-chan error
-	preDone   chan struct{}
 	firstByte chan struct{}
 	mu        sync.Mutex
 	once      sync.Once
@@ -96,11 +95,7 @@ func (s *sourceRollover) Read(p []byte) (int, error) {
 	s.bytes.Add(int64(n))
 	if n > 0 && s.firstByte != nil {
 		select {
-		case <-s.preDone:
-			select {
-			case s.firstByte <- struct{}{}:
-			default:
-			}
+		case s.firstByte <- struct{}{}:
 		default:
 		}
 	}
@@ -455,17 +450,6 @@ func (r *reader) Read(p []byte) (int, error) {
 			}
 			base := r.gateBase
 			if r.rolloverReady != nil {
-				err := execute(r.t.pre, r.t.tunerip, r.channel)
-				r.rolloverReady <- err
-				close(r.rollover.preDone)
-				if err != nil {
-					r.ReadCloser.Close()
-					logger("[ERR] Failed to run pre script: %v %s", err, r.t.tunerip)
-					return
-				}
-				if r.closed.Load() {
-					return
-				}
 				select {
 				case <-r.rollover.firstByte:
 				case <-time.After(srcStallReconnect):
@@ -716,8 +700,9 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			passthrough := holdDelay == 0 && early == nil && ready == nil && !nullsEnabled
 			var rolloverReady chan error
 			if passthrough {
-				rolloverReady = make(chan error, 2)
-			} else if err := execute(t.pre, t.tunerip, channel); err != nil {
+				rolloverReady = make(chan error, 1)
+			}
+			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
 				continue
@@ -773,17 +758,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						return r.Body, nil
 					}, label)
 				} else {
-					var readyOnce sync.Once
-					var readyErr error
 					source := &sourceRollover{ReadCloser: resp.Body, label: label, recover: passthrough, ready: rolloverReady, reopen: func() (io.ReadCloser, error) {
-						readyOnce.Do(func() {
-							if rolloverReady != nil {
-								readyErr = <-rolloverReady
-							}
-						})
-						if readyErr != nil {
-							return nil, readyErr
-						}
 						r, e := http.Get(t.url)
 						if e != nil {
 							return nil, e
@@ -796,7 +771,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					}}
 					body = source
 					if passthrough {
-						source.preDone = make(chan struct{})
 						source.firstByte = make(chan struct{}, 1)
 						rolloverSource = source
 					}
