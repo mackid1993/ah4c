@@ -23,6 +23,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/smtp"
 	"net/url"
@@ -99,6 +100,81 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	startedAt     time.Time
+	diagnosticID  uint64
+	diagnosticAt  time.Time
+	diagnosticN   atomic.Uint64
+}
+
+var diagnosticSequence atomic.Uint64
+
+type diagnosticBody struct {
+	inner io.ReadCloser
+	id    uint64
+	stage string
+	t0    time.Time
+	reads atomic.Uint64
+	total atomic.Uint64
+}
+
+func newDiagnosticBody(inner io.ReadCloser, id uint64, stage string, t0 time.Time) *diagnosticBody {
+	logger("[DIAG tune=%d stage=%s] attached inner=%T at=%v", id, stage, inner, time.Since(t0).Round(time.Microsecond))
+	return &diagnosticBody{inner: inner, id: id, stage: stage, t0: t0}
+}
+
+func (d *diagnosticBody) Read(p []byte) (int, error) {
+	read := d.reads.Add(1)
+	began := time.Now()
+	verbose := read <= 32 || read%100 == 0
+	if verbose {
+		logger("[DIAG tune=%d stage=%s] read=%d begin cap=%d at=%v", d.id, d.stage, read, len(p), time.Since(d.t0).Round(time.Microsecond))
+	}
+	n, err := d.inner.Read(p)
+	total := d.total.Add(uint64(n))
+	dur := time.Since(began)
+	if verbose || n == 0 || err != nil || dur >= 250*time.Millisecond {
+		logger("[DIAG tune=%d stage=%s] read=%d end n=%d err=%v blocked=%v total=%d at=%v", d.id, d.stage, read, n, err, dur.Round(time.Microsecond), total, time.Since(d.t0).Round(time.Microsecond))
+	}
+	if read == 1 && n > 0 {
+		sample := n
+		if sample > 32 {
+			sample = 32
+		}
+		logger("[DIAG tune=%d stage=%s] first-bytes=%x", d.id, d.stage, p[:sample])
+	}
+	return n, err
+}
+
+func (d *diagnosticBody) Close() error {
+	logger("[DIAG tune=%d stage=%s] close begin reads=%d total=%d at=%v", d.id, d.stage, d.reads.Load(), d.total.Load(), time.Since(d.t0).Round(time.Microsecond))
+	err := d.inner.Close()
+	logger("[DIAG tune=%d stage=%s] close end reads=%d total=%d err=%v at=%v", d.id, d.stage, d.reads.Load(), d.total.Load(), err, time.Since(d.t0).Round(time.Microsecond))
+	return err
+}
+
+func diagnosticGet(ctx context.Context, rawURL string, id uint64, kind string, t0 time.Time) (*http.Response, error) {
+	trace := &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			logger("[DIAG tune=%d %s] get-conn host=%s at=%v", id, kind, hostPort, time.Since(t0).Round(time.Microsecond))
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			logger("[DIAG tune=%d %s] got-conn reused=%t idle=%t idle-for=%v local=%s remote=%s at=%v", id, kind, info.Reused, info.WasIdle, info.IdleTime.Round(time.Microsecond), info.Conn.LocalAddr(), info.Conn.RemoteAddr(), time.Since(t0).Round(time.Microsecond))
+		},
+		GotFirstResponseByte: func() {
+			logger("[DIAG tune=%d %s] first-response-byte at=%v", id, kind, time.Since(t0).Round(time.Microsecond))
+		},
+	}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	logger("[DIAG tune=%d %s] request begin url=%s at=%v", id, kind, rawURL, time.Since(t0).Round(time.Microsecond))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger("[DIAG tune=%d %s] request failed err=%v at=%v", id, kind, err, time.Since(t0).Round(time.Microsecond))
+		return nil, err
+	}
+	logger("[DIAG tune=%d %s] response proto=%s status=%s content-length=%d transfer=%v close=%t headers=%v body=%T at=%v", id, kind, resp.Proto, resp.Status, resp.ContentLength, resp.TransferEncoding, resp.Close, resp.Header, resp.Body, time.Since(t0).Round(time.Microsecond))
+	return resp, nil
 }
 
 // Create a global file object to write logs to
@@ -222,17 +298,31 @@ func (r *reader) startTeeCMD() error { // Removed the readers argument
 
 // Called from io.Copy when reading socket data
 func (r *reader) Read(p []byte) (int, error) {
+	read := r.diagnosticN.Add(1)
+	verbose := read <= 32 || read%100 == 0
+	if r.diagnosticID != 0 && verbose {
+		logger("[DIAG tune=%d stage=reader] read=%d begin cap=%d at=%v", r.diagnosticID, read, len(p), time.Since(r.diagnosticAt).Round(time.Microsecond))
+	}
 	if !r.started {
 		r.started = true
 		addReader(r)
+		if r.diagnosticID != 0 {
+			logger("[DIAG tune=%d] first DVR read, launching start script at=%v", r.diagnosticID, time.Since(r.diagnosticAt).Round(time.Microsecond))
+		}
 		go func() {
 			base := r.gateBase
+			if r.diagnosticID != 0 {
+				logger("[DIAG tune=%d] start script begin at=%v", r.diagnosticID, time.Since(r.diagnosticAt).Round(time.Microsecond))
+			}
 			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
 				logger("[ERR] Failed to run start script: %v", err)
 				if r.gateReady != nil {
 					close(r.gateReady)
 				}
 				return
+			}
+			if r.diagnosticID != 0 {
+				logger("[DIAG tune=%d] start script end at=%v", r.diagnosticID, time.Since(r.diagnosticAt).Round(time.Microsecond))
 			}
 			if r.gateReady != nil {
 				if base != nil {
@@ -279,7 +369,12 @@ func (r *reader) Read(p []byte) (int, error) {
 		}
 	}
 	// Read from the source
+	began := time.Now()
 	n, err := r.ReadCloser.Read(p)
+	dur := time.Since(began)
+	if r.diagnosticID != 0 && (verbose || n == 0 || err != nil || dur >= 250*time.Millisecond) {
+		logger("[DIAG tune=%d stage=reader] read=%d end n=%d err=%v blocked=%v at=%v", r.diagnosticID, read, n, err, dur.Round(time.Microsecond), time.Since(r.diagnosticAt).Round(time.Microsecond))
+	}
 	// Write out to preview file if enabled
 	if allowPreview || r.t.teecmd != "" {
 		data := make([]byte, n)
@@ -426,8 +521,10 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				}, nil
 			}
 			// Network encoder
-			logger("Attempting network tune for device %s %s %v %v", t.url, t.tunerip, channel, idx)
+			diagnosticID := diagnosticSequence.Add(1)
 			tuneStart := time.Now()
+			logger("[DIAG tune=%d] begin encoder=%s device=%s channel=%s requested-tuner=%q null-frame=%q playback-detection=%q playback-delay=%q captions=%t preroll=%t", diagnosticID, t.url, t.tunerip, channel, idx, os.Getenv("NULL_FRAME_INSERTION"), os.Getenv("PLAYBACK_DETECTION"), os.Getenv("PLAYBACK_DELAY"), currentCaptionConfig().Enabled, prerollTS != "")
+			logger("Attempting network tune for device %s %s %v %v", t.url, t.tunerip, channel, idx)
 			var ready chan struct{}
 			var base map[string]bool
 			var sig string
@@ -439,11 +536,13 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				base = audioBaseline(t.tunerip)
 				sig = mediaSignature(t.tunerip)
 			}
+			logger("[DIAG tune=%d] pre script begin at=%v", diagnosticID, time.Since(tuneStart).Round(time.Microsecond))
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
 				continue
 			}
+			logger("[DIAG tune=%d] pre script end at=%v", diagnosticID, time.Since(tuneStart).Round(time.Microsecond))
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
 			var gate *gateReader
@@ -460,7 +559,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// which is the whole thing the feature is for.
 				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i), channel)
 			} else {
-				resp, err := http.Get(t.url)
+				resp, err := diagnosticGet(context.Background(), t.url, diagnosticID, "encoder", tuneStart)
 				if err != nil {
 					logger("[ERR] Failed to fetch source: %v", err)
 					t.active = false
@@ -472,10 +571,10 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					continue
 				}
 				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
-				body = resp.Body
+				body = newDiagnosticBody(resp.Body, diagnosticID, "encoder-body", tuneStart)
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
-					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
-						r, e := http.Get(t.url)
+					body = newStallTolerantReader(body, func() (io.ReadCloser, error) {
+						r, e := diagnosticGet(context.Background(), t.url, diagnosticID, "encoder-reconnect", tuneStart)
 						if e != nil {
 							return nil, e
 						}
@@ -483,7 +582,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 							r.Body.Close()
 							return nil, fmt.Errorf("status %s", r.Status)
 						}
-						return r.Body, nil
+						return newDiagnosticBody(r.Body, diagnosticID, "encoder-reconnect-body", tuneStart), nil
 					}, label)
 				}
 				// The gate holds the stream back until the hold says so:
@@ -493,7 +592,12 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
 					body = gate
 				}
-				body = hold.wrap(maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i)))
+				logger("[DIAG tune=%d] before captions type=%T gate=%t hold=%t at=%v", diagnosticID, body, gate != nil, hold != nil, time.Since(tuneStart).Round(time.Microsecond))
+				body = maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i))
+				logger("[DIAG tune=%d] after captions type=%T at=%v", diagnosticID, body, time.Since(tuneStart).Round(time.Microsecond))
+				body = hold.wrap(body)
+				logger("[DIAG tune=%d] after hold type=%T at=%v", diagnosticID, body, time.Since(tuneStart).Round(time.Microsecond))
+				body = newDiagnosticBody(body, diagnosticID, "delivery", tuneStart)
 			}
 			// The clock splice wraps the whole response in tuneEarlyWith, not
 			// here — the pre-roll has to be renumbered from its very first
@@ -502,15 +606,18 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			t.active = true
 			t.index = i
 			r := &reader{
-				ReadCloser: body,
-				channel:    channel,
-				t:          t,
-				gateReady:  ready,
-				gateDone:   make(chan struct{}),
-				gateBase:   base,
-				gateSig:    sig,
-				gate:       gate,
+				ReadCloser:   body,
+				channel:      channel,
+				t:            t,
+				gateReady:    ready,
+				gateDone:     make(chan struct{}),
+				gateBase:     base,
+				gateSig:      sig,
+				gate:         gate,
+				diagnosticID: diagnosticID,
+				diagnosticAt: tuneStart,
 			}
+			logger("[DIAG tune=%d] tune returned reader=%T body=%T at=%v", diagnosticID, r, body, time.Since(tuneStart).Round(time.Microsecond))
 			return r, nil
 		}
 	}
@@ -688,6 +795,8 @@ func run() error {
 	r.GET("/play/tuner:tuner/:channel", func(c *gin.Context) {
 		tuner := c.Param("tuner")
 		channel := c.Param("channel")
+		requestAt := time.Now()
+		logger("[DIAG request] begin remote=%s tuner=%q channel=%s", c.Request.RemoteAddr, tuner, channel)
 		reader, err := tuneEarly(tuner, channel)
 		if err != nil {
 			logger("[ERR] Failed to tune %s", err)
@@ -695,6 +804,7 @@ func run() error {
 			c.Data(500, "text/html; charset=utf-8", []byte(errorMessage))
 			return
 		}
+		logger("[DIAG request] tuneEarly returned type=%T after=%v", reader, time.Since(requestAt).Round(time.Microsecond))
 		// Closing the reader is what releases the tuner, runs the stop script
 		// and closes the encoder's connection, so every path must reach it.
 		defer reader.Close()
@@ -718,9 +828,11 @@ func run() error {
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
+		logger("[DIAG request] headers flushed after=%v, copy beginning", time.Since(requestAt).Round(time.Microsecond))
 		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
+		logger("[DIAG request] copy ended bytes=%d err=%v after=%v", bytesCopied, err, time.Since(requestAt).Round(time.Microsecond))
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
 		elapsedtime := time.Since(starttime)
 		speed := float64(bytesCopied) * 8 / elapsedtime.Seconds() / 1000000 // Convert from bytes/second to Mbits/second
@@ -941,7 +1053,10 @@ func run() error {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	r.GET("/api/tuner/:index/preview", func(c *gin.Context) {
+		diagnosticID := diagnosticSequence.Add(1)
+		t0 := time.Now()
 		index, err := strconv.Atoi(c.Param("index"))
+		logger("[DIAG preview=%d] begin remote=%s index=%q", diagnosticID, c.Request.RemoteAddr, c.Param("index"))
 		if err != nil || index < 0 || index >= len(tuners) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tuner index"})
 			return
@@ -950,12 +1065,7 @@ func run() error {
 			c.JSON(http.StatusNotFound, gin.H{"error": "no encoder url for this tuner"})
 			return
 		}
-		req, err := http.NewRequestWithContext(c.Request.Context(), "GET", tuners[index].url, nil)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := diagnosticGet(c.Request.Context(), tuners[index].url, diagnosticID, "preview", t0)
 		if err != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 			return
@@ -967,7 +1077,9 @@ func run() error {
 		}
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
-		io.Copy(c.Writer, resp.Body)
+		body := newDiagnosticBody(resp.Body, diagnosticID, "preview-body", t0)
+		n, copyErr := io.Copy(c.Writer, body)
+		logger("[DIAG preview=%d] copy ended bytes=%d err=%v after=%v", diagnosticID, n, copyErr, time.Since(t0).Round(time.Microsecond))
 	})
 	r.POST("/api/tuner/:index/release", func(c *gin.Context) {
 		index, err := strconv.Atoi(c.Param("index"))
