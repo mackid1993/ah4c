@@ -66,6 +66,7 @@ type sourceRollover struct {
 	io.ReadCloser
 	reopen    func() (io.ReadCloser, error)
 	label     string
+	ready     <-chan error
 	mu        sync.Mutex
 	once      sync.Once
 	fallback  sync.Once
@@ -103,17 +104,23 @@ func (s *sourceRollover) Read(p []byte) (int, error) {
 		}
 		return s.Read(p)
 	}
-	if switched || err != io.EOF {
+	if err != io.EOF {
 		return n, err
 	}
 	if n > 0 {
 		return n, nil
 	}
 	body.Close()
-	if !s.refresh() {
-		if !s.reopenAfterEnd() {
+	if !switched && s.refresh() {
+		return s.Read(p)
+	}
+	if !switched && s.ready != nil {
+		if startErr, ok := <-s.ready; !ok || startErr != nil {
 			return n, err
 		}
+	}
+	if !s.reopenAfterEnd() {
+		return n, err
 	}
 	return s.Read(p)
 }
@@ -198,6 +205,7 @@ func (s *sourceRollover) reopenAfterEnd() bool {
 	if !s.recover {
 		return false
 	}
+	recovered := false
 	s.fallback.Do(func() {
 		s.mu.Lock()
 		closed := s.closed
@@ -231,12 +239,11 @@ func (s *sourceRollover) reopenAfterEnd() bool {
 		s.ReadCloser = next
 		s.candidate = nil
 		s.switched = true
+		recovered = true
 		s.mu.Unlock()
 		logger("[TUNE TRACE] %s source reopened after encoder reset with %d bytes ready duration=%s", s.label, n, time.Since(started).Round(time.Microsecond))
 	})
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.switched
+	return recovered
 }
 
 func (s *sourceRollover) Close() error {
@@ -431,26 +438,30 @@ func (r *reader) Read(p []byte) (int, error) {
 		r.started = true
 		addReader(r)
 		go func() {
+			if r.rolloverReady != nil {
+				defer close(r.rolloverReady)
+			}
 			base := r.gateBase
 			if r.rolloverReady != nil {
 				err := execute(r.t.pre, r.t.tunerip, r.channel)
+				r.rolloverReady <- err
 				if err != nil {
-					r.rolloverReady <- err
 					r.ReadCloser.Close()
 					logger("[ERR] Failed to run pre script: %v %s", err, r.t.tunerip)
 					return
 				}
 				if r.closed.Load() {
-					r.rolloverReady <- io.ErrClosedPipe
+					return
+				}
+				if r.rollover != nil {
+					r.rollover.refresh()
+				}
+				if r.closed.Load() {
 					return
 				}
 			}
 			err := execute(r.t.start, r.channel, r.t.tunerip)
 			if r.rolloverReady != nil {
-				if r.closed.Load() {
-					r.rolloverReady <- io.ErrClosedPipe
-					return
-				}
 				r.rolloverReady <- err
 			}
 			if err != nil {
@@ -690,7 +701,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			passthrough := holdDelay == 0 && early == nil && ready == nil && !nullsEnabled
 			var rolloverReady chan error
 			if passthrough {
-				rolloverReady = make(chan error, 1)
+				rolloverReady = make(chan error, 2)
 			} else if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
@@ -749,7 +760,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				} else {
 					var readyOnce sync.Once
 					var readyErr error
-					source := &sourceRollover{ReadCloser: resp.Body, label: label, recover: passthrough, reopen: func() (io.ReadCloser, error) {
+					source := &sourceRollover{ReadCloser: resp.Body, label: label, recover: passthrough, ready: rolloverReady, reopen: func() (io.ReadCloser, error) {
 						readyOnce.Do(func() {
 							if rolloverReady != nil {
 								readyErr = <-rolloverReady
