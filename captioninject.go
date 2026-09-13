@@ -249,6 +249,8 @@ type captionInjector struct {
 	inPES    bool
 	videoCC  byte
 	ccSeeded bool // whether videoCC has picked up the source's count
+	seenPES  bool
+	firstPES bool
 
 	carry []byte // bytes of a packet split across two Write calls
 	// pmtPatch is the program table rewritten to announce the caption
@@ -411,6 +413,21 @@ func (ci *captionInjector) packet(p []byte) error {
 		}
 		_, err := ci.out.Write(p)
 		return err
+	}
+
+	if !ci.seenPES || ci.firstPES {
+		if pusi {
+			if !ci.seenPES {
+				ci.seenPES = true
+				ci.firstPES = true
+			} else {
+				ci.firstPES = false
+			}
+		}
+		if ci.firstPES || !ci.seenPES {
+			_, err := ci.out.Write(p)
+			return err
+		}
 	}
 
 	// Video packets that arrived before the PMT identified the video PID went
