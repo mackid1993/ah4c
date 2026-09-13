@@ -636,17 +636,19 @@ func isSoundEventTag(t string) bool {
 // captionStream sits between the encoder and the DVR, copying the transport
 // stream through the injector while feeding a copy of it to the recognizer.
 type captionStream struct {
-	src    io.ReadCloser
-	engine *captionEngine
-	pr     *io.PipeReader
-	pw     *io.PipeWriter
-	once   sync.Once
+	src      io.ReadCloser
+	engine   *captionEngine
+	pr       *io.PipeReader
+	pw       *io.PipeWriter
+	once     sync.Once
+	closeErr error
 	// pump starts the reading loop, and not before the gate has let a byte
 	// through. first holds that byte's chunk until the loop can take it. See
 	// Read.
-	pump    sync.Once
-	started bool
-	first   []byte
+	pump           sync.Once
+	deferUntilByte bool
+	started        bool
+	first          []byte
 }
 
 // maybeWrapCaptions returns src unchanged unless captions are switched on and
@@ -702,11 +704,14 @@ func refreshCaptionReady() {
 }
 
 func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadCloser {
+	return wrapCaptions(src, tunerIndex, label, true)
+}
+
+func wrapCaptions(src io.ReadCloser, tunerIndex int, label string, deferUntilByte bool) io.ReadCloser {
 	captionTuneStarting()
-	src = newTuneSettleReader(src)
 	cfg := currentCaptionConfig()
 	if !cfg.Enabled {
-		return src
+		return newTuneSettleReader(src)
 	}
 	if len(cfg.Tuners) > 0 {
 		found := false
@@ -717,7 +722,7 @@ func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadC
 			}
 		}
 		if !found {
-			return src
+			return newTuneSettleReader(src)
 		}
 	}
 	// Everything about whether captions can run has been worked out already,
@@ -733,18 +738,18 @@ func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadC
 	r := captionReadiness()
 	if !r.ok {
 		logger("[CC] %s %s, captions disabled for this tune", label, r.why)
-		return src
+		return newTuneSettleReader(src)
 	}
 	m := r.model
 	engine, err := newCaptionEngine(cfg, m, label)
 	if err != nil {
 		logger("[CC] %s could not start captions: %v", label, err)
-		return src
+		return newTuneSettleReader(src)
 	}
 
-	cs := &captionStream{src: src, engine: engine}
+	cs := &captionStream{src: src, engine: engine, deferUntilByte: deferUntilByte}
 	cs.pr, cs.pw = io.Pipe()
-	return cs
+	return newTuneSettleReader(cs)
 }
 
 func (cs *captionStream) run() {
@@ -840,6 +845,10 @@ func (cs *captionStream) inject() {
 // Nothing is lost by the delay: the gate emits the program tables at release,
 // so the first chunk carries what the injector needs to identify the stream.
 func (cs *captionStream) Read(p []byte) (int, error) {
+	if !cs.deferUntilByte {
+		cs.pump.Do(func() { go cs.run() })
+		return cs.pr.Read(p)
+	}
 	if !cs.started {
 		n, err := cs.src.Read(p)
 		if n > 0 {
@@ -854,19 +863,12 @@ func (cs *captionStream) Read(p []byte) (int, error) {
 }
 
 func (cs *captionStream) Close() error {
-	// The encoder connection is released first and immediately: on a channel
-	// change the next tune needs this tuner's encoder, and holding it while
-	// the recognizer winds down costs up to ten seconds of the new tune's
-	// window — the engine teardown even waits on work that the new tune's
-	// own quiet gate is holding, a circle only this ordering breaks.
-	// The engine cleans itself up in the background; nothing about it can
-	// touch the stream that no longer exists.
-	err := cs.src.Close()
 	cs.once.Do(func() {
+		cs.closeErr = cs.src.Close()
 		cs.pr.Close()
 		go cs.engine.Close()
 	})
-	return err
+	return cs.closeErr
 }
 
 // ---------------------------------------------------------------------------

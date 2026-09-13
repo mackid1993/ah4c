@@ -58,6 +58,100 @@ var (
 	allowPreview bool = false
 )
 
+type tuneRecovery struct {
+	io.ReadCloser
+	reopen    func() (io.ReadCloser, error)
+	ready     <-chan error
+	mu        sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
+	attempts  int
+	seen      uint32
+	label     string
+	closed    bool
+}
+
+func (r *tuneRecovery) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	body, attempts := r.ReadCloser, r.attempts
+	r.mu.Unlock()
+	n, err := body.Read(p)
+	if n > 0 {
+		bit := uint32(1) << attempts
+		r.mu.Lock()
+		first := r.seen&bit == 0
+		r.seen |= bit
+		r.mu.Unlock()
+		if first {
+			logger("[SOURCE TRACE] %s body=%d first bytes=%d err=%v", r.label, attempts, n, err)
+		}
+	}
+	if err != nil {
+		logger("[SOURCE TRACE] %s body=%d ended bytes=%d err=%v", r.label, attempts, n, err)
+	}
+	if err == nil {
+		return n, nil
+	}
+	if n > 0 {
+		return n, nil
+	}
+	if err != io.EOF || attempts >= 2 {
+		return 0, err
+	}
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		return 0, io.ErrClosedPipe
+	}
+	bodyClosed := false
+	for attempts < 2 {
+		if attempts == 1 {
+			if startErr, ok := <-r.ready; !ok || startErr != nil {
+				return 0, err
+			}
+		}
+		r.mu.Lock()
+		r.attempts++
+		attempts = r.attempts
+		r.mu.Unlock()
+		logger("[SOURCE TRACE] %s opening body=%d", r.label, attempts)
+		next, nextErr := r.reopen()
+		logger("[SOURCE TRACE] %s opened body=%d err=%v", r.label, attempts, nextErr)
+		if nextErr != nil {
+			if !bodyClosed {
+				body.Close()
+				bodyClosed = true
+			}
+			continue
+		}
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			next.Close()
+			return 0, io.ErrClosedPipe
+		}
+		r.ReadCloser = next
+		r.mu.Unlock()
+		if !bodyClosed {
+			body.Close()
+		}
+		return r.Read(p)
+	}
+	return 0, err
+}
+
+func (r *tuneRecovery) Close() error {
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		r.closed = true
+		body := r.ReadCloser
+		r.mu.Unlock()
+		r.closeErr = body.Close()
+	})
+	return r.closeErr
+}
+
 // /status page reader handling
 var (
 	activeReaders []*reader
@@ -98,6 +192,12 @@ type reader struct {
 	gateBase      map[string]bool
 	gateSig       string
 	gate          *gateReader
+	startDone     chan<- error
+	startFinished chan struct{}
+	startMu       sync.Mutex
+	startRunning  bool
+	closed        bool
+	recovery      *tuneRecovery
 	startedAt     time.Time
 }
 
@@ -227,7 +327,29 @@ func (r *reader) Read(p []byte) (int, error) {
 		addReader(r)
 		go func() {
 			base := r.gateBase
-			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+			if r.startDone != nil {
+				defer close(r.startDone)
+				r.startMu.Lock()
+				if r.closed {
+					r.startMu.Unlock()
+					close(r.startFinished)
+					return
+				}
+				r.startRunning = true
+				r.startMu.Unlock()
+			}
+			err := execute(r.t.start, r.channel, r.t.tunerip)
+			if r.startDone != nil {
+				r.startMu.Lock()
+				r.startRunning = false
+				r.startMu.Unlock()
+				close(r.startFinished)
+				r.startDone <- err
+			}
+			if err != nil {
+				if r.recovery != nil {
+					r.recovery.Close()
+				}
 				logger("[ERR] Failed to run start script: %v", err)
 				if r.gateReady != nil {
 					close(r.gateReady)
@@ -306,6 +428,31 @@ func (r *reader) Read(p []byte) (int, error) {
 
 // Called from io.Copy when closing socket
 func (r *reader) Close() error {
+	if r.startDone != nil {
+		r.startMu.Lock()
+		if r.closed {
+			r.startMu.Unlock()
+			return nil
+		}
+		r.closed = true
+		running := r.startRunning
+		finished := r.startFinished
+		r.startMu.Unlock()
+		if running {
+			go func() {
+				<-finished
+				r.close()
+			}()
+			return nil
+		}
+	}
+	return r.close()
+}
+
+func (r *reader) close() error {
+	if r.recovery != nil {
+		r.recovery.Close()
+	}
 	logger("Performing Close() for %s", r.t.tunerip)
 	if r.gateDone != nil {
 		r.gateStop.Do(func() { close(r.gateDone) })
@@ -320,9 +467,6 @@ func (r *reader) Close() error {
 		logger("[ERR] Failed to run stop script: %v", err)
 		execute(r.t.reboot, r.t.tunerip, r.channel)
 	}
-	tunerLock.Lock()
-	r.t.active = false
-	tunerLock.Unlock()
 	if allowPreview {
 		r.file.Close()
 		// Construct the file path based on the tuner
@@ -351,7 +495,11 @@ func (r *reader) Close() error {
 	}
 	r.cmdMutex.Unlock()
 	removeReader(r)
-	return r.ReadCloser.Close()
+	err := r.ReadCloser.Close()
+	tunerLock.Lock()
+	r.t.active = false
+	tunerLock.Unlock()
+	return err
 }
 
 func parseCommand(cmd string) []string {
@@ -439,6 +587,13 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				base = audioBaseline(t.tunerip)
 				sig = mediaSignature(t.tunerip)
 			}
+			ordinary := holdDelay == 0 && early == nil && ready == nil && !strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE")
+			var startDone chan error
+			var startFinished chan struct{}
+			if ordinary {
+				startDone = make(chan error, 1)
+				startFinished = make(chan struct{})
+			}
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
@@ -446,6 +601,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			}
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
+			var recovery *tuneRecovery
 			var gate *gateReader
 			if holdDelay > 0 {
 				// A tune held by the delay does not open the encoder yet: the
@@ -485,6 +641,19 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						}
 						return r.Body, nil
 					}, label)
+				} else if ordinary {
+					recovery = &tuneRecovery{ReadCloser: resp.Body, ready: startDone, label: label, reopen: func() (io.ReadCloser, error) {
+						r, e := http.Get(t.url)
+						if e != nil {
+							return nil, e
+						}
+						if r.StatusCode != http.StatusOK {
+							r.Body.Close()
+							return nil, fmt.Errorf("status %s", r.Status)
+						}
+						return r.Body, nil
+					}}
+					body = recovery
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
@@ -493,7 +662,12 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					gate = newGateReader(body, hold.ready, false, time.Time{}, ready)
 					body = gate
 				}
-				body = hold.wrap(maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i)))
+				if ordinary {
+					body = wrapCaptions(body, i, fmt.Sprintf("tuner%d", i), false)
+				} else {
+					body = maybeWrapCaptions(body, i, fmt.Sprintf("tuner%d", i))
+				}
+				body = hold.wrap(body)
 			}
 			// The clock splice wraps the whole response in tuneEarlyWith, not
 			// here — the pre-roll has to be renumbered from its very first
@@ -502,14 +676,17 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			t.active = true
 			t.index = i
 			r := &reader{
-				ReadCloser: body,
-				channel:    channel,
-				t:          t,
-				gateReady:  ready,
-				gateDone:   make(chan struct{}),
-				gateBase:   base,
-				gateSig:    sig,
-				gate:       gate,
+				ReadCloser:    body,
+				channel:       channel,
+				t:             t,
+				gateReady:     ready,
+				gateDone:      make(chan struct{}),
+				gateBase:      base,
+				gateSig:       sig,
+				gate:          gate,
+				startDone:     startDone,
+				startFinished: startFinished,
+				recovery:      recovery,
 			}
 			return r, nil
 		}
