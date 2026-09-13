@@ -62,62 +62,6 @@ type encoderPreview struct {
 	cancel context.CancelFunc
 }
 
-type sourceContinuityReader struct {
-	io.ReadCloser
-	reopen   func() (io.ReadCloser, error)
-	label    string
-	reopened bool
-	rollover bool
-	waiting  bool
-	reopenAt time.Time
-	started  time.Time
-	bytes    int64
-}
-
-func (r *sourceContinuityReader) Read(p []byte) (int, error) {
-	for {
-		if r.rollover {
-			r.rollover = false
-			if err := r.reopenSource(); err != nil {
-				return 0, err
-			}
-		}
-		n, err := r.ReadCloser.Read(p)
-		if n > 0 && r.waiting {
-			r.waiting = false
-			logger("[TUNE TRACE] %s source reopen=1 first bytes=%d wait=%s elapsed=%s", r.label, n, time.Since(r.reopenAt).Round(time.Microsecond), time.Since(r.started).Round(time.Microsecond))
-		}
-		r.bytes += int64(n)
-		if err != io.EOF || r.reopened {
-			return n, err
-		}
-		if n > 0 {
-			r.rollover = true
-			return n, nil
-		}
-		if err := r.reopenSource(); err != nil {
-			return 0, err
-		}
-	}
-}
-
-func (r *sourceContinuityReader) reopenSource() error {
-	r.reopened = true
-	r.ReadCloser.Close()
-	started := time.Now()
-	logger("[TUNE TRACE] %s initial encoder body ended bytes=%d; source reopen=1", r.label, r.bytes)
-	next, err := r.reopen()
-	if err != nil {
-		logger("[TUNE TRACE] %s source reopen=1 failed duration=%s err=%v", r.label, time.Since(started).Round(time.Microsecond), err)
-		return err
-	}
-	r.ReadCloser = next
-	r.reopenAt = time.Now()
-	r.waiting = true
-	logger("[TUNE TRACE] %s source reopen=1 connected duration=%s", r.label, time.Since(started).Round(time.Microsecond))
-	return nil
-}
-
 var encoderPreviews = struct {
 	sync.Mutex
 	m map[int]*encoderPreview
@@ -526,30 +470,8 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			nullsEnabled := strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE")
 			captionsEnabled := currentCaptionConfig().Enabled
-			var resp *http.Response
-			if holdDelay == 0 {
-				requestStart := time.Now()
-				logger("[TUNE TRACE] %s encoder request begin elapsed=%s url=%s", label, time.Since(tuneStart).Round(time.Microsecond), t.url)
-				var err error
-				resp, err = http.Get(t.url)
-				if err != nil {
-					logger("[TUNE TRACE] %s encoder request failed elapsed=%s duration=%s err=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), err)
-					logger("[ERR] Failed to fetch source: %v", err)
-					t.active = false
-					continue
-				} else if resp.StatusCode != 200 {
-					logger("[ERR] Failed to fetch source: %v", resp.Status)
-					resp.Body.Close()
-					t.active = false
-					continue
-				}
-				logger("[TUNE TRACE] %s encoder response elapsed=%s duration=%s status=%s contentLength=%d transferEncoding=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), resp.Status, resp.ContentLength, resp.TransferEncoding)
-			}
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
-				if resp != nil {
-					resp.Body.Close()
-				}
 				t.active = false
 				continue
 			}
@@ -569,6 +491,21 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// which is the whole thing the feature is for.
 				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i), channel)
 			} else {
+				requestStart := time.Now()
+				logger("[TUNE TRACE] %s encoder request begin elapsed=%s url=%s", label, time.Since(tuneStart).Round(time.Microsecond), t.url)
+				resp, err := http.Get(t.url)
+				if err != nil {
+					logger("[TUNE TRACE] %s encoder request failed elapsed=%s duration=%s err=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), err)
+					logger("[ERR] Failed to fetch source: %v", err)
+					t.active = false
+					continue
+				} else if resp.StatusCode != 200 {
+					logger("[ERR] Failed to fetch source: %v", resp.Status)
+					resp.Body.Close()
+					t.active = false
+					continue
+				}
+				logger("[TUNE TRACE] %s encoder response elapsed=%s duration=%s status=%s contentLength=%d transferEncoding=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), resp.Status, resp.ContentLength, resp.TransferEncoding)
 				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
 				body = resp.Body
 				if nullsEnabled {
@@ -583,18 +520,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						}
 						return r.Body, nil
 					}, label)
-				} else {
-					body = &sourceContinuityReader{ReadCloser: resp.Body, label: label, started: tuneStart, reopen: func() (io.ReadCloser, error) {
-						r, e := http.Get(t.url)
-						if e != nil {
-							return nil, e
-						}
-						if r.StatusCode != 200 {
-							r.Body.Close()
-							return nil, fmt.Errorf("status %s", r.Status)
-						}
-						return r.Body, nil
-					}}
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
