@@ -68,8 +68,10 @@ type sourceRollover struct {
 	label     string
 	mu        sync.Mutex
 	once      sync.Once
+	fallback  sync.Once
 	switched  bool
 	closed    bool
+	recover   bool
 	candidate io.ReadCloser
 	bytes     atomic.Int64
 }
@@ -109,7 +111,9 @@ func (s *sourceRollover) Read(p []byte) (int, error) {
 	}
 	body.Close()
 	if !s.refresh() {
-		return n, err
+		if !s.reopenAfterEnd() {
+			return n, err
+		}
 	}
 	return s.Read(p)
 }
@@ -170,6 +174,33 @@ func (s *sourceRollover) refresh() bool {
 		s.mu.Unlock()
 		old.Close()
 		logger("[TUNE TRACE] %s source handed off after %d bytes with %d bytes ready duration=%s", s.label, s.bytes.Load(), n, time.Since(started).Round(time.Microsecond))
+	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.switched
+}
+
+func (s *sourceRollover) reopenAfterEnd() bool {
+	if !s.recover {
+		return false
+	}
+	s.fallback.Do(func() {
+		started := time.Now()
+		next, err := s.reopen()
+		if err != nil {
+			logger("[TUNE TRACE] %s source recovery failed duration=%s err=%v", s.label, time.Since(started).Round(time.Microsecond), err)
+			return
+		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			next.Close()
+			return
+		}
+		s.ReadCloser = next
+		s.switched = true
+		s.mu.Unlock()
+		logger("[TUNE TRACE] %s source reopened after encoder reset duration=%s", s.label, time.Since(started).Round(time.Microsecond))
 	})
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -687,11 +718,16 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						return r.Body, nil
 					}, label)
 				} else {
-					source := &sourceRollover{ReadCloser: resp.Body, label: label, reopen: func() (io.ReadCloser, error) {
-						if rolloverReady != nil {
-							if err := <-rolloverReady; err != nil {
-								return nil, err
+					var readyOnce sync.Once
+					var readyErr error
+					source := &sourceRollover{ReadCloser: resp.Body, label: label, recover: passthrough, reopen: func() (io.ReadCloser, error) {
+						readyOnce.Do(func() {
+							if rolloverReady != nil {
+								readyErr = <-rolloverReady
 							}
+						})
+						if readyErr != nil {
+							return nil, readyErr
 						}
 						r, e := http.Get(t.url)
 						if e != nil {
