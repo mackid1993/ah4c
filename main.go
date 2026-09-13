@@ -110,10 +110,10 @@ func (s *sourceRollover) Read(p []byte) (int, error) {
 	if n > 0 {
 		return n, nil
 	}
-	body.Close()
 	if !switched && s.refresh() {
 		return s.Read(p)
 	}
+	body.Close()
 	if s.ready != nil {
 		if startErr, ok := <-s.ready; !ok || startErr != nil {
 			return n, err
