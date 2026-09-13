@@ -62,6 +62,43 @@ type encoderPreview struct {
 	cancel context.CancelFunc
 }
 
+type sourceRollover struct {
+	io.ReadCloser
+	reopen   func() (io.ReadCloser, error)
+	label    string
+	reopened bool
+	bytes    int64
+}
+
+func (s *sourceRollover) sessions() int64 {
+	if s.reopened {
+		return 1
+	}
+	return 0
+}
+
+func (s *sourceRollover) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	s.bytes += int64(n)
+	if err != io.EOF || s.reopened {
+		return n, err
+	}
+	if n > 0 {
+		return n, nil
+	}
+	s.reopened = true
+	s.ReadCloser.Close()
+	started := time.Now()
+	next, err := s.reopen()
+	if err != nil {
+		logger("[TUNE TRACE] %s source rollover failed duration=%s err=%v", s.label, time.Since(started).Round(time.Microsecond), err)
+		return 0, err
+	}
+	s.ReadCloser = next
+	logger("[TUNE TRACE] %s source rolled over after %d bytes duration=%s", s.label, s.bytes, time.Since(started).Round(time.Microsecond))
+	return s.Read(p)
+}
+
 var encoderPreviews = struct {
 	sync.Mutex
 	m map[int]*encoderPreview
@@ -470,6 +507,11 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			nullsEnabled := strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE")
 			captionsEnabled := currentCaptionConfig().Enabled
+			if err := execute(t.pre, t.tunerip, channel); err != nil {
+				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
+				t.active = false
+				continue
+			}
 			var resp *http.Response
 			if holdDelay == 0 {
 				requestStart := time.Now()
@@ -488,14 +530,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					continue
 				}
 				logger("[TUNE TRACE] %s encoder response elapsed=%s duration=%s status=%s contentLength=%d transferEncoding=%v", label, time.Since(tuneStart).Round(time.Microsecond), time.Since(requestStart).Round(time.Microsecond), resp.Status, resp.ContentLength, resp.TransferEncoding)
-			}
-			if err := execute(t.pre, t.tunerip, channel); err != nil {
-				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
-				if resp != nil {
-					resp.Body.Close()
-				}
-				t.active = false
-				continue
 			}
 			var body io.ReadCloser
 			var gate *gateReader
@@ -527,6 +561,18 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						}
 						return r.Body, nil
 					}, label)
+				} else {
+					body = &sourceRollover{ReadCloser: resp.Body, label: label, reopen: func() (io.ReadCloser, error) {
+						r, e := http.Get(t.url)
+						if e != nil {
+							return nil, e
+						}
+						if r.StatusCode != http.StatusOK {
+							r.Body.Close()
+							return nil, fmt.Errorf("status %s", r.Status)
+						}
+						return r.Body, nil
+					}}
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
