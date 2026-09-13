@@ -132,6 +132,10 @@ func (s *sourceRollover) prime(next io.ReadCloser) (io.ReadCloser, int, error) {
 		next.Close()
 		return nil, 0, io.ErrClosedPipe
 	}
+	if s.ready != nil {
+		s.mu.Unlock()
+		return next, 0, nil
+	}
 	s.candidate = next
 	s.mu.Unlock()
 	first := make([]byte, 188)
