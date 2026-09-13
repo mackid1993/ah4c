@@ -67,7 +67,7 @@ type sourceRollover struct {
 	reopen    func() (io.ReadCloser, error)
 	label     string
 	ready     <-chan error
-	firstByte chan struct{}
+	preDone   chan struct{}
 	mu        sync.Mutex
 	once      sync.Once
 	fallback  sync.Once
@@ -88,16 +88,27 @@ func (s *sourceRollover) sessions() int64 {
 }
 
 func (s *sourceRollover) Read(p []byte) (int, error) {
-	s.mu.Lock()
-	body, switched := s.ReadCloser, s.switched
-	s.mu.Unlock()
-	n, err := body.Read(p)
-	s.bytes.Add(int64(n))
-	if n > 0 && s.firstByte != nil {
-		select {
-		case s.firstByte <- struct{}{}:
-		default:
+	var body io.ReadCloser
+	var switched bool
+	var n int
+	var err error
+	for {
+		s.mu.Lock()
+		body, switched = s.ReadCloser, s.switched
+		s.mu.Unlock()
+		n, err = body.Read(p)
+		s.bytes.Add(int64(n))
+		if s.preDone != nil && !switched {
+			select {
+			case <-s.preDone:
+			default:
+				n = 0
+				if err == nil {
+					continue
+				}
+			}
 		}
+		break
 	}
 	if err == nil {
 		return n, err
@@ -450,11 +461,13 @@ func (r *reader) Read(p []byte) (int, error) {
 			}
 			base := r.gateBase
 			if r.rolloverReady != nil {
-				select {
-				case <-r.rollover.firstByte:
-				case <-time.After(srcStallReconnect):
-					logger("[TUNE TRACE] tuner=%s channel=%s no post-wake source byte within %s; starting tune", r.t.tunerip, r.channel, srcStallReconnect)
+				err := execute(r.t.pre, r.t.tunerip, r.channel)
+				if err != nil {
+					r.ReadCloser.Close()
+					logger("[ERR] Failed to run pre script: %v %s", err, r.t.tunerip)
+					return
 				}
+				close(r.rollover.preDone)
 				if r.closed.Load() {
 					return
 				}
@@ -701,8 +714,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			var rolloverReady chan error
 			if passthrough {
 				rolloverReady = make(chan error, 1)
-			}
-			if err := execute(t.pre, t.tunerip, channel); err != nil {
+			} else if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
 				continue
@@ -771,7 +783,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					}}
 					body = source
 					if passthrough {
-						source.firstByte = make(chan struct{}, 1)
+						source.preDone = make(chan struct{})
 						rolloverSource = source
 					}
 				}
