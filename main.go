@@ -67,7 +67,6 @@ type sourceRollover struct {
 	reopen    func() (io.ReadCloser, error)
 	label     string
 	ready     <-chan error
-	preDone   chan struct{}
 	mu        sync.Mutex
 	once      sync.Once
 	fallback  sync.Once
@@ -88,28 +87,11 @@ func (s *sourceRollover) sessions() int64 {
 }
 
 func (s *sourceRollover) Read(p []byte) (int, error) {
-	var body io.ReadCloser
-	var switched bool
-	var n int
-	var err error
-	for {
-		s.mu.Lock()
-		body, switched = s.ReadCloser, s.switched
-		s.mu.Unlock()
-		n, err = body.Read(p)
-		s.bytes.Add(int64(n))
-		if s.preDone != nil && !switched {
-			select {
-			case <-s.preDone:
-			default:
-				n = 0
-				if err == nil {
-					continue
-				}
-			}
-		}
-		break
-	}
+	s.mu.Lock()
+	body, switched := s.ReadCloser, s.switched
+	s.mu.Unlock()
+	n, err := body.Read(p)
+	s.bytes.Add(int64(n))
 	if err == nil {
 		return n, err
 	}
@@ -322,7 +304,7 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	rolloverReady chan<- error
-	rollover      *sourceRollover
+	startStop     sync.Mutex
 	closed        atomic.Bool
 	startedAt     time.Time
 	traceStart    time.Time
@@ -461,19 +443,15 @@ func (r *reader) Read(p []byte) (int, error) {
 			}
 			base := r.gateBase
 			if r.rolloverReady != nil {
-				err := execute(r.t.pre, r.t.tunerip, r.channel)
-				if err != nil {
-					r.ReadCloser.Close()
-					logger("[ERR] Failed to run pre script: %v %s", err, r.t.tunerip)
-					return
-				}
-				close(r.rollover.preDone)
+				r.startStop.Lock()
 				if r.closed.Load() {
+					r.startStop.Unlock()
 					return
 				}
 			}
 			err := execute(r.t.start, r.channel, r.t.tunerip)
 			if r.rolloverReady != nil {
+				r.startStop.Unlock()
 				r.rolloverReady <- err
 			}
 			if err != nil {
@@ -571,6 +549,10 @@ func (r *reader) Read(p []byte) (int, error) {
 // Called from io.Copy when closing socket
 func (r *reader) Close() error {
 	r.closed.Store(true)
+	if r.rolloverReady != nil {
+		r.startStop.Lock()
+		r.startStop.Unlock()
+	}
 	logger("[TUNE TRACE] tuner=%s channel=%s close reads=%d bytes=%d elapsed=%s reader=%T", r.t.tunerip, r.channel, r.traceReads, r.traceBytes, time.Since(r.traceStart).Round(time.Microsecond), r.ReadCloser)
 	logger("Performing Close() for %s", r.t.tunerip)
 	if r.gateDone != nil {
@@ -714,7 +696,8 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			var rolloverReady chan error
 			if passthrough {
 				rolloverReady = make(chan error, 1)
-			} else if err := execute(t.pre, t.tunerip, channel); err != nil {
+			}
+			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 				t.active = false
 				continue
@@ -741,7 +724,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			var body io.ReadCloser
 			var gate *gateReader
 			var gateDone chan struct{}
-			var rolloverSource *sourceRollover
 			if holdDelay > 0 {
 				// A tune held by the delay does not open the encoder yet: the
 				// wait is the pre-roll or NULL packets, and the encoder is
@@ -782,10 +764,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 						return r.Body, nil
 					}}
 					body = source
-					if passthrough {
-						source.preDone = make(chan struct{})
-						rolloverSource = source
-					}
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
@@ -820,7 +798,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				gateSig:       sig,
 				gate:          gate,
 				rolloverReady: rolloverReady,
-				rollover:      rolloverSource,
 				traceStart:    tuneStart,
 			}
 			return r, nil
