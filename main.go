@@ -548,10 +548,10 @@ func executeStarted(started chan struct{}, args ...string) error {
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 	err := cmd.Start()
-	close(started)
 	if err == nil {
 		err = cmd.Wait()
 	}
+	close(started)
 	logger("[EXECUTE] Stdout: '%s'", stdoutBuf.String())
 	logger("[EXECUTE] Stderr: '%s'", stderrBuf.String())
 	logger("[EXECUTE] Finished running %v in %v", args[0], time.Since(t0))
