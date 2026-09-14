@@ -2024,12 +2024,6 @@ func (c *cea608) reset() {
 	c.crCopies = 0
 }
 
-func (c *cea608) hasPendingText() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.queue) > 0 || len(c.held) > 0
-}
-
 func (c *cea608) backlog() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
