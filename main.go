@@ -98,7 +98,131 @@ type reader struct {
 	gateBase      map[string]bool
 	gateSig       string
 	gate          *gateReader
+	rollover      *rolloverReader
 	startedAt     time.Time
+}
+
+type rolloverReader struct {
+	mu        sync.Mutex
+	body      io.ReadCloser
+	reopen    func() (io.ReadCloser, error)
+	closed    chan struct{}
+	started   chan struct{}
+	closeOnce sync.Once
+	startOnce sync.Once
+	starting  bool
+}
+
+func newRolloverReader(body io.ReadCloser, reopen func() (io.ReadCloser, error)) *rolloverReader {
+	defer traceFunction("newRolloverReader", nil, "source=%T/%p", body, body)()
+
+	return &rolloverReader{body: body, reopen: reopen, closed: make(chan struct{}), started: make(chan struct{}), starting: true}
+}
+
+func (r *rolloverReader) startFinished() {
+	defer traceFunction("rolloverReader.startFinished", r, "")()
+
+	r.startOnce.Do(func() {
+		r.mu.Lock()
+		body := r.body
+		r.body = nil
+		r.mu.Unlock()
+		if body != nil {
+			body.Close()
+		}
+		r.mu.Lock()
+		r.starting = false
+		r.mu.Unlock()
+		close(r.started)
+	})
+}
+
+func (r *rolloverReader) Read(p []byte) (int, error) {
+	defer traceFunction("rolloverReader.Read", r, "")()
+
+	for {
+		r.mu.Lock()
+		body := r.body
+		starting := r.starting
+		r.mu.Unlock()
+
+		if body == nil {
+			if starting {
+				select {
+				case <-r.closed:
+					return 0, io.EOF
+				case <-r.started:
+					continue
+				}
+			}
+			select {
+			case <-r.closed:
+				return 0, io.EOF
+			default:
+			}
+			next, err := r.reopen()
+			if err != nil {
+				select {
+				case <-r.closed:
+					return 0, io.EOF
+				case <-time.After(100 * time.Millisecond):
+					continue
+				}
+			}
+			r.mu.Lock()
+			select {
+			case <-r.closed:
+				r.mu.Unlock()
+				next.Close()
+				return 0, io.EOF
+			default:
+				r.body = next
+				body = next
+				r.mu.Unlock()
+			}
+		}
+
+		n, err := body.Read(p)
+		r.mu.Lock()
+		current := r.body == body
+		starting = r.starting
+		if err != nil && current {
+			r.body = nil
+		}
+		r.mu.Unlock()
+		if !current || starting {
+			if err != nil {
+				body.Close()
+			}
+			continue
+		}
+		if err != nil {
+			body.Close()
+		}
+		if n > 0 {
+			return n, nil
+		}
+		if err == nil {
+			continue
+		}
+		select {
+		case <-r.closed:
+			return 0, io.EOF
+		default:
+		}
+	}
+}
+
+func (r *rolloverReader) Close() error {
+	defer traceFunction("rolloverReader.Close", nil, "reader=%p", r)()
+
+	r.closeOnce.Do(func() { close(r.closed) })
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.body != nil {
+		return r.body.Close()
+	}
+	return nil
 }
 
 // Create a global file object to write logs to
@@ -229,7 +353,11 @@ func (r *reader) Read(p []byte) (int, error) {
 		addReader(r)
 		go func() {
 			base := r.gateBase
-			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+			err := execute(r.t.start, r.channel, r.t.tunerip)
+			if r.rollover != nil {
+				r.rollover.startFinished()
+			}
+			if err != nil {
 				logger("[ERR] Failed to run start script: %v", err)
 				if r.gateReady != nil {
 					close(r.gateReady)
@@ -453,6 +581,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
 			var gate *gateReader
+			var rollover *rolloverReader
 			if holdDelay > 0 {
 				// A tune held by the delay does not open the encoder yet: the
 				// wait is the pre-roll or NULL packets, and the encoder is
@@ -493,7 +622,8 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, reopen, label)
 				} else if ready == nil {
-					body = newRolloverReader(resp.Body, reopen)
+					rollover = newRolloverReader(resp.Body, reopen)
+					body = rollover
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
@@ -519,6 +649,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				gateBase:   base,
 				gateSig:    sig,
 				gate:       gate,
+				rollover:   rollover,
 			}
 			return r, nil
 		}
