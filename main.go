@@ -460,7 +460,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// which is the whole thing the feature is for.
 				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i), channel)
 			} else {
-				resp, err := http.Get(t.url)
+				resp, err := packetTraceGet(t.url)
 				if err != nil {
 					logger("[ERR] Failed to fetch source: %v", err)
 					t.active = false
@@ -473,7 +473,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				}
 				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
 				reopen := func() (io.ReadCloser, error) {
-					r, e := http.Get(t.url)
+					r, e := packetTraceGet(t.url)
 					if e != nil {
 						return nil, e
 					}
@@ -2696,6 +2696,9 @@ type flushWriter interface {
 
 // copyFlush is io.Copy, flushed after every write.
 func copyFlush(dst flushWriter, src io.Reader) (int64, error) {
+	capture := newPacketCapture("output")
+	defer capture.close()
+	logger("[PACKET TRACE] output=%s reader=%p", capture.path, src)
 	buf := make([]byte, 32*1024)
 	var n int64
 	for {
@@ -2703,6 +2706,7 @@ func copyFlush(dst flushWriter, src io.Reader) (int64, error) {
 		if r > 0 {
 			w, werr := dst.Write(buf[:r])
 			n += int64(w)
+			capture.record(buf[:w])
 			if werr != nil {
 				return n, werr
 			}
