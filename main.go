@@ -223,8 +223,6 @@ func (r *reader) startTeeCMD() error { // Removed the readers argument
 
 // Called from io.Copy when reading socket data
 func (r *reader) Read(p []byte) (int, error) {
-	defer traceFunction("reader.Read", r, "tuner=%s channel=%s source=%T/%p gate=%p", r.t.tunerip, r.channel, r.ReadCloser, r.ReadCloser, r.gate)()
-
 	if !r.started {
 		r.started = true
 		addReader(r)
@@ -329,8 +327,6 @@ func (r *reader) Read(p []byte) (int, error) {
 
 // Called from io.Copy when closing socket
 func (r *reader) Close() error {
-	defer traceFunction("reader.Close", nil, "reader=%p tuner=%s channel=%s source=%T/%p", r, r.t.tunerip, r.channel, r.ReadCloser, r.ReadCloser)()
-
 	logger("Performing Close() for %s", r.t.tunerip)
 	if r.gateDone != nil {
 		r.gateStop.Do(func() { close(r.gateDone) })
@@ -407,8 +403,6 @@ func parseCommand(cmd string) []string {
 // Tune into a application or network encoder. early is the pre-roll already
 // playing for this request, for the hold to carry on with, or nil.
 func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
-	defer traceFunction("main.tune", nil, "idx=%q channel=%q early=%p delay=%v preroll=%q nullEnv=%q detectEnv=%q captions=%t", idx, channel, early, holdDelay, prerollTS, os.Getenv("NULL_FRAME_INSERTION"), os.Getenv("PLAYBACK_DETECTION"), currentCaptionConfig().Enabled)()
-
 	tunerLock.Lock()
 	defer tunerLock.Unlock()
 	intidx, _ := strconv.Atoi(idx)
@@ -558,8 +552,6 @@ func plainTune() bool {
 
 // Custom execute command with timing stats
 func execute(args ...string) error {
-	defer traceFunction("main.execute", nil, "args=%v", args)()
-
 	t0 := time.Now()
 	logger("[EXECUTE] Running %v", args)
 	cmd := exec.Command(args[0], args[1:]...)
