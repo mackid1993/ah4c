@@ -100,6 +100,7 @@ type reader struct {
 	gate          *gateReader
 	startedAt     time.Time
 	sourceURL     string
+	startDone     <-chan error
 }
 
 type playbackReader struct {
@@ -230,12 +231,14 @@ func (r *reader) Read(p []byte) (int, error) {
 	if !r.started {
 		r.started = true
 		addReader(r)
-		go func() {
-			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
-				logger("[ERR] Failed to run start script: %v", err)
-				return
-			}
-		}()
+		if r.startDone == nil {
+			go func() {
+				if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+					logger("[ERR] Failed to run start script: %v", err)
+					return
+				}
+			}()
+		}
 	}
 	// Determine the index of the tuner
 	tunerIndex := -1
@@ -269,6 +272,12 @@ func (r *reader) Read(p []byte) (int, error) {
 		if n > 0 {
 			err = nil
 		} else {
+			if r.startDone != nil {
+				if startErr := <-r.startDone; startErr != nil {
+					return 0, startErr
+				}
+				r.startDone = nil
+			}
 			sourceURL := r.sourceURL
 			r.sourceURL = ""
 			resp, getErr := http.Get(sourceURL)
@@ -508,9 +517,15 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				}
 				body = resp.Body
 				if plain {
+					startDone, startErr := executeStarted(t.start, channel, t.tunerip)
+					if startErr != nil {
+						body.Close()
+						t.active = false
+						continue
+					}
 					t.active = true
 					t.index = i
-					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url}, nil
+					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url, startDone: startDone}, nil
 				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
@@ -580,6 +595,27 @@ func execute(args ...string) error {
 	logger("[EXECUTE] Stderr: '%s'", errStr)
 	logger("[EXECUTE] Finished running %v in %v", args[0], time.Since(t0))
 	return err
+}
+
+func executeStarted(args ...string) (<-chan error, error) {
+	t0 := time.Now()
+	logger("[EXECUTE] Running %v", args)
+	cmd := exec.Command(args[0], args[1:]...)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		logger("[EXECUTE] Stdout: '%s'", stdoutBuf.String())
+		logger("[EXECUTE] Stderr: '%s'", stderrBuf.String())
+		logger("[EXECUTE] Finished running %v in %v", args[0], time.Since(t0))
+		done <- err
+	}()
+	return done, nil
 }
 
 // GIN custom logging middleware
