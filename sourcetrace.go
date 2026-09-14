@@ -15,8 +15,8 @@ type sourceTraceBody struct {
 	id      uint64
 	label   string
 	started time.Time
-	reads   int64
-	bytes   int64
+	reads   atomic.Int64
+	bytes   atomic.Int64
 	first   bool
 }
 
@@ -29,14 +29,14 @@ func traceSourceBody(inner io.ReadCloser, label string, resp *http.Response) io.
 func (s *sourceTraceBody) Read(p []byte) (int, error) {
 	t0 := time.Now()
 	n, err := s.inner.Read(p)
-	s.reads++
-	s.bytes += int64(n)
+	s.reads.Add(1)
+	s.bytes.Add(int64(n))
 	if !s.first && n > 0 {
 		s.first = true
-		logger("[SOURCE TRACE] id=%d %s first bytes n=%d read=%d elapsed=%v", s.id, s.label, n, s.reads, time.Since(s.started))
+		logger("[SOURCE TRACE] id=%d %s first bytes n=%d read=%d elapsed=%v", s.id, s.label, n, s.reads.Load(), time.Since(s.started))
 	}
-	if n == 0 || err != nil {
-		logger("[SOURCE TRACE] id=%d %s read n=%d err=%v call=%v totalReads=%d totalBytes=%d elapsed=%v", s.id, s.label, n, err, time.Since(t0), s.reads, s.bytes, time.Since(s.started))
+	if time.Since(s.started) < 10*time.Second || time.Since(t0) > 250*time.Millisecond || n == 0 || err != nil {
+		logger("[SOURCE TRACE] id=%d %s read n=%d err=%v call=%v totalReads=%d totalBytes=%d elapsed=%v", s.id, s.label, n, err, time.Since(t0), s.reads.Load(), s.bytes.Load(), time.Since(s.started))
 	}
 	return n, err
 }
@@ -44,6 +44,6 @@ func (s *sourceTraceBody) Read(p []byte) (int, error) {
 func (s *sourceTraceBody) Close() error {
 	buf := make([]byte, 8192)
 	n := runtime.Stack(buf, false)
-	logger("[SOURCE TRACE] id=%d %s local Close after %v reads=%d bytes=%d stack=%s", s.id, s.label, time.Since(s.started), s.reads, s.bytes, string(buf[:n]))
+	logger("[SOURCE TRACE] id=%d %s local Close after %v reads=%d bytes=%d stack=%s", s.id, s.label, time.Since(s.started), s.reads.Load(), s.bytes.Load(), string(buf[:n]))
 	return s.inner.Close()
 }

@@ -224,8 +224,11 @@ func (r *reader) startTeeCMD() error { // Removed the readers argument
 func (r *reader) Read(p []byte) (int, error) {
 	if !r.started {
 		r.started = true
+		logger("[LIFE TRACE] reader=%p tuner=%s channel=%s first Read source=%T", r, r.t.tunerip, r.channel, r.ReadCloser)
 		addReader(r)
 		go func() {
+			logger("[LIFE TRACE] reader=%p start goroutine entered", r)
+			defer logger("[LIFE TRACE] reader=%p start goroutine exited", r)
 			base := r.gateBase
 			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
 				logger("[ERR] Failed to run start script: %v", err)
@@ -306,6 +309,8 @@ func (r *reader) Read(p []byte) (int, error) {
 
 // Called from io.Copy when closing socket
 func (r *reader) Close() error {
+	logger("[LIFE TRACE] reader=%p tuner=%s channel=%s Close entered", r, r.t.tunerip, r.channel)
+	defer logger("[LIFE TRACE] reader=%p Close returned", r)
 	logger("Performing Close() for %s", r.t.tunerip)
 	if r.gateDone != nil {
 		r.gateStop.Do(func() { close(r.gateDone) })
@@ -322,6 +327,7 @@ func (r *reader) Close() error {
 	}
 	tunerLock.Lock()
 	r.t.active = false
+	logger("[LIFE TRACE] reader=%p tuner=%s made available before source Close", r, r.t.tunerip)
 	tunerLock.Unlock()
 	if allowPreview {
 		r.file.Close()
@@ -699,6 +705,9 @@ func run() error {
 		}
 		// Closing the reader is what releases the tuner, runs the stop script
 		// and closes the encoder's connection, so every path must reach it.
+		logger("[REQUEST TRACE] reader=%p remote=%s tuner=%s channel=%s", reader, c.Request.RemoteAddr, tuner, channel)
+		stopTrace := context.AfterFunc(c.Request.Context(), func() { logger("[REQUEST TRACE] reader=%p DVR context ended", reader) })
+		defer stopTrace()
 		defer reader.Close()
 		starttime := time.Now()
 		var bytesCopied int64
@@ -2700,12 +2709,15 @@ func copyFlush(dst flushWriter, src io.Reader) (int64, error) {
 	var reads int64
 	started := time.Now()
 	for {
+		t0 := time.Now()
 		r, rerr := src.Read(buf)
+		readTime := time.Since(t0)
 		reads++
-		if reads == 1 || r == 0 || rerr != nil {
-			logger("[COPY TRACE] read=%d n=%d err=%v total=%d elapsed=%v src=%T", reads, r, rerr, n, time.Since(started), src)
+		if time.Since(started) < 10*time.Second || readTime > 250*time.Millisecond || r == 0 || rerr != nil {
+			logger("[COPY TRACE] reader=%p read=%d n=%d err=%v total=%d elapsed=%v blocked=%v src=%T", src, reads, r, rerr, n, time.Since(started), readTime, src)
 		}
 		if r > 0 {
+			w0 := time.Now()
 			w, werr := dst.Write(buf[:r])
 			n += int64(w)
 			if w != r || werr != nil {
@@ -2715,6 +2727,9 @@ func copyFlush(dst flushWriter, src io.Reader) (int64, error) {
 				return n, werr
 			}
 			dst.Flush()
+			if time.Since(started) < 10*time.Second || time.Since(w0) > 250*time.Millisecond {
+				logger("[WRITE TRACE] reader=%p read=%d offered=%d wrote=%d err=%v writeFlush=%v total=%d", src, reads, r, w, werr, time.Since(w0), n)
+			}
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
