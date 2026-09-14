@@ -100,6 +100,9 @@ type reader struct {
 	gate          *gateReader
 	startedAt     time.Time
 	sourceURL     string
+	held          []byte
+	holding       bool
+	tuned         chan struct{}
 }
 
 type playbackReader struct {
@@ -233,7 +236,9 @@ func (r *reader) Read(p []byte) (int, error) {
 		go func() {
 			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
 				logger("[ERR] Failed to run start script: %v", err)
-				return
+			}
+			if r.tuned != nil {
+				close(r.tuned)
 			}
 		}()
 	}
@@ -264,7 +269,33 @@ func (r *reader) Read(p []byte) (int, error) {
 		}
 	}
 	// Read from the source
-	n, err := r.ReadCloser.Read(p)
+	var n int
+	var err error
+	if len(r.held) > 0 {
+		n = copy(p, r.held)
+		r.held = r.held[n:]
+	} else {
+		n, err = r.ReadCloser.Read(p)
+	}
+	for r.holding {
+		if err != nil {
+			logger("[SOURCE] %s closed before the tune settled, dropping %d held bytes", r.t.url, len(r.held)+n)
+			r.holding = false
+			r.held = nil
+			n = 0
+			break
+		}
+		r.held = append(r.held, p[:n]...)
+		select {
+		case <-r.tuned:
+			logger("[SOURCE] %s survived the tune, releasing %d held bytes", r.t.url, len(r.held))
+			r.holding = false
+			n = copy(p, r.held)
+			r.held = r.held[n:]
+		default:
+			n, err = r.ReadCloser.Read(p)
+		}
+	}
 	if err == io.EOF && r.sourceURL != "" {
 		if n > 0 {
 			err = nil
@@ -530,7 +561,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				if plain {
 					t.active = true
 					t.index = i
-					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url}, nil
+					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url, holding: true, tuned: make(chan struct{})}, nil
 				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
