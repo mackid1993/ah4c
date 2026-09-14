@@ -99,7 +99,6 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	startedAt     time.Time
-	sourceURL     string
 }
 
 type playbackReader struct {
@@ -237,7 +236,56 @@ func (r *reader) Read(p []byte) (int, error) {
 			}
 		}()
 	}
-	return r.read(p)
+	// Determine the index of the tuner
+	tunerIndex := -1
+	for index := range tuners {
+		if &tuners[index] == r.t {
+			tunerIndex = index
+			break
+		}
+	}
+	if tunerIndex == -1 {
+		return 0, fmt.Errorf("tuner not found")
+	}
+	// Create the file if it doesn't exist
+	if r.file == nil && allowPreview {
+		filePath := fmt.Sprintf("/tmp/video_%d.ts", tunerIndex)
+		file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return 0, fmt.Errorf("error opening file: %v", err)
+		}
+		r.file = file
+		r.t.filePath = filePath
+	}
+	if r.t.teecmd != "" {
+		if err := r.startTeeCMD(); err != nil {
+			return 0, fmt.Errorf("[ERR] Failed to start TEECMD: %v", err)
+		}
+	}
+	// Read from the source
+	n, err := r.ReadCloser.Read(p)
+	// Write out to preview file if enabled
+	if allowPreview || r.t.teecmd != "" {
+		data := make([]byte, n)
+		copy(data, p[:n])
+		if allowPreview {
+			go func() {
+				// Write to file
+				if _, err := r.file.Write(data); err != nil {
+					logger("Error while writing to preview file")
+				}
+			}()
+		}
+		// Write to TEECMD if enabled
+		if r.t.teecmd != "" {
+			go func() {
+				if _, err := r.teecmdIn.Write(data); err != nil {
+					logger("Error while writing to TEECMD")
+				}
+			}()
+		}
+	}
+	return n, err
 }
 
 func (r *playbackReader) Read(p []byte) (int, error) {
@@ -267,75 +315,7 @@ func (r *playbackReader) Read(p []byte) (int, error) {
 			close(r.gateReady)
 		}()
 	}
-	return r.read(p)
-}
-
-func (r *reader) read(p []byte) (int, error) {
-	// Determine the index of the tuner
-	tunerIndex := -1
-	for index := range tuners {
-		if &tuners[index] == r.t {
-			tunerIndex = index
-			break
-		}
-	}
-	if tunerIndex == -1 {
-		return 0, fmt.Errorf("tuner not found")
-	}
-	// Create the file if it doesn't exist
-	if r.file == nil && allowPreview {
-		filePath := fmt.Sprintf("/tmp/video_%d.ts", tunerIndex)
-		file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return 0, fmt.Errorf("error opening file: %v", err)
-		}
-		r.file = file
-		r.t.filePath = filePath
-	}
-	if r.t.teecmd != "" {
-		if err := r.startTeeCMD(); err != nil {
-			return 0, fmt.Errorf("[ERR] Failed to start TEECMD: %v", err)
-		}
-	}
-	// Read from the source
-	n, err := r.ReadCloser.Read(p)
-	if n == 0 && err == io.EOF && r.sourceURL != "" {
-		sourceURL := r.sourceURL
-		r.sourceURL = ""
-		resp, getErr := http.Get(sourceURL)
-		if getErr != nil {
-			return 0, getErr
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return 0, fmt.Errorf("status %s", resp.Status)
-		}
-		r.ReadCloser.Close()
-		r.ReadCloser = resp.Body
-		return r.Read(p)
-	}
-	// Write out to preview file if enabled
-	if allowPreview || r.t.teecmd != "" {
-		data := make([]byte, n)
-		copy(data, p[:n])
-		if allowPreview {
-			go func() {
-				// Write to file
-				if _, err := r.file.Write(data); err != nil {
-					logger("Error while writing to preview file")
-				}
-			}()
-		}
-		// Write to TEECMD if enabled
-		if r.t.teecmd != "" {
-			go func() {
-				if _, err := r.teecmdIn.Write(data); err != nil {
-					logger("Error while writing to TEECMD")
-				}
-			}()
-		}
-	}
-	return n, err
+	return r.reader.Read(p)
 }
 
 // Called from io.Copy when closing socket
@@ -510,7 +490,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				if plain {
 					t.active = true
 					t.index = i
-					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url}, nil
+					return &reader{ReadCloser: body, channel: channel, t: t}, nil
 				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
