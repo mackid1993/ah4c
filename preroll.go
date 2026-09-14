@@ -1215,7 +1215,7 @@ func (c *clockSplice) rewrite(b []byte) {
 // becomes the offset for every timestamp after — so PCR, PTS and DTS all keep
 // their spacing.
 func (c *clockSplice) newSource(ts uint64, fromPCR bool) {
-	defer traceFunction("clockSplice.newSource", nil, "reader=%p label=%s incoming=%d fromPCR=%t previousPCR=%d previousHigh=%d", c, c.label, ts, fromPCR, c.out, c.high)()
+	defer traceFunction("clockSplice.newSource", c, "reader=%p label=%s incoming=%d fromPCR=%t previousPCR=%d previousHigh=%d", c, c.label, ts, fromPCR, c.out, c.high)()
 
 	ref := c.out
 	if forward(c.high, ref) {

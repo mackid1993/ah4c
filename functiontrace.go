@@ -37,6 +37,12 @@ func traceFunction(name string, object any, format string, args ...any) func() {
 	if object != nil {
 		identity = fmt.Sprintf("%T/%p", object, object)
 	}
-	logger("[FN TRACE] id=%d enter=%s self=%s %s callers=%s", id, name, identity, fmt.Sprintf(format, args...), strings.Join(callers, " <- "))
-	return func() { logger("[FN TRACE] id=%d exit=%s elapsed=%v", id, name, time.Since(started)) }
+	writeFunctionTrace("[FN TRACE] id=%d enter=%s self=%s %s callers=%s", id, name, identity, fmt.Sprintf(format, args...), strings.Join(callers, " <- "))
+	return func() { writeFunctionTrace("[FN TRACE] id=%d exit=%s elapsed=%v", id, name, time.Since(started)) }
+}
+
+func writeFunctionTrace(format string, args ...any) {
+	text := fmt.Sprintf(format, args...)
+	fmt.Println(text)
+	loggerhandle.Println(text)
 }
