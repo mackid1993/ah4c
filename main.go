@@ -472,19 +472,22 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					continue
 				}
 				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
+				reopen := func() (io.ReadCloser, error) {
+					r, e := http.Get(t.url)
+					if e != nil {
+						return nil, e
+					}
+					if r.StatusCode != 200 {
+						r.Body.Close()
+						return nil, fmt.Errorf("status %s", r.Status)
+					}
+					return r.Body, nil
+				}
 				body = resp.Body
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
-					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
-						r, e := http.Get(t.url)
-						if e != nil {
-							return nil, e
-						}
-						if r.StatusCode != 200 {
-							r.Body.Close()
-							return nil, fmt.Errorf("status %s", r.Status)
-						}
-						return r.Body, nil
-					}, label)
+					body = newStallTolerantReader(resp.Body, reopen, label)
+				} else if ready == nil {
+					body = newRolloverReader(resp.Body, reopen)
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
