@@ -100,6 +100,7 @@ type reader struct {
 	gate          *gateReader
 	startedAt     time.Time
 	sourceFirst   bool
+	startReady    chan struct{}
 }
 
 // Create a global file object to write logs to
@@ -228,7 +229,13 @@ func (r *reader) Read(p []byte) (int, error) {
 		addReader(r)
 		go func() {
 			base := r.gateBase
-			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+			var err error
+			if r.startReady != nil {
+				err = executeStarted(r.startReady, r.t.start, r.channel, r.t.tunerip)
+			} else {
+				err = execute(r.t.start, r.channel, r.t.tunerip)
+			}
+			if err != nil {
 				logger("[ERR] Failed to run start script: %v", err)
 				if r.gateReady != nil {
 					close(r.gateReady)
@@ -455,6 +462,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
 			var gate *gateReader
+			var startReady chan struct{}
 			if holdDelay > 0 {
 				// A tune held by the delay does not open the encoder yet: the
 				// wait is the pre-roll or NULL packets, and the encoder is
@@ -468,31 +476,36 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// which is the whole thing the feature is for.
 				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i), channel)
 			} else {
-				resp, err := http.Get(t.url)
-				if err != nil {
-					logger("[ERR] Failed to fetch source: %v", err)
-					t.active = false
-					continue
-				} else if resp.StatusCode != 200 {
-					logger("[ERR] Failed to fetch source: %v", resp.Status)
-					resp.Body.Close()
-					t.active = false
-					continue
-				}
-				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
-				body = resp.Body
-				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
-					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
-						r, e := http.Get(t.url)
-						if e != nil {
-							return nil, e
-						}
-						if r.StatusCode != 200 {
-							r.Body.Close()
-							return nil, fmt.Errorf("status %s", r.Status)
-						}
-						return r.Body, nil
-					}, label)
+				nulls := strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE")
+				if ready == nil && !nulls {
+					startReady = make(chan struct{})
+					body = newDeferredSource(t.url, startReady)
+				} else {
+					resp, err := http.Get(t.url)
+					if err != nil {
+						logger("[ERR] Failed to fetch source: %v", err)
+						t.active = false
+						continue
+					} else if resp.StatusCode != 200 {
+						logger("[ERR] Failed to fetch source: %v", resp.Status)
+						resp.Body.Close()
+						t.active = false
+						continue
+					}
+					body = resp.Body
+					if nulls {
+						body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
+							r, e := http.Get(t.url)
+							if e != nil {
+								return nil, e
+							}
+							if r.StatusCode != 200 {
+								r.Body.Close()
+								return nil, fmt.Errorf("status %s", r.Status)
+							}
+							return r.Body, nil
+						}, label)
+					}
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
@@ -518,6 +531,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				gateBase:   base,
 				gateSig:    sig,
 				gate:       gate,
+				startReady: startReady,
 			}
 			return r, nil
 		}
@@ -526,6 +540,24 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 }
 
 // Custom execute command with timing stats
+func executeStarted(started chan struct{}, args ...string) error {
+	t0 := time.Now()
+	logger("[EXECUTE] Running %v", args)
+	cmd := exec.Command(args[0], args[1:]...)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	err := cmd.Start()
+	close(started)
+	if err == nil {
+		err = cmd.Wait()
+	}
+	logger("[EXECUTE] Stdout: '%s'", stdoutBuf.String())
+	logger("[EXECUTE] Stderr: '%s'", stderrBuf.String())
+	logger("[EXECUTE] Finished running %v in %v", args[0], time.Since(t0))
+	return err
+}
+
 func execute(args ...string) error {
 	t0 := time.Now()
 	logger("[EXECUTE] Running %v", args)
