@@ -75,6 +75,8 @@ type packetTraceBody struct {
 }
 
 func (p *packetTraceBody) Read(b []byte) (int, error) {
+	defer traceFunction("packetTraceBody.Read", p, "capture=%s", p.capture.path)()
+
 	start := time.Now()
 	n, err := p.ReadCloser.Read(b)
 	p.capture.record(b[:n])
@@ -84,12 +86,16 @@ func (p *packetTraceBody) Read(b []byte) (int, error) {
 	return n, err
 }
 func (p *packetTraceBody) Close() error {
+	defer traceFunction("packetTraceBody.Close", nil, "reader=%p capture=%s", p, p.capture.path)()
+
 	err := p.ReadCloser.Close()
 	p.capture.close()
 	return err
 }
 
 func packetTraceGet(url string) (*http.Response, error) {
+	defer traceFunction("packetTraceGet", nil, "url=%s", url)()
+
 	started := time.Now()
 	logger("[PACKET TRACE] GET begin url=%s at=%s", url, started.Format(time.RFC3339Nano))
 	resp, err := http.Get(url)

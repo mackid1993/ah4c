@@ -222,6 +222,8 @@ func (r *reader) startTeeCMD() error { // Removed the readers argument
 
 // Called from io.Copy when reading socket data
 func (r *reader) Read(p []byte) (int, error) {
+	defer traceFunction("reader.Read", r, "tuner=%s channel=%s source=%T/%p gate=%p", r.t.tunerip, r.channel, r.ReadCloser, r.ReadCloser, r.gate)()
+
 	if !r.started {
 		r.started = true
 		addReader(r)
@@ -306,6 +308,8 @@ func (r *reader) Read(p []byte) (int, error) {
 
 // Called from io.Copy when closing socket
 func (r *reader) Close() error {
+	defer traceFunction("reader.Close", nil, "reader=%p tuner=%s channel=%s source=%T/%p", r, r.t.tunerip, r.channel, r.ReadCloser, r.ReadCloser)()
+
 	logger("Performing Close() for %s", r.t.tunerip)
 	if r.gateDone != nil {
 		r.gateStop.Do(func() { close(r.gateDone) })
@@ -382,6 +386,8 @@ func parseCommand(cmd string) []string {
 // Tune into a application or network encoder. early is the pre-roll already
 // playing for this request, for the hold to carry on with, or nil.
 func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
+	defer traceFunction("main.tune", nil, "idx=%q channel=%q early=%p delay=%v preroll=%q nullEnv=%q detectEnv=%q captions=%t", idx, channel, early, holdDelay, prerollTS, os.Getenv("NULL_FRAME_INSERTION"), os.Getenv("PLAYBACK_DETECTION"), currentCaptionConfig().Enabled)()
+
 	tunerLock.Lock()
 	defer tunerLock.Unlock()
 	intidx, _ := strconv.Atoi(idx)
@@ -522,6 +528,8 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 
 // Custom execute command with timing stats
 func execute(args ...string) error {
+	defer traceFunction("main.execute", nil, "args=%v", args)()
+
 	t0 := time.Now()
 	logger("[EXECUTE] Running %v", args)
 	cmd := exec.Command(args[0], args[1:]...)
@@ -1771,6 +1779,8 @@ const (
 )
 
 func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadCloser, error), label string) *stallTolerantReader {
+	defer traceFunction("newStallTolerantReader", nil, "label=%s source=%T/%p", label, body, body)()
+
 	s := &stallTolerantReader{
 		chunks:      make(chan []byte, queueDepth),
 		closed:      make(chan struct{}),
@@ -1784,6 +1794,8 @@ func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadClose
 }
 
 func (s *stallTolerantReader) producer() {
+	defer traceFunction("stallTolerantReader.producer", s, "label=%s", s.label)()
+
 	defer close(s.done)
 	chunk := make([]byte, chunkSize)
 	lastReal := time.Now()
@@ -1916,6 +1928,8 @@ func (s *stallTolerantReader) producer() {
 }
 
 func (s *stallTolerantReader) Read(p []byte) (int, error) {
+	defer traceFunction("stallTolerantReader.Read", s, "label=%s len=%d", s.label, len(p))()
+
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -2041,6 +2055,8 @@ func (s *stallTolerantReader) flush(label string) {
 }
 
 func (s *stallTolerantReader) Close() error {
+	defer traceFunction("stallTolerantReader.Close", nil, "reader=%p label=%s", s, s.label)()
+
 	s.closeOnce.Do(func() { close(s.closed) })
 	return s.closeBody()
 }
@@ -2112,6 +2128,8 @@ type gateReader struct {
 // newGateReader gates src until ready closes. timed says the wait was a timer,
 // so the gate releases on the first keyframe after it rather than waiting to
 func newGateReader(src io.ReadCloser, ready <-chan struct{}, timed bool, target time.Time, detect <-chan struct{}) *gateReader {
+	defer traceFunction("newGateReader", nil, "source=%T/%p ready=%p timed=%t detect=%p", src, src, ready, timed, detect)()
+
 	g := &gateReader{src: src, ready: ready, t0: time.Now(), timed: timed, target: target, detect: detect}
 	if sc, ok := src.(sessionSource); ok {
 		g.sess = sc
@@ -2202,6 +2220,8 @@ func (g *gateReader) armedAtTime(now time.Time) bool {
 }
 
 func (g *gateReader) release(reason string) {
+	defer traceFunction("gateReader.release", nil, "reader=%p reason=%s", g, reason)()
+
 	// Tables, then the keyframe, and nothing timestamped before the program:
 	// the DVR keeps time by the stream's own timestamps, so anything stamped
 	g.pend = append(append(append([]byte{}, g.pat...), g.pmt...), g.keep...)
@@ -2344,6 +2364,8 @@ func (g *gateReader) scan(b []byte) int {
 }
 
 func (g *gateReader) Read(p []byte) (int, error) {
+	defer traceFunction("gateReader.Read", g, "source=%T/%p timed=%t detect=%p", g.src, g.src, g.timed, g.detect)()
+
 	for !g.open && len(g.pend) == 0 {
 		buf := make([]byte, 32*1024)
 		n, err := g.src.Read(buf)
@@ -2694,6 +2716,8 @@ type flushWriter interface {
 
 // copyFlush is io.Copy, flushed after every write.
 func copyFlush(dst flushWriter, src io.Reader) (int64, error) {
+	defer traceFunction("main.copyFlush", nil, "source=%T/%p destination=%T/%p", src, src, dst, dst)()
+
 	capture := newPacketCapture("output")
 	defer capture.close()
 	logger("[PACKET TRACE] output=%s reader=%p", capture.path, src)
@@ -2722,6 +2746,8 @@ func copyFlush(dst flushWriter, src io.Reader) (int64, error) {
 // readWithDeadline does r.Read with a timeout: on expiry the body is closed,
 // unblocking the blocked Read with an error. No goroutine leak, no buf race.
 func readWithDeadline(r io.ReadCloser, buf []byte, timeout time.Duration) (int, error) {
+	defer traceFunction("readWithDeadline", r, "source=%T/%p timeout=%v", r, r, timeout)()
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	defer context.AfterFunc(ctx, func() { r.Close() })()

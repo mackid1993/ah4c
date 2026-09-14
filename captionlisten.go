@@ -2260,6 +2260,8 @@ var (
 // captionTuneStarting marks that a tune is beginning somewhere on the
 // machine, which postpones any heavy caption work until its video flows.
 func captionTuneStarting() {
+	defer traceFunction("captionTuneStarting", nil, "")()
+
 	tuneMu.Lock()
 	tunePending = append(tunePending, time.Now())
 	tuneMu.Unlock()
@@ -2271,6 +2273,8 @@ func captionTuneStarting() {
 // protect. Paired oldest-first with captionTuneStarting; a tune that never
 // reports either way ages out at tunePendingCap.
 func captionTuneSettled() {
+	defer traceFunction("captionTuneSettled", nil, "")()
+
 	tuneMu.Lock()
 	if len(tunePending) > 0 {
 		tunePending = tunePending[1:]
@@ -2405,9 +2409,14 @@ type tuneSettleReader struct {
 	once  sync.Once
 }
 
-func newTuneSettleReader(r io.ReadCloser) *tuneSettleReader { return &tuneSettleReader{inner: r} }
+func newTuneSettleReader(r io.ReadCloser) *tuneSettleReader {
+	defer traceFunction("newTuneSettleReader", nil, "source=%T/%p", r, r)()
+	return &tuneSettleReader{inner: r}
+}
 
 func (t *tuneSettleReader) Read(p []byte) (int, error) {
+	defer traceFunction("tuneSettleReader.Read", t, "source=%T/%p", t.inner, t.inner)()
+
 	n, err := t.inner.Read(p)
 	if n > 0 {
 		t.once.Do(captionTuneSettled)
@@ -2416,6 +2425,8 @@ func (t *tuneSettleReader) Read(p []byte) (int, error) {
 }
 
 func (t *tuneSettleReader) Close() error {
+	defer traceFunction("tuneSettleReader.Close", nil, "reader=%p source=%T/%p", t, t.inner, t.inner)()
+
 	t.once.Do(captionTuneSettled)
 	return t.inner.Close()
 }

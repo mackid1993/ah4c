@@ -190,6 +190,8 @@ func planPreroll(src string, info prerollProbe) (prerollPlan, error) {
 // prerollStartup prepares whatever is mounted at prerollMount into
 // prerollCache, before the listener binds. Anything that goes wrong is logged
 func prerollStartup() {
+	defer traceFunction("prerollStartup", nil, "mount=%s", prerollMount)()
+
 	prerollTS = ""
 	st, err := os.Stat(prerollMount)
 	if err != nil {
@@ -243,6 +245,8 @@ func prerollInDir(dir string) string {
 // preparePreroll turns the file at src into a transport stream at
 // prerollCache and points prerollTS at it, or logs why it could not.
 func preparePreroll(src string) {
+	defer traceFunction("preparePreroll", nil, "file=%q", src)()
+
 	ctx, cancel := context.WithTimeout(context.Background(), prerollPrepareBudget)
 	defer cancel()
 	t0 := time.Now()
@@ -363,6 +367,8 @@ type prerollPlayer struct {
 // startPreroll starts the pre-roll, or returns nil to fall back to NULL
 // packets. A nil player's out() never delivers, so it can sit in a select.
 func startPreroll(label string) *prerollPlayer {
+	defer traceFunction("startPreroll", nil, "label=%s prepared=%q", label, prerollTS)()
+
 	if prerollTS == "" {
 		return nil
 	}
@@ -381,6 +387,8 @@ func startPreroll(label string) *prerollPlayer {
 // startPlayer runs one ffmpeg writing MPEG-TS to a channel, or nil if it will
 // not start.
 func startPlayer(label, tag string, args ...string) *prerollPlayer {
+	defer traceFunction("startPlayer", nil, "label=%s tag=%s args=%v", label, tag, args)()
+
 	cmd := exec.Command("ffmpeg", append([]string{"-hide_banner", "-loglevel", "error"}, args...)...)
 	cmd.Stderr = os.Stderr
 	stdout, err := cmd.StdoutPipe()
@@ -459,6 +467,8 @@ type tuneHold struct {
 
 // newTuneHold builds the hold, or nil when nothing holds the tune.
 func newTuneHold(t0 time.Time, detect <-chan struct{}, label string, early *prerollPlayer) *tuneHold {
+	defer traceFunction("newTuneHold", nil, "label=%s detect=%p early=%p prepared=%q", label, detect, early, prerollTS)()
+
 	if detect == nil {
 		return nil
 	}
@@ -467,6 +477,8 @@ func newTuneHold(t0 time.Time, detect <-chan struct{}, label string, early *prer
 
 // wrap puts the hold's filler in front of src, which must be behind the gate.
 func (h *tuneHold) wrap(src io.ReadCloser) io.ReadCloser {
+	defer traceFunction("tuneHold.wrap", nil, "hold=%p enabled=%t source=%T/%p", h, h != nil && h.fill, src, src)()
+
 	if h == nil || !h.fill {
 		return src
 	}
@@ -493,6 +505,8 @@ type holdFirst struct {
 }
 
 func newHoldReader(src io.ReadCloser, hold *tuneHold) *holdReader {
+	defer traceFunction("newHoldReader", nil, "source=%T/%p hold=%p", src, src, hold)()
+
 	h := &holdReader{src: src, hold: hold, first: make(chan holdFirst, 1)}
 	if hold.early != nil {
 		h.preroll = hold.early
@@ -532,6 +546,8 @@ func newHoldReader(src io.ReadCloser, hold *tuneHold) *holdReader {
 }
 
 func (h *holdReader) Read(p []byte) (int, error) {
+	defer traceFunction("holdReader.Read", h, "")()
+
 	if len(h.pend) > 0 {
 		n := copy(p, h.pend)
 		h.pend = h.pend[n:]
@@ -572,6 +588,8 @@ func (h *holdReader) serveNulls(p []byte) int {
 
 // handoff ends the filler and starts the real stream, on a packet boundary.
 func (h *holdReader) handoff(p []byte, f holdFirst) (int, error) {
+	defer traceFunction("holdReader.handoff", nil, "reader=%p firstBytes=%d firstError=%v", h, len(f.data), f.err)()
+
 	h.open = true
 	var preroll int64
 	if h.preroll != nil {
@@ -711,6 +729,8 @@ func tuneEarly(idx, channel string) (io.ReadCloser, error) {
 
 // tuneEarlyWith is tuneEarly over any tune function.
 func tuneEarlyWith(idx, channel string, tuneFn func(string, string, *earlyTune) (io.ReadCloser, error)) (io.ReadCloser, error) {
+	defer traceFunction("tuneEarlyWith", nil, "idx=%q channel=%q prepared=%q delay=%v bypass=%t", idx, channel, prerollTS, holdDelay, prerollTS == "" && holdDelay == 0)()
+
 	if prerollTS == "" && holdDelay == 0 {
 		return tuneFn(idx, channel, nil)
 	}
@@ -776,6 +796,8 @@ type earlyReader struct {
 }
 
 func (e *earlyReader) Read(p []byte) (int, error) {
+	defer traceFunction("earlyReader.Read", e, "")()
+
 	if len(e.pend) > 0 {
 		n := copy(p, e.pend)
 		e.pend = e.pend[n:]
@@ -837,6 +859,8 @@ func (e *earlyReader) serveNulls(p []byte) int {
 
 // arrive takes the tune's result; an adopted pre-roll keeps playing.
 func (e *earlyReader) arrive(p []byte, res tuneResult) (int, error) {
+	defer traceFunction("earlyReader.arrive", nil, "reader=%p source=%T/%p error=%v", e, res.r, res.r, res.err)()
+
 	took := time.Since(e.t0).Round(time.Millisecond)
 	if res.err != nil {
 		if e.preroll != nil {
@@ -1026,6 +1050,8 @@ type clockSplice struct {
 
 // spliceClock gives the DVR one clock whatever filled the wait.
 func spliceClock(src io.ReadCloser, label string) io.ReadCloser {
+	defer traceFunction("spliceClock", nil, "label=%s source=%T/%p", label, src, src)()
+
 	return &clockSplice{ReadCloser: src, label: label}
 }
 
@@ -1043,6 +1069,8 @@ func spliceClock(src io.ReadCloser, label string) io.ReadCloser {
 // packets are rewritten and moved to pend, and the part packet at the end
 // waits for the rest of itself.
 func (c *clockSplice) Read(p []byte) (int, error) {
+	defer traceFunction("clockSplice.Read", c, "source=%T/%p", c.ReadCloser, c.ReadCloser)()
+
 	for len(c.pend) == 0 {
 		if c.err != nil {
 			// Nothing left to align; hand back whatever is stranded so the
@@ -1187,6 +1215,8 @@ func (c *clockSplice) rewrite(b []byte) {
 // becomes the offset for every timestamp after — so PCR, PTS and DTS all keep
 // their spacing.
 func (c *clockSplice) newSource(ts uint64, fromPCR bool) {
+	defer traceFunction("clockSplice.newSource", nil, "reader=%p label=%s incoming=%d fromPCR=%t previousPCR=%d previousHigh=%d", c, c.label, ts, fromPCR, c.out, c.high)()
+
 	ref := c.out
 	if forward(c.high, ref) {
 		ref = c.high
@@ -1214,7 +1244,7 @@ func (c *clockSplice) newSource(ts uint64, fromPCR bool) {
 	c.marking, c.marked, c.markFrom = true, map[int]bool{}, time.Time{}
 	if !c.said {
 		c.said = true
-		logger("[HOLD] %s the program's clock was carried on from the pre-roll's rather than left as a jump", c.label)
+		logger("[CLOCK TRACE] clockSplice.newSource %s remapped source timestamp reset", c.label)
 	}
 }
 

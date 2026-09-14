@@ -106,6 +106,8 @@ const (
 // maybeWrapNullFrameInsertion wraps body when NULL_FRAME_INSERTION is TRUE, so
 // stalls are filled and the encoder at url is reconnected when it drops.
 func maybeWrapNullFrameInsertion(body io.ReadCloser, url, label string) io.ReadCloser {
+	defer traceFunction("maybeWrapNullFrameInsertion", nil, "label=%s source=%T/%p nullEnv=%q", label, body, body, os.Getenv("NULL_FRAME_INSERTION"))()
+
 	if !strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 		return body
 	}
@@ -124,6 +126,8 @@ func maybeWrapNullFrameInsertion(body io.ReadCloser, url, label string) io.ReadC
 
 // tuneHoldStartup parses the delay and prepares the pre-roll, before the listener binds.
 func tuneHoldStartup() {
+	defer traceFunction("tuneHoldStartup", nil, "delayEnv=%q codecEnv=%q", os.Getenv("PLAYBACK_DELAY"), os.Getenv("ENCODER_CODEC"))()
+
 	holdDelay = 0
 	if s := os.Getenv("PLAYBACK_DELAY"); strings.TrimSpace(s) != "" {
 		d, err := parseHoldDuration(s)
@@ -296,6 +300,8 @@ var heldRecently sync.Map // name -> time.Time of the last hand-off
 const holdAgainAfter = 20 * time.Second
 
 func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner int, name, channel string) *lateEncoder {
+	defer traceFunction("newLateEncoder", nil, "label=%s channel=%s delay=%v early=%p", label, channel, holdDelay, early)()
+
 	until := t0.Add(holdDelay)
 	// The hold exists to cover the box tuning in, and that happens once. But a
 	// hold was started on every request, and the DVR reconnects — on a broken
@@ -345,6 +351,8 @@ func newLateEncoder(url, label string, t0 time.Time, early *prerollPlayer, tuner
 // flowing the entire time, which is the one thing this hold did not share with
 // the features that work.
 func (l *lateEncoder) drainEarly() {
+	defer traceFunction("lateEncoder.drainEarly", l, "")()
+
 	var body io.ReadCloser
 	// The bound covers the open as well as the drain. It used to be set after
 	// the open succeeded, so an encoder that would not open — off, rebooting,
@@ -552,6 +560,8 @@ func (l *lateEncoder) dietFrom() time.Time {
 }
 
 func (l *lateEncoder) Read(p []byte) (int, error) {
+	defer traceFunction("lateEncoder.Read", l, "")()
+
 	l.mu.Lock()
 	body, closed := l.body, l.closed
 	l.mu.Unlock()
@@ -714,6 +724,8 @@ func stripNulls(b []byte) ([]byte, int) {
 // takeHandoff swaps the filler for the released program and starts the
 // reopen's clock, which must run from here and not from the encoder's open.
 func (l *lateEncoder) takeHandoff(p []byte, r *handoffResult) (int, error) {
+	defer traceFunction("lateEncoder.takeHandoff", nil, "reader=%p result=%p", l, r)()
+
 	if r == nil || r.body == nil {
 		return 0, io.EOF
 	}
@@ -894,6 +906,8 @@ func (l *lateEncoder) finishFiller() {
 }
 
 func (l *lateEncoder) Close() error {
+	defer traceFunction("lateEncoder.Close", nil, "reader=%p", l)()
+
 	l.mu.Lock()
 	body, drain := l.body, l.drain
 	l.closed = true
@@ -1078,6 +1092,8 @@ func (b bufWriter) Flush()                      { b.rw.Flush() }
 // allows, then hands back the connection to stream the rest. The second
 // return says the connection has been taken over.
 func holdOnHints(w http.ResponseWriter, src io.Reader, tuner, channel string) (*hintHold, bool) {
+	defer traceFunction("holdOnHints", nil, "tuner=%s channel=%s source=%T/%p ceiling=%v delay=%v prepared=%q hints=%t", tuner, channel, src, src, hintCeiling, holdDelay, prerollTS, hintsWork.Load())()
+
 	if hintCeiling == 0 || holdDelay == 0 || prerollTS != "" || !hintsWork.Load() {
 		return nil, false
 	}
@@ -1134,6 +1150,8 @@ func holdRate(since time.Duration) (time.Duration, int) {
 // container running the delay with NULL frame insertion off loses the stream
 // twenty seconds after the program starts, every time.
 func (l *lateEncoder) stallTolerant(body io.ReadCloser) *stallTolerantReader {
+	defer traceFunction("lateEncoder.stallTolerant", nil, "reader=%p source=%T/%p", l, body, body)()
+
 	return newStallTolerantReader(body, func() (io.ReadCloser, error) {
 		r, e := http.Get(l.url)
 		if e != nil {
@@ -1221,6 +1239,8 @@ func wantHEVC() bool {
 // the encoder's live edge. The black just fronts the seam; it is never content
 // the playhead starts behind, which is what a decoded or a long black became.
 func blackStartup() {
+	defer traceFunction("blackStartup", nil, "delay=%v prepared=%q skipped=%t", holdDelay, prerollTS, holdDelay <= 0 || prerollTS != "")()
+
 	if holdDelay <= 0 || prerollTS != "" {
 		return
 	}

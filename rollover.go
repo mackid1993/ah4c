@@ -15,10 +15,14 @@ type rolloverReader struct {
 }
 
 func newRolloverReader(body io.ReadCloser, reopen func() (io.ReadCloser, error)) io.ReadCloser {
+	defer traceFunction("newRolloverReader", nil, "source=%T/%p", body, body)()
+
 	return &rolloverReader{body: body, reopen: reopen, closed: make(chan struct{})}
 }
 
 func (r *rolloverReader) Read(p []byte) (int, error) {
+	defer traceFunction("rolloverReader.Read", r, "")()
+
 	for {
 		r.mu.Lock()
 		body := r.body
@@ -76,6 +80,8 @@ func (r *rolloverReader) Read(p []byte) (int, error) {
 }
 
 func (r *rolloverReader) Close() error {
+	defer traceFunction("rolloverReader.Close", nil, "reader=%p", r)()
+
 	r.closeOnce.Do(func() { close(r.closed) })
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -702,6 +702,8 @@ func refreshCaptionReady() {
 }
 
 func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadCloser {
+	defer traceFunction("maybeWrapCaptions", nil, "tuner=%d label=%s enabled=%t source=%T/%p", tunerIndex, label, currentCaptionConfig().Enabled, src, src)()
+
 	captionTuneStarting()
 	src = newTuneSettleReader(src)
 	cfg := currentCaptionConfig()
@@ -748,6 +750,8 @@ func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadC
 }
 
 func (cs *captionStream) run() {
+	defer traceFunction("captionStream.run", nil, "reader=%p source=%T/%p", cs, cs.src, cs.src)()
+
 	// Captions are a convenience; the stream is not. If anything in the
 	// injector goes wrong, the picture has to keep flowing, so a panic here is
 	// caught and the rest of the stream is copied straight through untouched
@@ -774,6 +778,8 @@ func (cs *captionStream) run() {
 
 // inject is the captioning path proper.
 func (cs *captionStream) inject() {
+	defer traceFunction("captionStream.inject", nil, "reader=%p source=%T/%p", cs, cs.src, cs.src)()
+
 	// The injector emits packet by packet, and an io.Pipe write is a
 	// synchronous rendezvous with the reader — per 188-byte packet that was
 	// thousands of goroutine handoffs a second per stream. Buffering between
@@ -840,6 +846,8 @@ func (cs *captionStream) inject() {
 // Nothing is lost by the delay: the gate emits the program tables at release,
 // so the first chunk carries what the injector needs to identify the stream.
 func (cs *captionStream) Read(p []byte) (int, error) {
+	defer traceFunction("captionStream.Read", cs, "source=%T/%p", cs.src, cs.src)()
+
 	if !cs.started {
 		n, err := cs.src.Read(p)
 		if n > 0 {
@@ -854,6 +862,8 @@ func (cs *captionStream) Read(p []byte) (int, error) {
 }
 
 func (cs *captionStream) Close() error {
+	defer traceFunction("captionStream.Close", nil, "reader=%p source=%T/%p", cs, cs.src, cs.src)()
+
 	// The encoder connection is released first and immediately: on a channel
 	// change the next tune needs this tuner's encoder, and holding it while
 	// the recognizer winds down costs up to ten seconds of the new tune's
