@@ -478,8 +478,26 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				base = audioBaseline(t.tunerip)
 				sig = mediaSignature(t.tunerip)
 			}
+			var resp *http.Response
+			var err error
+			if plain {
+				resp, err = http.Get(t.url)
+				if err != nil {
+					logger("[ERR] Failed to fetch source: %v", err)
+					t.active = false
+					continue
+				} else if resp.StatusCode != 200 {
+					logger("[ERR] Failed to fetch source: %v", resp.Status)
+					resp.Body.Close()
+					t.active = false
+					continue
+				}
+			}
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
+				if resp != nil {
+					resp.Body.Close()
+				}
 				t.active = false
 				continue
 			}
@@ -499,16 +517,18 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// which is the whole thing the feature is for.
 				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i), channel)
 			} else {
-				resp, err := http.Get(t.url)
-				if err != nil {
-					logger("[ERR] Failed to fetch source: %v", err)
-					t.active = false
-					continue
-				} else if resp.StatusCode != 200 {
-					logger("[ERR] Failed to fetch source: %v", resp.Status)
-					resp.Body.Close()
-					t.active = false
-					continue
+				if resp == nil {
+					resp, err = http.Get(t.url)
+					if err != nil {
+						logger("[ERR] Failed to fetch source: %v", err)
+						t.active = false
+						continue
+					} else if resp.StatusCode != 200 {
+						logger("[ERR] Failed to fetch source: %v", resp.Status)
+						resp.Body.Close()
+						t.active = false
+						continue
+					}
 				}
 				body = resp.Body
 				if plain {
@@ -742,12 +762,13 @@ func run() error {
 		tuner := c.Param("tuner")
 		channel := c.Param("channel")
 		plain := plainTune()
+		early := holdDelay > 0 || prerollTS != ""
 		var reader io.ReadCloser
 		var err error
-		if plain {
-			reader, err = tune(tuner, channel, nil)
-		} else {
+		if early {
 			reader, err = tuneEarly(tuner, channel)
+		} else {
+			reader, err = tune(tuner, channel, nil)
 		}
 		if err != nil {
 			logger("[ERR] Failed to tune %s", err)
@@ -765,7 +786,7 @@ func run() error {
 		var bytesCopied int64
 		// The first stretch of a hold goes out as 1xx, which puts nothing in
 		// the body; the body carries whatever is left, however long that is.
-		if !plain {
+		if early {
 			h, taken := holdOnHints(c.Writer, reader, tuner, channel)
 			switch {
 			case h != nil:
