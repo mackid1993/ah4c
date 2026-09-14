@@ -98,7 +98,6 @@ type reader struct {
 	gateBase      map[string]bool
 	gateSig       string
 	gate          *gateReader
-	rollover      *rolloverReader
 	startedAt     time.Time
 }
 
@@ -107,34 +106,13 @@ type rolloverReader struct {
 	body      io.ReadCloser
 	reopen    func() (io.ReadCloser, error)
 	closed    chan struct{}
-	started   chan struct{}
 	closeOnce sync.Once
-	startOnce sync.Once
-	starting  bool
 }
 
 func newRolloverReader(body io.ReadCloser, reopen func() (io.ReadCloser, error)) *rolloverReader {
 	defer traceFunction("newRolloverReader", nil, "source=%T/%p", body, body)()
 
-	return &rolloverReader{body: body, reopen: reopen, closed: make(chan struct{}), started: make(chan struct{}), starting: true}
-}
-
-func (r *rolloverReader) startFinished() {
-	defer traceFunction("rolloverReader.startFinished", r, "")()
-
-	r.startOnce.Do(func() {
-		r.mu.Lock()
-		body := r.body
-		r.body = nil
-		r.mu.Unlock()
-		if body != nil {
-			body.Close()
-		}
-		r.mu.Lock()
-		r.starting = false
-		r.mu.Unlock()
-		close(r.started)
-	})
+	return &rolloverReader{body: body, reopen: reopen, closed: make(chan struct{})}
 }
 
 func (r *rolloverReader) Read(p []byte) (int, error) {
@@ -143,18 +121,9 @@ func (r *rolloverReader) Read(p []byte) (int, error) {
 	for {
 		r.mu.Lock()
 		body := r.body
-		starting := r.starting
 		r.mu.Unlock()
 
 		if body == nil {
-			if starting {
-				select {
-				case <-r.closed:
-					return 0, io.EOF
-				case <-r.started:
-					continue
-				}
-			}
 			select {
 			case <-r.closed:
 				return 0, io.EOF
@@ -185,12 +154,11 @@ func (r *rolloverReader) Read(p []byte) (int, error) {
 		n, err := body.Read(p)
 		r.mu.Lock()
 		current := r.body == body
-		starting = r.starting
 		if err != nil && current {
 			r.body = nil
 		}
 		r.mu.Unlock()
-		if !current || starting {
+		if !current {
 			if err != nil {
 				body.Close()
 			}
@@ -354,9 +322,6 @@ func (r *reader) Read(p []byte) (int, error) {
 		go func() {
 			base := r.gateBase
 			err := execute(r.t.start, r.channel, r.t.tunerip)
-			if r.rollover != nil {
-				r.rollover.startFinished()
-			}
 			if err != nil {
 				logger("[ERR] Failed to run start script: %v", err)
 				if r.gateReady != nil {
@@ -581,7 +546,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
 			var gate *gateReader
-			var rollover *rolloverReader
 			if holdDelay > 0 {
 				// A tune held by the delay does not open the encoder yet: the
 				// wait is the pre-roll or NULL packets, and the encoder is
@@ -622,8 +586,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, reopen, label)
 				} else if ready == nil {
-					rollover = newRolloverReader(resp.Body, reopen)
-					body = rollover
+					body = newRolloverReader(resp.Body, reopen)
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
@@ -649,7 +612,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				gateBase:   base,
 				gateSig:    sig,
 				gate:       gate,
-				rollover:   rollover,
 			}
 			return r, nil
 		}
