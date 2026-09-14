@@ -459,6 +459,13 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				t.active = false
 				continue
 			}
+			if plain {
+				if err := execute(t.start, channel, t.tunerip); err != nil {
+					logger("[ERR] Failed to run start script: %v", err)
+					t.active = false
+					continue
+				}
+			}
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
 			var gate *gateReader
@@ -490,7 +497,9 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				if plain {
 					t.active = true
 					t.index = i
-					return &reader{ReadCloser: body, channel: channel, t: t}, nil
+					r := &reader{ReadCloser: body, channel: channel, t: t, started: true}
+					addReader(r)
+					return r, nil
 				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
