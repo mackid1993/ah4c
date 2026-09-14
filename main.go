@@ -487,7 +487,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, reopen, label)
 				} else if ready == nil {
-					body = newRolloverReader(resp.Body, reopen)
+					body = spliceClock(newRolloverReader(resp.Body, reopen), label)
 				}
 				// The gate holds the stream back until the hold says so:
 				// playback detection with a pre-roll to show while it waits.
