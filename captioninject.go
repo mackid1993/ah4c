@@ -266,9 +266,11 @@ type captionInjector struct {
 	ccPerAU float64
 	ptsGaps []int64
 
-	frames   int64
-	injected int64
-	warned   bool
+	begun     bool
+	injecting bool
+	frames    int64
+	injected  int64
+	warned    bool
 }
 
 func newCaptionInjector(out io.Writer, enc *cea608, label string) *captionInjector {
@@ -436,8 +438,23 @@ func (ci *captionInjector) packet(p []byte) error {
 		}
 	}
 	if pusi {
-		ci.inPES = true
-		ci.pes = ci.pes[:0]
+		if !ci.injecting {
+			if !ci.begun {
+				ci.enc.reset()
+				ci.begun = true
+			}
+			ci.injecting = ci.enc.hasPendingText()
+			if !ci.injecting {
+				if _, _, pts, ok := splitPES(tsPayload(p)); ok {
+					ci.trackFrameRate(pts)
+					ci.onPicture(pts)
+				}
+			}
+		}
+		if ci.injecting {
+			ci.inPES = true
+			ci.pes = ci.pes[:0]
+		}
 	}
 	if !ci.inPES {
 		ci.stampVideoCC(p)
@@ -750,8 +767,9 @@ func (ci *captionInjector) flush() error {
 	// queued, playback after five seconds leaves five seconds of it.
 	//
 	// The viewer's timeline starts here, so this is where the encoder starts.
-	if ci.injected == 0 {
+	if !ci.begun {
 		ci.enc.reset()
+		ci.begun = true
 	}
 	send := ci.onPicture(ptsVal)
 	pair := [2]byte{}

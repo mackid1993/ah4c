@@ -653,7 +653,7 @@ type captionStream struct {
 // the selected model is installed, so a tune costs nothing when captions are
 // off or half configured.
 //
-// It is also where the tune gate learns about tunes: this is called for every
+// With captioning enabled, the tune gate learns about every
 // tuner's stream as it comes up, captioned or not, so it marks the tune as
 // beginning here — through its most fragile stretch, playback confirmation —
 // and the returned reader marks it settled at the first delivered byte. All
@@ -704,12 +704,12 @@ func refreshCaptionReady() {
 func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadCloser {
 	defer traceFunction("maybeWrapCaptions", nil, "tuner=%d label=%s enabled=%t source=%T/%p", tunerIndex, label, currentCaptionConfig().Enabled, src, src)()
 
-	captionTuneStarting()
-	src = newTuneSettleReader(src)
 	cfg := currentCaptionConfig()
 	if !cfg.Enabled {
 		return src
 	}
+	captionTuneStarting()
+	src = newTuneSettleReader(src)
 	if len(cfg.Tuners) > 0 {
 		found := false
 		for _, t := range cfg.Tuners {
