@@ -570,7 +570,6 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					t.active = false
 					continue
 				}
-				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
 				reopen := func() (io.ReadCloser, error) {
 					r, e := packetTraceGet(t.url)
 					if e != nil {
@@ -822,7 +821,16 @@ func run() error {
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
-		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
+		plain := prerollTS == "" && holdDelay == 0 &&
+			!strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE") &&
+			!strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") &&
+			!currentCaptionConfig().Enabled
+		if plain {
+			bytesCopied, err = io.Copy(c.Writer, reader)
+		} else {
+			bytesCopied, err = copyFlush(c.Writer, reader)
+		}
+		if err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
