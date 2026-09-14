@@ -99,15 +99,11 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	startedAt     time.Time
-	sourceURL     string
-	sourceSession int64
 }
 
 type playbackReader struct {
 	*reader
 }
-
-func (r *reader) sessions() int64 { return r.sourceSession }
 
 // Create a global file object to write logs to
 var loggerhandle *log.Logger
@@ -268,26 +264,6 @@ func (r *reader) Read(p []byte) (int, error) {
 	}
 	// Read from the source
 	n, err := r.ReadCloser.Read(p)
-	if err == io.EOF && r.sourceURL != "" {
-		if n > 0 {
-			err = nil
-		} else {
-			sourceURL := r.sourceURL
-			r.sourceURL = ""
-			resp, getErr := http.Get(sourceURL)
-			if getErr != nil {
-				return 0, getErr
-			}
-			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close()
-				return 0, fmt.Errorf("status %s", resp.Status)
-			}
-			r.ReadCloser.Close()
-			r.ReadCloser = resp.Body
-			r.sourceSession++
-			return r.Read(p)
-		}
-	}
 	// Write out to preview file if enabled
 	if allowPreview || r.t.teecmd != "" {
 		data := make([]byte, n)
@@ -478,26 +454,8 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				base = audioBaseline(t.tunerip)
 				sig = mediaSignature(t.tunerip)
 			}
-			var resp *http.Response
-			var err error
-			if plain {
-				resp, err = http.Get(t.url)
-				if err != nil {
-					logger("[ERR] Failed to fetch source: %v", err)
-					t.active = false
-					continue
-				} else if resp.StatusCode != 200 {
-					logger("[ERR] Failed to fetch source: %v", resp.Status)
-					resp.Body.Close()
-					t.active = false
-					continue
-				}
-			}
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
-				if resp != nil {
-					resp.Body.Close()
-				}
 				t.active = false
 				continue
 			}
@@ -517,24 +475,22 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				// which is the whole thing the feature is for.
 				body = newLateEncoder(t.url, label, early.from(tuneStart), early.player(), i, fmt.Sprintf("tuner%d", i), channel)
 			} else {
-				if resp == nil {
-					resp, err = http.Get(t.url)
-					if err != nil {
-						logger("[ERR] Failed to fetch source: %v", err)
-						t.active = false
-						continue
-					} else if resp.StatusCode != 200 {
-						logger("[ERR] Failed to fetch source: %v", resp.Status)
-						resp.Body.Close()
-						t.active = false
-						continue
-					}
+				resp, err := http.Get(t.url)
+				if err != nil {
+					logger("[ERR] Failed to fetch source: %v", err)
+					t.active = false
+					continue
+				} else if resp.StatusCode != 200 {
+					logger("[ERR] Failed to fetch source: %v", resp.Status)
+					resp.Body.Close()
+					t.active = false
+					continue
 				}
 				body = resp.Body
 				if plain {
 					t.active = true
 					t.index = i
-					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url}, nil
+					return &reader{ReadCloser: body, channel: channel, t: t}, nil
 				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
@@ -775,9 +731,6 @@ func run() error {
 			errorMessage := fmt.Sprintf("<html><body><h1>Error: %s</h1></body></html>", err.Error())
 			c.Data(500, "text/html; charset=utf-8", []byte(errorMessage))
 			return
-		}
-		if plain {
-			reader = preserveClock(reader, "tuner="+tuner+" channel="+channel)
 		}
 		// Closing the reader is what releases the tuner, runs the stop script
 		// and closes the encoder's connection, so every path must reach it.

@@ -1013,17 +1013,7 @@ const (
 // clockSplice maps every timestamp it passes onto a single forward-only clock.
 type clockSplice struct {
 	io.ReadCloser
-	label           string
-	preserveProgram bool
-	sess            sessionSource
-	sessSeen        int64
-	preserveReset   bool
-	preserveCC      map[int]byte
-	preserveClock   bool
-	preserveRaw     bool
-	preservePCR     uint64
-	preservePCRStep uint64
-	preservePCRSeen bool
+	label string
 	// out is the last timestamp written, in 90 kHz. delta is what is added to
 	// an input timestamp to get an output one, and in is the last input seen.
 	out, high, delta, in uint64
@@ -1065,14 +1055,6 @@ func spliceClock(src io.ReadCloser, label string) io.ReadCloser {
 	return &clockSplice{ReadCloser: src, label: label}
 }
 
-func preserveClock(src io.ReadCloser, label string) io.ReadCloser {
-	c := &clockSplice{ReadCloser: src, label: label, preserveProgram: true}
-	if s, ok := src.(sessionSource); ok {
-		c.sess, c.sessSeen = s, s.sessions()
-	}
-	return c
-}
-
 // Read hands back only whole packets that have been rewritten.
 //
 // The first version rewrote whatever the underlying reader returned, starting
@@ -1104,17 +1086,6 @@ func (c *clockSplice) Read(p []byte) (int, error) {
 		}
 		n, err := c.ReadCloser.Read(c.scratch)
 		if n > 0 {
-			if c.sess != nil {
-				if session := c.sess.sessions(); session != c.sessSeen {
-					c.pend = append(c.pend, c.tail...)
-					c.tail = c.tail[:0]
-					c.synced = false
-					c.preserveReset = true
-					c.preserveClock = false
-					c.preserveRaw = false
-					c.sessSeen = session
-				}
-			}
 			c.tail = append(c.tail, c.scratch[:n]...)
 			c.fill()
 		}
@@ -1150,16 +1121,6 @@ func (c *clockSplice) fill() {
 	if whole == 0 {
 		return
 	}
-	if c.preserveProgram && c.preserveReset && !c.preserveClock {
-		if !c.preparePreserveClock(c.tail[:whole]) {
-			if len(c.tail) < len(c.scratch) {
-				return
-			}
-			c.preserveClock = true
-			c.preserveRaw = true
-			logger("[CLOCK] %s replacement source has no PCR in its first %d bytes; passing its timestamps through", c.label, len(c.tail))
-		}
-	}
 	c.rewrite(c.tail[:whole])
 	c.pend = append(c.pend, c.tail[:whole]...)
 	c.tail = append(c.tail[:0], c.tail[whole:]...)
@@ -1171,7 +1132,6 @@ func (c *clockSplice) fill() {
 func (c *clockSplice) sync() {
 	for i := 0; i+2*tsPacketSize <= len(c.tail); i++ {
 		if c.tail[i] == 0x47 && c.tail[i+tsPacketSize] == 0x47 {
-			c.pend = append(c.pend, c.tail[:i]...)
 			c.tail = append(c.tail[:0], c.tail[i:]...)
 			c.synced = true
 			return
@@ -1179,7 +1139,6 @@ func (c *clockSplice) sync() {
 	}
 	// Keep only what could still be the start of a pair.
 	if drop := len(c.tail) - 2*tsPacketSize; drop > 0 {
-		c.pend = append(c.pend, c.tail[:drop]...)
 		c.tail = append(c.tail[:0], c.tail[drop:]...)
 	}
 }
@@ -1202,14 +1161,6 @@ func (c *clockSplice) rewrite(b []byte) {
 		pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
 		if pid == 0x1FFF {
 			continue // NULL packets carry nothing to map
-		}
-		if c.preserveProgram {
-			if !c.preserveRaw {
-				c.mapPCR(pkt)
-				c.mapPES(pkt)
-			}
-			c.preserveContinuity(pkt, pid)
-			continue
 		}
 		if pid == 0 {
 			c.notePMTPID(pkt)
@@ -1246,41 +1197,6 @@ func (c *clockSplice) rewrite(b []byte) {
 		c.setPID(pkt, out)
 		c.stamp(pkt, out)
 	}
-}
-
-func (c *clockSplice) preserveContinuity(pkt []byte, pid int) {
-	if c.preserveCC == nil {
-		c.preserveCC = map[int]byte{}
-	}
-	last, known := c.preserveCC[pid]
-	if !c.preserveReset || !known {
-		c.preserveCC[pid] = pkt[3] & 0x0F
-		return
-	}
-	if pkt[3]&0x10 != 0 {
-		last = (last + 1) & 0x0F
-	}
-	pkt[3] = pkt[3]&0xF0 | last
-	c.preserveCC[pid] = last
-}
-
-func (c *clockSplice) preparePreserveClock(b []byte) bool {
-	if !c.preservePCRSeen || c.preservePCRStep == 0 {
-		c.preserveClock = true
-		c.preserveRaw = true
-		return true
-	}
-	for i := 0; i+tsPacketSize <= len(b); i += tsPacketSize {
-		if pcr, ok := packetPCR(b[i : i+tsPacketSize]); ok {
-			step := c.preservePCRStep
-			c.delta = (c.preservePCR + step - pcr) & (ptsMod - 1)
-			c.in = pcr
-			c.pending = false
-			c.preserveClock = true
-			return true
-		}
-	}
-	return false
 }
 
 // The clock is carried by two high-water marks, not one.
@@ -1392,7 +1308,7 @@ func (c *clockSplice) at(ts uint64) uint64 {
 	if !c.started {
 		return ts
 	}
-	if !c.pending && !near(ts, c.in) {
+	if !near(ts, c.in) {
 		c.newSource(ts, false)
 	}
 	o := (ts + c.delta) & (ptsMod - 1)
@@ -1409,34 +1325,18 @@ func near(a, b uint64) bool { return forward(a, b) || forward(b, a) }
 func forward(a, b uint64) bool { return (a-b)&(ptsMod-1) < spliceJump }
 
 func (c *clockSplice) mapPCR(pkt []byte) {
-	base, ok := packetPCR(pkt)
-	if !ok {
+	if pkt[3]&0x20 == 0 || pkt[4] < 7 || pkt[5]&0x10 == 0 {
 		return
 	}
+	base := uint64(pkt[6])<<25 | uint64(pkt[7])<<17 | uint64(pkt[8])<<9 |
+		uint64(pkt[9])<<1 | uint64(pkt[10])>>7
 	c.advance(base)
 	out := c.at(base)
-	if c.preserveProgram {
-		if c.preservePCRSeen {
-			if step := (out - c.preservePCR) & (ptsMod - 1); step > 0 && step < spliceJump {
-				c.preservePCRStep = step
-			}
-		}
-		c.preservePCR = out
-		c.preservePCRSeen = true
-	}
 	pkt[6] = byte(out >> 25)
 	pkt[7] = byte(out >> 17)
 	pkt[8] = byte(out >> 9)
 	pkt[9] = byte(out >> 1)
 	pkt[10] = byte(out&1)<<7 | pkt[10]&0x7F
-}
-
-func packetPCR(pkt []byte) (uint64, bool) {
-	if pkt[3]&0x20 == 0 || pkt[4] < 7 || pkt[5]&0x10 == 0 {
-		return 0, false
-	}
-	return uint64(pkt[6])<<25 | uint64(pkt[7])<<17 | uint64(pkt[8])<<9 |
-		uint64(pkt[9])<<1 | uint64(pkt[10])>>7, true
 }
 
 func (c *clockSplice) mapPES(pkt []byte) {
