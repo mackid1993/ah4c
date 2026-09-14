@@ -472,7 +472,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					continue
 				}
 				// NULL_FRAME_INSERTION=TRUE (case-insensitive): fill encoder stalls with MPEG-TS NULLs so DVR never sees a zero-byte gap.
-				body = resp.Body
+				body = traceSourceBody(resp.Body, label, resp)
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
 						r, e := http.Get(t.url)
@@ -690,6 +690,7 @@ func run() error {
 		tuner := c.Param("tuner")
 		channel := c.Param("channel")
 		reader, err := tuneEarly(tuner, channel)
+		logger("[WRAPPER TRACE] handler reader=%T delay=%v preroll=%t", reader, holdDelay, prerollTS != "")
 		if err != nil {
 			logger("[ERR] Failed to tune %s", err)
 			errorMessage := fmt.Sprintf("<html><body><h1>Error: %s</h1></body></html>", err.Error())
@@ -2696,11 +2697,20 @@ type flushWriter interface {
 func copyFlush(dst flushWriter, src io.Reader) (int64, error) {
 	buf := make([]byte, 32*1024)
 	var n int64
+	var reads int64
+	started := time.Now()
 	for {
 		r, rerr := src.Read(buf)
+		reads++
+		if reads == 1 || r == 0 || rerr != nil {
+			logger("[COPY TRACE] read=%d n=%d err=%v total=%d elapsed=%v src=%T", reads, r, rerr, n, time.Since(started), src)
+		}
 		if r > 0 {
 			w, werr := dst.Write(buf[:r])
 			n += int64(w)
+			if w != r || werr != nil {
+				logger("[COPY TRACE] write readBytes=%d wrote=%d err=%v total=%d dst=%T", r, w, werr, n, dst)
+			}
 			if werr != nil {
 				return n, werr
 			}

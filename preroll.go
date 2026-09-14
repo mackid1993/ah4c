@@ -712,6 +712,7 @@ func tuneEarly(idx, channel string) (io.ReadCloser, error) {
 // tuneEarlyWith is tuneEarly over any tune function.
 func tuneEarlyWith(idx, channel string, tuneFn func(string, string, *earlyTune) (io.ReadCloser, error)) (io.ReadCloser, error) {
 	if prerollTS == "" && holdDelay == 0 {
+		logger("[WRAPPER TRACE] tuneEarlyWith bypassed preroll=%t delay=%v", prerollTS != "", holdDelay)
 		return tuneFn(idx, channel, nil)
 	}
 	t0 := time.Now()

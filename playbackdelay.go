@@ -1079,6 +1079,7 @@ func (b bufWriter) Flush()                      { b.rw.Flush() }
 // return says the connection has been taken over.
 func holdOnHints(w http.ResponseWriter, src io.Reader, tuner, channel string) (*hintHold, bool) {
 	if hintCeiling == 0 || holdDelay == 0 || prerollTS != "" || !hintsWork.Load() {
+		logger("[WRAPPER TRACE] holdOnHints bypassed ceiling=%v delay=%v preroll=%t hints=%t", hintCeiling, holdDelay, prerollTS != "", hintsWork.Load())
 		return nil, false
 	}
 	label := "tuner=" + tuner + " channel=" + channel
