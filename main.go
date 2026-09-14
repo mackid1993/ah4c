@@ -102,6 +102,10 @@ type reader struct {
 	sourceURL     string
 }
 
+type playbackReader struct {
+	*reader
+}
+
 // Create a global file object to write logs to
 var loggerhandle *log.Logger
 
@@ -226,38 +230,47 @@ func (r *reader) Read(p []byte) (int, error) {
 	if !r.started {
 		r.started = true
 		addReader(r)
-		if r.gateReady == nil {
-			go func() {
-				if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
-					logger("[ERR] Failed to run start script: %v", err)
-					return
-				}
-			}()
-		} else {
-			go func() {
-				base := r.gateBase
-				if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
-					logger("[ERR] Failed to run start script: %v", err)
-					close(r.gateReady)
-					return
-				}
-				if base != nil {
-					swap, confirmed := waitForPlayback(r.t.tunerip, base, r.gateSig, r.gateDone)
-					if r.gate != nil {
-						if confirmed {
-							r.gate.playbackConfirmed()
-						}
-						if swap {
-							r.gate.expectNewStream()
-						}
-					}
-				} else {
-					logger("[PLAYBACK] %s no audio baseline, gating on motion alone", r.t.tunerip)
-				}
-				close(r.gateReady)
-			}()
-		}
+		go func() {
+			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+				logger("[ERR] Failed to run start script: %v", err)
+				return
+			}
+		}()
 	}
+	return r.read(p)
+}
+
+func (r *playbackReader) Read(p []byte) (int, error) {
+	if !r.started {
+		r.started = true
+		addReader(r.reader)
+		go func() {
+			base := r.gateBase
+			if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+				logger("[ERR] Failed to run start script: %v", err)
+				close(r.gateReady)
+				return
+			}
+			if base != nil {
+				swap, confirmed := waitForPlayback(r.t.tunerip, base, r.gateSig, r.gateDone)
+				if r.gate != nil {
+					if confirmed {
+						r.gate.playbackConfirmed()
+					}
+					if swap {
+						r.gate.expectNewStream()
+					}
+				}
+			} else {
+				logger("[PLAYBACK] %s no audio baseline, gating on motion alone", r.t.tunerip)
+			}
+			close(r.gateReady)
+		}()
+	}
+	return r.read(p)
+}
+
+func (r *reader) read(p []byte) (int, error) {
 	// Determine the index of the tuner
 	tunerIndex := -1
 	for index := range tuners {
@@ -536,6 +549,9 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				gateBase:   base,
 				gateSig:    sig,
 				gate:       gate,
+			}
+			if ready != nil {
+				return &playbackReader{reader: r}, nil
 			}
 			return r, nil
 		}
