@@ -99,8 +99,61 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	startedAt     time.Time
-	sourceURL     string
 }
+
+type reopenReader struct {
+	body     io.ReadCloser
+	url      string
+	buf      []byte
+	deciding bool
+	reopened bool
+}
+
+const reopenHoldBytes = 256 * 1024
+
+func (r *reopenReader) Read(p []byte) (int, error) {
+	for r.deciding {
+		if len(r.buf) >= reopenHoldBytes {
+			r.deciding = false
+			break
+		}
+		tmp := make([]byte, 64*1024)
+		n, err := r.body.Read(tmp)
+		if n > 0 {
+			r.buf = append(r.buf, tmp[:n]...)
+		}
+		if err == io.EOF {
+			if !r.reopened {
+				logger("[SOURCE] %s closed after %d bytes; dropping the lead-in and opening the tuned session", r.url, len(r.buf))
+				r.buf = nil
+				r.reopened = true
+				resp, getErr := http.Get(r.url)
+				if getErr != nil {
+					return 0, getErr
+				}
+				if resp.StatusCode != http.StatusOK {
+					resp.Body.Close()
+					return 0, fmt.Errorf("status %s", resp.Status)
+				}
+				r.body.Close()
+				r.body = resp.Body
+			}
+			r.deciding = false
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	if len(r.buf) > 0 {
+		n := copy(p, r.buf)
+		r.buf = r.buf[n:]
+		return n, nil
+	}
+	return r.body.Read(p)
+}
+
+func (r *reopenReader) Close() error { return r.body.Close() }
 
 type playbackReader struct {
 	*reader
@@ -265,25 +318,6 @@ func (r *reader) Read(p []byte) (int, error) {
 	}
 	// Read from the source
 	n, err := r.ReadCloser.Read(p)
-	if err == io.EOF && r.sourceURL != "" {
-		if n > 0 {
-			err = nil
-		} else {
-			sourceURL := r.sourceURL
-			r.sourceURL = ""
-			resp, getErr := http.Get(sourceURL)
-			if getErr != nil {
-				return 0, getErr
-			}
-			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close()
-				return 0, fmt.Errorf("status %s", resp.Status)
-			}
-			r.ReadCloser.Close()
-			r.ReadCloser = resp.Body
-			return r.Read(p)
-		}
-	}
 	// Write out to preview file if enabled
 	if allowPreview || r.t.teecmd != "" {
 		data := make([]byte, n)
@@ -511,10 +545,14 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					}
 				}
 				body = resp.Body
+				if !strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") &&
+					!strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE") {
+					body = &reopenReader{body: body, url: t.url, deciding: true}
+				}
 				if plain {
 					t.active = true
 					t.index = i
-					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url}, nil
+					return &reader{ReadCloser: body, channel: channel, t: t}, nil
 				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
