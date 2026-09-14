@@ -751,6 +751,9 @@ func run() error {
 			c.Data(500, "text/html; charset=utf-8", []byte(errorMessage))
 			return
 		}
+		if plain {
+			reader = preserveClock(reader, "tuner="+tuner+" channel="+channel)
+		}
 		// Closing the reader is what releases the tuner, runs the stop script
 		// and closes the encoder's connection, so every path must reach it.
 		defer reader.Close()

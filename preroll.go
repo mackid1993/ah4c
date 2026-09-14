@@ -1013,7 +1013,8 @@ const (
 // clockSplice maps every timestamp it passes onto a single forward-only clock.
 type clockSplice struct {
 	io.ReadCloser
-	label string
+	label           string
+	preserveProgram bool
 	// out is the last timestamp written, in 90 kHz. delta is what is added to
 	// an input timestamp to get an output one, and in is the last input seen.
 	out, high, delta, in uint64
@@ -1053,6 +1054,10 @@ func spliceClock(src io.ReadCloser, label string) io.ReadCloser {
 	defer traceFunction("spliceClock", nil, "label=%s source=%T/%p", label, src, src)()
 
 	return &clockSplice{ReadCloser: src, label: label}
+}
+
+func preserveClock(src io.ReadCloser, label string) io.ReadCloser {
+	return &clockSplice{ReadCloser: src, label: label, preserveProgram: true}
 }
 
 // Read hands back only whole packets that have been rewritten.
@@ -1161,6 +1166,11 @@ func (c *clockSplice) rewrite(b []byte) {
 		pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
 		if pid == 0x1FFF {
 			continue // NULL packets carry nothing to map
+		}
+		if c.preserveProgram {
+			c.mapPCR(pkt)
+			c.mapPES(pkt)
+			continue
 		}
 		if pid == 0 {
 			c.notePMTPID(pkt)
