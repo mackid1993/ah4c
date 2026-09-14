@@ -99,6 +99,7 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	startedAt     time.Time
+	sourceFirst   bool
 }
 
 // Create a global file object to write logs to
@@ -280,6 +281,13 @@ func (r *reader) Read(p []byte) (int, error) {
 	}
 	// Read from the source
 	n, err := r.ReadCloser.Read(p)
+	if n > 0 && !r.sourceFirst {
+		r.sourceFirst = true
+		logger("[PASSTHROUGH TRACE] tuner=%s first bytes=%d err=%v", r.t.tunerip, n, err)
+	}
+	if err != nil {
+		logger("[PASSTHROUGH TRACE] tuner=%s ended bytes=%d err=%v", r.t.tunerip, n, err)
+	}
 	// Write out to preview file if enabled
 	if allowPreview || r.t.teecmd != "" {
 		data := make([]byte, n)
