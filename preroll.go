@@ -1015,6 +1015,10 @@ type clockSplice struct {
 	io.ReadCloser
 	label           string
 	preserveProgram bool
+	sess            sessionSource
+	sessSeen        int64
+	preserveReset   bool
+	preserveCC      map[int]byte
 	// out is the last timestamp written, in 90 kHz. delta is what is added to
 	// an input timestamp to get an output one, and in is the last input seen.
 	out, high, delta, in uint64
@@ -1057,7 +1061,11 @@ func spliceClock(src io.ReadCloser, label string) io.ReadCloser {
 }
 
 func preserveClock(src io.ReadCloser, label string) io.ReadCloser {
-	return &clockSplice{ReadCloser: src, label: label, preserveProgram: true}
+	c := &clockSplice{ReadCloser: src, label: label, preserveProgram: true}
+	if s, ok := src.(sessionSource); ok {
+		c.sess, c.sessSeen = s, s.sessions()
+	}
+	return c
 }
 
 // Read hands back only whole packets that have been rewritten.
@@ -1091,6 +1099,15 @@ func (c *clockSplice) Read(p []byte) (int, error) {
 		}
 		n, err := c.ReadCloser.Read(c.scratch)
 		if n > 0 {
+			if c.sess != nil {
+				if session := c.sess.sessions(); session != c.sessSeen {
+					c.pend = append(c.pend, c.tail...)
+					c.tail = c.tail[:0]
+					c.synced = false
+					c.preserveReset = true
+					c.sessSeen = session
+				}
+			}
 			c.tail = append(c.tail, c.scratch[:n]...)
 			c.fill()
 		}
@@ -1137,6 +1154,7 @@ func (c *clockSplice) fill() {
 func (c *clockSplice) sync() {
 	for i := 0; i+2*tsPacketSize <= len(c.tail); i++ {
 		if c.tail[i] == 0x47 && c.tail[i+tsPacketSize] == 0x47 {
+			c.pend = append(c.pend, c.tail[:i]...)
 			c.tail = append(c.tail[:0], c.tail[i:]...)
 			c.synced = true
 			return
@@ -1144,6 +1162,7 @@ func (c *clockSplice) sync() {
 	}
 	// Keep only what could still be the start of a pair.
 	if drop := len(c.tail) - 2*tsPacketSize; drop > 0 {
+		c.pend = append(c.pend, c.tail[:drop]...)
 		c.tail = append(c.tail[:0], c.tail[drop:]...)
 	}
 }
@@ -1170,6 +1189,7 @@ func (c *clockSplice) rewrite(b []byte) {
 		if c.preserveProgram {
 			c.mapPCR(pkt)
 			c.mapPES(pkt)
+			c.preserveContinuity(pkt, pid)
 			continue
 		}
 		if pid == 0 {
@@ -1207,6 +1227,22 @@ func (c *clockSplice) rewrite(b []byte) {
 		c.setPID(pkt, out)
 		c.stamp(pkt, out)
 	}
+}
+
+func (c *clockSplice) preserveContinuity(pkt []byte, pid int) {
+	if c.preserveCC == nil {
+		c.preserveCC = map[int]byte{}
+	}
+	last, known := c.preserveCC[pid]
+	if !c.preserveReset || !known {
+		c.preserveCC[pid] = pkt[3] & 0x0F
+		return
+	}
+	if pkt[3]&0x10 != 0 {
+		last = (last + 1) & 0x0F
+	}
+	pkt[3] = pkt[3]&0xF0 | last
+	c.preserveCC[pid] = last
 }
 
 // The clock is carried by two high-water marks, not one.

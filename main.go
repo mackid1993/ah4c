@@ -100,11 +100,14 @@ type reader struct {
 	gate          *gateReader
 	startedAt     time.Time
 	sourceURL     string
+	sourceSession int64
 }
 
 type playbackReader struct {
 	*reader
 }
+
+func (r *reader) sessions() int64 { return r.sourceSession }
 
 // Create a global file object to write logs to
 var loggerhandle *log.Logger
@@ -281,6 +284,7 @@ func (r *reader) Read(p []byte) (int, error) {
 			}
 			r.ReadCloser.Close()
 			r.ReadCloser = resp.Body
+			r.sourceSession++
 			return r.Read(p)
 		}
 	}
