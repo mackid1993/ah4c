@@ -1221,7 +1221,7 @@ func wantHEVC() bool {
 // the encoder's live edge. The black just fronts the seam; it is never content
 // the playhead starts behind, which is what a decoded or a long black became.
 func blackStartup() {
-	if prerollTS != "" {
+	if holdDelay <= 0 || prerollTS != "" {
 		return
 	}
 	if wantHEVC() {
