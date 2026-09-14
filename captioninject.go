@@ -448,6 +448,8 @@ func (ci *captionInjector) packet(p []byte) error {
 				if _, _, pts, ok := splitPES(tsPayload(p)); ok {
 					ci.trackFrameRate(pts)
 					ci.onPicture(pts)
+				} else {
+					ci.ptsGaps = ci.ptsGaps[:0]
 				}
 			}
 		}
