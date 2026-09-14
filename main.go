@@ -99,6 +99,7 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	startedAt     time.Time
+	sourceURL     string
 }
 
 // Create a global file object to write logs to
@@ -287,6 +288,21 @@ func (r *reader) Read(p []byte) (int, error) {
 	}
 	// Read from the source
 	n, err := r.ReadCloser.Read(p)
+	if n == 0 && err == io.EOF && r.sourceURL != "" {
+		sourceURL := r.sourceURL
+		r.sourceURL = ""
+		resp, getErr := http.Get(sourceURL)
+		if getErr != nil {
+			return 0, getErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return 0, fmt.Errorf("status %s", resp.Status)
+		}
+		r.ReadCloser.Close()
+		r.ReadCloser = resp.Body
+		return r.Read(p)
+	}
 	// Write out to preview file if enabled
 	if allowPreview || r.t.teecmd != "" {
 		data := make([]byte, n)
@@ -487,7 +503,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				if plain {
 					t.active = true
 					t.index = i
-					return &reader{ReadCloser: body, channel: channel, t: t}, nil
+					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url}, nil
 				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
