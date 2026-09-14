@@ -265,7 +265,7 @@ func (r *reader) Read(p []byte) (int, error) {
 	}
 	// Read from the source
 	n, err := r.ReadCloser.Read(p)
-	if err != nil && r.sourceURL != "" {
+	if err == io.EOF && r.sourceURL != "" {
 		if n > 0 {
 			err = nil
 		} else {
