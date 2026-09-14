@@ -702,12 +702,12 @@ func refreshCaptionReady() {
 }
 
 func maybeWrapCaptions(src io.ReadCloser, tunerIndex int, label string) io.ReadCloser {
-	captionTuneStarting()
-	src = newTuneSettleReader(src)
 	cfg := currentCaptionConfig()
 	if !cfg.Enabled {
 		return src
 	}
+	captionTuneStarting()
+	src = newTuneSettleReader(src)
 	if len(cfg.Tuners) > 0 {
 		found := false
 		for _, t := range cfg.Tuners {
