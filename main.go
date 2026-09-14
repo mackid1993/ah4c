@@ -501,6 +501,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			// arrives, or its PIDs change mid-play and the player freezes.
 			t.active = true
 			t.index = i
+			logger("[WRAPPER TRACE] body=%T detection=%t delay=%v nulls=%t captions=%t", body, ready != nil, holdDelay, strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE"), currentCaptionConfig().Enabled)
 			r := &reader{
 				ReadCloser: body,
 				channel:    channel,
