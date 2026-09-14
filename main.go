@@ -124,8 +124,7 @@ func (r *reopenReader) Read(p []byte) (int, error) {
 		}
 		if err == io.EOF {
 			if !r.reopened {
-				logger("[SOURCE] %s closed after %d bytes; dropping the lead-in and opening the tuned session", r.url, len(r.buf))
-				r.buf = nil
+				logger("[SOURCE] %s closed after %d bytes; remuxing the lead-in and the tuned session onto one clock", r.url, len(r.buf))
 				r.reopened = true
 				resp, getErr := http.Get(r.url)
 				if getErr != nil {
@@ -136,7 +135,9 @@ func (r *reopenReader) Read(p []byte) (int, error) {
 					return 0, fmt.Errorf("status %s", resp.Status)
 				}
 				r.body.Close()
-				r.body = resp.Body
+				joined := multiReadCloser{Reader: io.MultiReader(bytes.NewReader(r.buf), resp.Body), c: resp.Body}
+				r.body = remuxTimestamps(joined, r.url)
+				r.buf = nil
 			}
 			r.deciding = false
 			break
@@ -154,6 +155,50 @@ func (r *reopenReader) Read(p []byte) (int, error) {
 }
 
 func (r *reopenReader) Close() error { return r.body.Close() }
+
+type multiReadCloser struct {
+	io.Reader
+	c io.Closer
+}
+
+func (m multiReadCloser) Close() error { return m.c.Close() }
+
+type remuxReader struct {
+	cmd  *exec.Cmd
+	out  io.ReadCloser
+	src  io.ReadCloser
+	once sync.Once
+}
+
+func (r *remuxReader) Read(p []byte) (int, error) { return r.out.Read(p) }
+
+func (r *remuxReader) Close() error {
+	r.once.Do(func() {
+		r.src.Close()
+		if r.cmd.Process != nil {
+			r.cmd.Process.Kill()
+		}
+		go r.cmd.Wait()
+	})
+	return nil
+}
+
+func remuxTimestamps(src io.ReadCloser, label string) io.ReadCloser {
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-analyzeduration", "500000", "-probesize", "500000",
+		"-i", "pipe:0", "-c", "copy", "-f", "mpegts", "-flush_packets", "1", "pipe:1")
+	cmd.Stdin = src
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		logger("[IO] %s remux stdout: %v; passing source through", label, err)
+		return src
+	}
+	if err := cmd.Start(); err != nil {
+		logger("[IO] %s remux start: %v; passing source through", label, err)
+		return src
+	}
+	return &remuxReader{cmd: cmd, out: out, src: src}
+}
 
 type playbackReader struct {
 	*reader
