@@ -538,15 +538,15 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				base = audioBaseline(t.tunerip)
 				sig = mediaSignature(t.tunerip)
 			}
-			if err := execute(t.pre, t.tunerip, channel); err != nil {
-				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
-				t.active = false
-				continue
-			}
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
 			var gate *gateReader
 			if holdDelay > 0 {
+				if err := execute(t.pre, t.tunerip, channel); err != nil {
+					logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
+					t.active = false
+					continue
+				}
 				// A tune held by the delay does not open the encoder yet: the
 				// wait is the pre-roll or NULL packets, and the encoder is
 				// opened when the delay is up, so the program starts at the
@@ -566,6 +566,12 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					continue
 				} else if resp.StatusCode != 200 {
 					logger("[ERR] Failed to fetch source: %v", resp.Status)
+					resp.Body.Close()
+					t.active = false
+					continue
+				}
+				if err := execute(t.pre, t.tunerip, channel); err != nil {
+					logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
 					resp.Body.Close()
 					t.active = false
 					continue
