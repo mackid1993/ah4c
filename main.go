@@ -718,7 +718,12 @@ func run() error {
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
-		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
+		if holdDelay == 0 && prerollTS == "" {
+			bytesCopied, err = io.Copy(c.Writer, reader)
+		} else {
+			bytesCopied, err = copyFlush(c.Writer, reader)
+		}
+		if err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
@@ -1245,6 +1250,9 @@ func run() error {
 	// Not r.Run: it builds its own listener and leaves the send buffer to the
 	// kernel, which autotunes it into the megabytes of stale video. See
 	// playbackdelay.go.
+	if holdDelay == 0 && prerollTS == "" {
+		return r.Run(":7654")
+	}
 	return serveLive(r, ":7654")
 }
 
