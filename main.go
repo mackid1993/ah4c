@@ -1721,7 +1721,6 @@ var nullFill = bytes.Repeat(nullTSPacket[:], 350) // 65.8KB, ≥ any plausible D
 type stallTolerantReader struct {
 	chunks        chan []byte
 	closed        chan struct{}
-	done          chan struct{}
 	closeOnce     sync.Once
 	bodyMu        sync.Mutex
 	body          io.ReadCloser
@@ -1734,7 +1733,10 @@ type stallTolerantReader struct {
 	// the next Read. Only the reading goroutine touches it.
 	rest    []byte
 	dropped atomic.Int64
-	out     int64
+	// out is how many bytes have gone downstream, so NULL fill can finish a
+	// torn packet before it starts whole ones. Only the reading goroutine
+	// touches it.
+	out int64
 	// filled counts NULL bytes put into a live program to cover an encoder
 	// stall. saidFill keeps that to one line a tune.
 	filled   atomic.Int64
@@ -1784,7 +1786,6 @@ func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadClose
 	s := &stallTolerantReader{
 		chunks:      make(chan []byte, queueDepth),
 		closed:      make(chan struct{}),
-		done:        make(chan struct{}),
 		body:        body,
 		reconnectFn: reconnectFn,
 		label:       label,
@@ -1796,7 +1797,6 @@ func newStallTolerantReader(body io.ReadCloser, reconnectFn func() (io.ReadClose
 func (s *stallTolerantReader) producer() {
 	defer traceFunction("stallTolerantReader.producer", s, "label=%s", s.label)()
 
-	defer close(s.done)
 	chunk := make([]byte, chunkSize)
 	lastReal := time.Now()
 	var lastLog time.Time
@@ -1812,6 +1812,7 @@ func (s *stallTolerantReader) producer() {
 		}
 		if time.Since(lastReal) > budget {
 			logger("[%s] no source bytes for %v; giving up and ending stream", s.label, budget)
+			s.closeOnce.Do(func() { close(s.closed) })
 			return
 		}
 		s.bodyMu.Lock()
@@ -1819,6 +1820,7 @@ func (s *stallTolerantReader) producer() {
 		s.bodyMu.Unlock()
 		if body == nil {
 			if s.reconnectFn == nil {
+				s.closeOnce.Do(func() { close(s.closed) })
 				return
 			}
 			nb, rerr := s.reconnectFn()
@@ -1863,9 +1865,6 @@ func (s *stallTolerantReader) producer() {
 			continue
 		}
 		n, err := readWithDeadline(body, chunk, srcStallReconnect)
-		if n == 0 && err == nil {
-			continue
-		}
 		if n > 0 {
 			lastReal = time.Now()
 			data := make([]byte, n)
@@ -1923,16 +1922,16 @@ func (s *stallTolerantReader) producer() {
 		if err != nil {
 			logger("[%s] encoder stream ended (%v); reconnecting", s.label, err)
 		}
-		s.closeBody()
+		body.Close()
+		s.bodyMu.Lock()
+		s.body = nil
+		s.bodyMu.Unlock()
 	}
 }
 
 func (s *stallTolerantReader) Read(p []byte) (int, error) {
 	defer traceFunction("stallTolerantReader.Read", s, "label=%s len=%d", s.label, len(p))()
 
-	if len(p) == 0 {
-		return 0, nil
-	}
 	// Pre-first-chunk: nil channel disables the NULL-fill case, so Read blocks on chunks/closed only.
 	var stall <-chan time.Time
 	// No stall timer at all while a hold has the filling switched off. There
@@ -1947,7 +1946,7 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 	//
 	// With no timer the select simply blocks on chunks or closed, which is
 	// what a reader with nothing to say should do.
-	if s.hasFirstChunk.Load() && s.out%188 == 0 {
+	if s.hasFirstChunk.Load() {
 		t := time.NewTimer(stallReadGap)
 		defer t.Stop()
 		stall = t.C
@@ -1964,17 +1963,17 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		s.out += int64(n)
 		return n, nil
 	}
-	var data []byte
 	select {
 	case <-s.closed:
 		return 0, io.EOF
-	case data = <-s.chunks:
-	case <-s.done:
-		select {
-		case data = <-s.chunks:
-		default:
-			return 0, io.EOF
+	case data := <-s.chunks:
+		s.hasFirstChunk.Store(true)
+		n := copy(p, data)
+		if n < len(data) {
+			s.rest = append(s.rest[:0], data[n:]...)
 		}
+		s.out += int64(n)
+		return n, nil
 	case <-stall:
 		// This reader once had its filling switched off during a hold, on the
 		// grounds that a stream held back on purpose should not be papered
@@ -1998,11 +1997,26 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		// So it counts and it speaks. If a tune shows seconds of this, the
 		// encoder is stalling and the filler is turning those stalls into
 		// unplayable time in the recording.
+		// Finish the torn packet before starting whole ones. An encoder can
+		// stall part way through a packet, and filling from there put the
+		// whole rest of the stream out of step — which a demuxer resyncs
+		// from, but which anything downstream carving packets at fixed
+		// offsets does not. One damaged packet is a frame; a stream out of
+		// step is every frame after it.
+		if k := s.out % 188; k != 0 {
+			n := min(len(p), int(188-k))
+			for i := 0; i < n; i++ {
+				p[i] = 0xFF
+			}
+			s.filled.Add(int64(n))
+			s.out += int64(n)
+			s.sayFilled()
+			return n, nil
+		}
 		if len(p) < 188 {
 			s.filled.Add(188)
 			s.sayFilled()
 			n := copy(p, nullTSPacket[:])
-			s.rest = nullTSPacket[n:]
 			s.out += int64(n)
 			return n, nil
 		}
@@ -2013,13 +2027,6 @@ func (s *stallTolerantReader) Read(p []byte) (int, error) {
 		s.out += int64(n)
 		return n, nil
 	}
-	s.hasFirstChunk.Store(true)
-	n := copy(p, data)
-	if n < len(data) {
-		s.rest = append(s.rest[:0], data[n:]...)
-	}
-	s.out += int64(n)
-	return n, nil
 }
 
 // sayFilled says once, per reader, that the encoder stalled and the gap was
@@ -2058,13 +2065,8 @@ func (s *stallTolerantReader) Close() error {
 	defer traceFunction("stallTolerantReader.Close", nil, "reader=%p label=%s", s, s.label)()
 
 	s.closeOnce.Do(func() { close(s.closed) })
-	return s.closeBody()
-}
-
-func (s *stallTolerantReader) closeBody() error {
 	s.bodyMu.Lock()
 	body := s.body
-	s.body = nil
 	s.bodyMu.Unlock()
 	if body != nil {
 		return body.Close()
