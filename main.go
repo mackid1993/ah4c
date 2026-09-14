@@ -1501,7 +1501,6 @@ func apiStatusHandler(c *gin.Context) {
 		exportedReaders[i] = ExportedReader{
 			T:        r.t.index,
 			Channel:  r.channel,
-			Name:     channelName(r.channel),
 			Started:  fmt.Sprintf("%v", r.started),
 			Elapsed:  int64(time.Since(r.startedAt).Seconds()),
 			FileName: fileName,
@@ -1509,6 +1508,9 @@ func apiStatusHandler(c *gin.Context) {
 		}
 	}
 	readersLock.Unlock()
+	for i := range exportedReaders {
+		exportedReaders[i].Name = channelName(exportedReaders[i].Channel)
+	}
 	fanSpeed := ""
 	gpuUtil := ""
 	memUsage := ""
