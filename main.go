@@ -77,8 +77,6 @@ type tuner struct {
 	filePath string
 	index    int
 	teecmd   string
-	resume   string
-	resumeBy time.Time
 }
 
 // All readers
@@ -101,9 +99,6 @@ type reader struct {
 	gateSig       string
 	gate          *gateReader
 	startedAt     time.Time
-	skipStart     bool
-	sourceEOF     bool
-	canResume     bool
 }
 
 // Create a global file object to write logs to
@@ -232,33 +227,35 @@ func (r *reader) Read(p []byte) (int, error) {
 	if !r.started {
 		r.started = true
 		addReader(r)
-		if !r.skipStart {
+		if r.gateReady == nil {
 			go func() {
-				base := r.gateBase
-				err := execute(r.t.start, r.channel, r.t.tunerip)
-				if err != nil {
+				if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
 					logger("[ERR] Failed to run start script: %v", err)
-					if r.gateReady != nil {
-						close(r.gateReady)
-					}
 					return
 				}
-				if r.gateReady != nil {
-					if base != nil {
-						swap, confirmed := waitForPlayback(r.t.tunerip, base, r.gateSig, r.gateDone)
-						if r.gate != nil {
-							if confirmed {
-								r.gate.playbackConfirmed()
-							}
-							if swap {
-								r.gate.expectNewStream()
-							}
-						}
-					} else {
-						logger("[PLAYBACK] %s no audio baseline, gating on motion alone", r.t.tunerip)
-					}
+			}()
+		} else {
+			go func() {
+				base := r.gateBase
+				if err := execute(r.t.start, r.channel, r.t.tunerip); err != nil {
+					logger("[ERR] Failed to run start script: %v", err)
 					close(r.gateReady)
+					return
 				}
+				if base != nil {
+					swap, confirmed := waitForPlayback(r.t.tunerip, base, r.gateSig, r.gateDone)
+					if r.gate != nil {
+						if confirmed {
+							r.gate.playbackConfirmed()
+						}
+						if swap {
+							r.gate.expectNewStream()
+						}
+					}
+				} else {
+					logger("[PLAYBACK] %s no audio baseline, gating on motion alone", r.t.tunerip)
+				}
+				close(r.gateReady)
 			}()
 		}
 	}
@@ -290,9 +287,6 @@ func (r *reader) Read(p []byte) (int, error) {
 	}
 	// Read from the source
 	n, err := r.ReadCloser.Read(p)
-	if err == io.EOF {
-		r.sourceEOF = true
-	}
 	// Write out to preview file if enabled
 	if allowPreview || r.t.teecmd != "" {
 		data := make([]byte, n)
@@ -331,16 +325,9 @@ func (r *reader) Close() error {
 			logger("[ERR] Failed to kill command: %v", err)
 		}
 	}
-	if r.canResume && r.sourceEOF {
-		tunerLock.Lock()
-		r.t.resume = r.channel
-		r.t.resumeBy = time.Now().Add(5 * time.Second)
-		tunerLock.Unlock()
-	} else {
-		if err := execute(r.t.stop, r.t.tunerip, r.channel); err != nil {
-			logger("[ERR] Failed to run stop script: %v", err)
-			execute(r.t.reboot, r.t.tunerip, r.channel)
-		}
+	if err := execute(r.t.stop, r.t.tunerip, r.channel); err != nil {
+		logger("[ERR] Failed to run stop script: %v", err)
+		execute(r.t.reboot, r.t.tunerip, r.channel)
 	}
 	tunerLock.Lock()
 	r.t.active = false
@@ -451,13 +438,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			}
 			// Network encoder
 			logger("Attempting network tune for device %s %s %v %v", t.url, t.tunerip, channel, idx)
-			plain := holdDelay == 0 && prerollTS == "" &&
-				!strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE") &&
-				!strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") &&
-				!currentCaptionConfig().Enabled
-			resume := plain && t.resume == channel && time.Now().Before(t.resumeBy)
-			t.resume = ""
-			t.resumeBy = time.Time{}
+			plain := plainTune()
 			tuneStart := time.Now()
 			var ready chan struct{}
 			var base map[string]bool
@@ -470,12 +451,10 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				base = audioBaseline(t.tunerip)
 				sig = mediaSignature(t.tunerip)
 			}
-			if !resume {
-				if err := execute(t.pre, t.tunerip, channel); err != nil {
-					logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
-					t.active = false
-					continue
-				}
+			if err := execute(t.pre, t.tunerip, channel); err != nil {
+				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
+				t.active = false
+				continue
 			}
 			label := fmt.Sprintf("tuner=%s", t.tunerip)
 			var body io.ReadCloser
@@ -505,6 +484,11 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					continue
 				}
 				body = resp.Body
+				if plain {
+					t.active = true
+					t.index = i
+					return &reader{ReadCloser: body, channel: channel, t: t}, nil
+				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
 						r, e := packetTraceGet(t.url)
@@ -542,13 +526,18 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 				gateBase:   base,
 				gateSig:    sig,
 				gate:       gate,
-				skipStart:  resume,
-				canResume:  plain,
 			}
 			return r, nil
 		}
 	}
 	return nil, fmt.Errorf("device(s) not available")
+}
+
+func plainTune() bool {
+	return holdDelay == 0 && prerollTS == "" &&
+		!strings.EqualFold(os.Getenv("PLAYBACK_DETECTION"), "TRUE") &&
+		!strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") &&
+		!currentCaptionConfig().Enabled
 }
 
 // Custom execute command with timing stats
@@ -724,7 +713,14 @@ func run() error {
 	r.GET("/play/tuner:tuner/:channel", func(c *gin.Context) {
 		tuner := c.Param("tuner")
 		channel := c.Param("channel")
-		reader, err := tuneEarly(tuner, channel)
+		plain := plainTune()
+		var reader io.ReadCloser
+		var err error
+		if plain {
+			reader, err = tune(tuner, channel, nil)
+		} else {
+			reader, err = tuneEarly(tuner, channel)
+		}
 		if err != nil {
 			logger("[ERR] Failed to tune %s", err)
 			errorMessage := fmt.Sprintf("<html><body><h1>Error: %s</h1></body></html>", err.Error())
@@ -738,23 +734,30 @@ func run() error {
 		var bytesCopied int64
 		// The first stretch of a hold goes out as 1xx, which puts nothing in
 		// the body; the body carries whatever is left, however long that is.
-		h, taken := holdOnHints(c.Writer, reader, tuner, channel)
-		switch {
-		case h != nil:
-			defer h.Close()
-			if bytesCopied, err = h.stream(reader); err != nil {
-				logger("[IO] stream: %v", err)
+		if !plain {
+			h, taken := holdOnHints(c.Writer, reader, tuner, channel)
+			switch {
+			case h != nil:
+				defer h.Close()
+				if bytesCopied, err = h.stream(reader); err != nil {
+					logger("[IO] stream: %v", err)
+				}
+				return
+			case taken:
+				logger("[HOLD] tuner=%s channel=%s the DVR left during the hold", tuner, channel)
+				return
 			}
-			return
-		case taken:
-			logger("[HOLD] tuner=%s channel=%s the DVR left during the hold", tuner, channel)
-			return
 		}
 		c.Header("Transfer-Encoding", "identity")
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
-		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
+		if plain {
+			bytesCopied, err = io.Copy(c.Writer, reader)
+		} else {
+			bytesCopied, err = copyFlush(c.Writer, reader)
+		}
+		if err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
