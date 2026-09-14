@@ -754,7 +754,7 @@ func run() error {
 		c.Header("Content-Type", "video/mp2t")
 		c.Writer.WriteHeaderNow()
 		c.Writer.Flush()
-		if bytesCopied, err = io.Copy(c.Writer, reader); err != nil {
+		if bytesCopied, err = copyFlush(c.Writer, reader); err != nil {
 			logger("[IO] io.Copy: %v", err)
 		}
 		logger("[IOINFO] Successfully copied %v bytes", bytesCopied)
