@@ -476,24 +476,8 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 			}
 			var resp *http.Response
 			var err error
-			if plain {
-				resp, err = http.Get(t.url)
-				if err != nil {
-					logger("[ERR] Failed to fetch source: %v", err)
-					t.active = false
-					continue
-				} else if resp.StatusCode != 200 {
-					logger("[ERR] Failed to fetch source: %v", resp.Status)
-					resp.Body.Close()
-					t.active = false
-					continue
-				}
-			}
 			if err := execute(t.pre, t.tunerip, channel); err != nil {
 				logger("[ERR] Failed to run pre script: %v %s", err, t.tunerip)
-				if resp != nil {
-					resp.Body.Close()
-				}
 				t.active = false
 				continue
 			}
