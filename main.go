@@ -101,7 +101,6 @@ type reader struct {
 	startedAt     time.Time
 	sourceURL     string
 	startLaunched bool
-	discardSource bool
 }
 
 type playbackReader struct {
@@ -268,16 +267,6 @@ func (r *reader) Read(p []byte) (int, error) {
 		}
 	}
 	// Read from the source
-	for r.discardSource {
-		n, err := r.ReadCloser.Read(p)
-		if err == nil || n > 0 {
-			continue
-		}
-		r.discardSource = false
-		if err != io.EOF {
-			return 0, err
-		}
-	}
 	n, err := r.ReadCloser.Read(p)
 	if err == io.EOF && r.sourceURL != "" {
 		if n > 0 {
@@ -529,7 +518,7 @@ func tune(idx, channel string, early *earlyTune) (io.ReadCloser, error) {
 					}
 					t.active = true
 					t.index = i
-					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url, startLaunched: true, discardSource: true}, nil
+					return &reader{ReadCloser: body, channel: channel, t: t, sourceURL: t.url, startLaunched: true}, nil
 				}
 				if strings.EqualFold(os.Getenv("NULL_FRAME_INSERTION"), "TRUE") {
 					body = newStallTolerantReader(resp.Body, func() (io.ReadCloser, error) {
