@@ -509,19 +509,6 @@ func validatedSettingsRequest(request configSaveRequest, old Settings) (Settings
 		if key == "STREAMER_APP" {
 			value = canonicalStreamerSelection(value)
 		}
-		if key == "IPADDRESS" || key == "CHANNELSIP" {
-			defaultPort := "7654"
-			if key == "CHANNELSIP" {
-				defaultPort = "8089"
-			}
-			if value != "" {
-				var err error
-				value, err = serverBaseURL(value, defaultPort)
-				if err != nil {
-					return Settings{}, fmt.Errorf("%s: %v", key, err)
-				}
-			}
-		}
 		if value == "" {
 			continue
 		}
@@ -593,6 +580,11 @@ func validateCatalogValue(spec VarSpec, value string) error {
 	}
 	if spec.Key == "STREAMER_APP" && value != "" && !validStreamerSelection(value) {
 		return fmt.Errorf("must use scripts/package or scripts/device/app")
+	}
+	if spec.Key == "CHANNELS_M3U" && value != "" {
+		if _, err := validM3UFile(value); err != nil {
+			return err
+		}
 	}
 	switch spec.Key {
 	case "IPADDRESS":
@@ -839,7 +831,7 @@ func environmentSetupReady(lookup func(string) string) bool {
 }
 
 func discoverLocalStreamers() []string {
-	return mergeStreamers(discoverLocalStreamersAt("scripts"), discoverLocalStreamersAt("/tmp/scripts"))
+	return discoverLocalStreamersAt("scripts")
 }
 
 func discoverLocalStreamersAt(root string) []string {
